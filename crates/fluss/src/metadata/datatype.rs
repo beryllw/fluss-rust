@@ -436,26 +436,48 @@ impl Display for StringType {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DecimalType {
     nullable: bool,
-    precision: u32,
-    scale: u32,
+    precision: i8,
+    scale: i8,
 }
 
 impl DecimalType {
-    pub const MIN_PRECISION: u32 = 1;
+    pub const MIN_PRECISION: i8 = 1;
 
-    pub const MAX_PRECISION: u32 = 38;
+    pub const MAX_PRECISION: i8 = 38;
 
-    pub const DEFAULT_PRECISION: u32 = 10;
+    pub const DEFAULT_PRECISION: i8 = 10;
 
-    pub const MIN_SCALE: u32 = 0;
+    pub const MIN_SCALE: i8 = 0;
 
-    pub const DEFAULT_SCALE: u32 = 0;
+    pub const DEFAULT_SCALE: i8 = 0;
 
     pub fn new(precision: u32, scale: u32) -> Self {
         Self::with_nullable(true, precision, scale)
     }
 
     pub fn with_nullable(nullable: bool, precision: u32, scale: u32) -> Self {
+        let precision = precision
+            .try_into()
+            .expect("Decimal precision is too large (must be ≤ 127)");
+        let scale = scale
+            .try_into()
+            .expect("Decimal scale is too large (must be ≤ 127)");
+
+        if precision < Self::MIN_PRECISION || precision > Self::MAX_PRECISION {
+            panic!(
+                "Decimal precision must be between {} and {} (both inclusive).",
+                Self::MIN_PRECISION,
+                Self::MAX_PRECISION
+            );
+        }
+        if scale < Self::MIN_SCALE || scale > precision {
+            panic!(
+                "Decimal scale must be between {} and the precision {} (both inclusive).",
+                Self::MIN_SCALE,
+                precision
+            );
+        }
+
         DecimalType {
             nullable,
             precision,
@@ -463,11 +485,11 @@ impl DecimalType {
         }
     }
 
-    pub fn precision(&self) -> u32 {
+    pub fn precision(&self) -> i8 {
         self.precision
     }
 
-    pub fn scale(&self) -> u32 {
+    pub fn scale(&self) -> i8 {
         self.scale
     }
 

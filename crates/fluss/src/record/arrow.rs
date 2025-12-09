@@ -590,26 +590,31 @@ pub fn to_arrow_type(fluss_type: &DataType) -> ArrowDataType {
         DataType::Char(_) => ArrowDataType::Utf8,
         DataType::String(_) => ArrowDataType::Utf8,
         DataType::Decimal(_data_type) => {
-            ArrowDataType::Decimal128(_data_type.precision() as u8, _data_type.scale() as i8)
+            ArrowDataType::Decimal128(_data_type.precision().try_into().expect(""), _data_type.scale() as i8)
         }
         DataType::Date(_) => ArrowDataType::Date32,
         DataType::Time(_data_type) => match _data_type.precision() {
             0 => ArrowDataType::Time32(arrow_schema::TimeUnit::Second),
             1 | 2 | 3 => ArrowDataType::Time32(arrow_schema::TimeUnit::Millisecond),
             4 | 5 | 6 => ArrowDataType::Time64(arrow_schema::TimeUnit::Microsecond),
-            _ => ArrowDataType::Time64(arrow_schema::TimeUnit::Nanosecond),
+            7 | 8 | 9 => ArrowDataType::Time64(arrow_schema::TimeUnit::Nanosecond),
+            // This arm should never be reached due to validation in TimeType.
+            invalid => panic!("Invalid precision value for TimeType: {}", invalid),
         },
         DataType::Timestamp(_data_type) => match _data_type.precision() {
             0 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, None),
             1 | 2 | 3 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
             4 | 5 | 6 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-            _ => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            7 | 8 | 9 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            invalid => panic!("Invalid precision value for TimestampType: {}", invalid),
         },
         DataType::TimestampLTz(_data_type) => match _data_type.precision() {
             0 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Second, None),
             1 | 2 | 3 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Millisecond, None),
             4 | 5 | 6 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
-            _ => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            7 | 8 | 9 => ArrowDataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, None),
+            // This arm should never be reached due to validation in TimeType.
+            invalid => panic!("Invalid precision value for TimestampLTzType: {}", invalid),
         },
         DataType::Bytes(_) => ArrowDataType::Binary,
         DataType::Binary(_data_type) => ArrowDataType::FixedSizeBinary(_data_type.length() as i32),
