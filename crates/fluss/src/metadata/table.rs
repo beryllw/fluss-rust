@@ -1212,7 +1212,10 @@ mod tests {
         assert!(!table_info.is_auto_partitioned());
 
         // 2. Not partitioned, auto partition enabled
-        properties.insert("table.auto.partition.enabled".to_string(), "true".to_string());
+        properties.insert(
+            "table.auto.partition.enabled".to_string(),
+            "true".to_string(),
+        );
         let table_info = TableInfo::new(
             table_path.clone(),
             1,
@@ -1230,7 +1233,10 @@ mod tests {
         assert!(!table_info.is_auto_partitioned());
 
         // 3. Partitioned, auto partition disabled
-        properties.insert("table.auto.partition.enabled".to_string(), "false".to_string());
+        properties.insert(
+            "table.auto.partition.enabled".to_string(),
+            "false".to_string(),
+        );
         let table_info = TableInfo::new(
             table_path.clone(),
             1,
@@ -1248,7 +1254,10 @@ mod tests {
         assert!(!table_info.is_auto_partitioned());
 
         // 4. Partitioned, auto partition enabled
-        properties.insert("table.auto.partition.enabled".to_string(), "true".to_string());
+        properties.insert(
+            "table.auto.partition.enabled".to_string(),
+            "true".to_string(),
+        );
         let table_info = TableInfo::new(
             table_path.clone(),
             1,
