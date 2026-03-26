@@ -1,0 +1,43 @@
+{
+  "name": "@apache/fluss-wasm",
+  "version": "0.2.0",
+  "description": "WASM bindings for Apache Fluss (Incubating)",
+  "type": "module",
+  "sideEffects": false,
+  "homepage": "https://clients.fluss.apache.org/",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/apache/fluss-rust",
+    "directory": "bindings/wasm"
+  },
+  "license": "Apache-2.0",
+  "author": "Apache Fluss <dev@fluss.apache.org>",
+  "main": "./pkg/fluss_wasm.js",
+  "types": "./pkg/fluss_wasm.d.ts",
+  "files": [
+    "pkg"
+  ],
+  "keywords": [
+    "fluss",
+    "streaming",
+    "data",
+    "lake",
+    "wasm",
+    "webassembly"
+  ],
+  "scripts": {
+    "build": "wasm-pack build --target nodejs --release",
+    "build:web": "wasm-pack build --target web --release",
+    "test": "wasm-pack test --node",
+    "clean": "rm -rf pkg"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
