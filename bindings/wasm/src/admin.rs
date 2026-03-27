@@ -19,18 +19,19 @@
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
-use js_sys::Promise;
+use js_sys::{Array, Promise};
+use std::sync::Arc;
 
-use crate::error::Result;
+use crate::error::FlussWasmError;
 
 /// Admin interface for managing databases, tables, and partitions
 #[wasm_bindgen]
 pub struct FlussAdmin {
-    inner: fluss::client::FlussAdmin,
+    inner: Arc<fluss::client::FlussAdmin>,
 }
 
 impl FlussAdmin {
-    pub fn new(inner: fluss::client::FlussAdmin) -> Self {
+    pub fn new(inner: Arc<fluss::client::FlussAdmin>) -> Self {
         Self { inner }
     }
 }
@@ -38,44 +39,28 @@ impl FlussAdmin {
 #[wasm_bindgen]
 impl FlussAdmin {
     /// Create a new database
-    ///
-    /// # Arguments
-    ///
-    /// * `databaseName` - Name of the database to create
-    ///
-    /// # Example
-    ///
-    /// ```javascript
-    /// await admin.createDatabase("mydb");
-    /// ```
     #[wasm_bindgen]
-    pub fn create_database(&self, database_name: String) -> Promise {
+    pub fn create_database(&self, database_name: String, ignore_if_exists: Option<bool>) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
-            self.inner
-                .create_database(&database_name, None)
+            admin
+                .create_database(&database_name, None, ignore_if_exists.unwrap_or(false))
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
+                .map_err(FlussWasmError::from)?;
             Ok(JsValue::UNDEFINED)
         })
     }
 
     /// List all databases
-    ///
-    /// # Example
-    ///
-    /// ```javascript
-    /// const databases = await admin.listDatabases();
-    /// console.log(databases); // ["fluss", "mydb", ...]
-    /// ```
     #[wasm_bindgen]
     pub fn list_databases(&self) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
-            let dbs = self
-                .inner
+            let dbs = admin
                 .list_databases()
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
-            let js_array = js_sys::Array::new();
+                .map_err(FlussWasmError::from)?;
+            let js_array = Array::new();
             for db in dbs {
                 js_array.push(&JsValue::from(db));
             }
@@ -84,60 +69,41 @@ impl FlussAdmin {
     }
 
     /// Check if a database exists
-    ///
-    /// # Arguments
-    ///
-    /// * `databaseName` - Name of the database to check
     #[wasm_bindgen]
     pub fn database_exists(&self, database_name: String) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
-            let exists = self
-                .inner
+            let exists = admin
                 .database_exists(&database_name)
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
+                .map_err(FlussWasmError::from)?;
             Ok(JsValue::from(exists))
         })
     }
 
     /// Drop a database
-    ///
-    /// # Arguments
-    ///
-    /// * `databaseName` - Name of the database to drop
-    /// * `ifExists` - If true, don't error if database doesn't exist
     #[wasm_bindgen]
-    pub fn drop_database(&self, database_name: String, if_exists: Option<bool>) -> Promise {
+    pub fn drop_database(&self, database_name: String, if_exists: Option<bool>, ignore_if_not_exists: Option<bool>) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
-            self.inner
-                .drop_database(&database_name, if_exists.unwrap_or(false))
+            admin
+                .drop_database(&database_name, if_exists.unwrap_or(false), ignore_if_not_exists.unwrap_or(false))
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
+                .map_err(FlussWasmError::from)?;
             Ok(JsValue::UNDEFINED)
         })
     }
 
     /// List tables in a database
-    ///
-    /// # Arguments
-    ///
-    /// * `databaseName` - Name of the database
-    ///
-    /// # Example
-    ///
-    /// ```javascript
-    /// const tables = await admin.listTables("fluss");
-    /// console.log(tables); // ["users", "events", ...]
-    /// ```
     #[wasm_bindgen]
     pub fn list_tables(&self, database_name: String) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
-            let tables = self
-                .inner
+            let tables = admin
                 .list_tables(&database_name)
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
-            let js_array = js_sys::Array::new();
+                .map_err(FlussWasmError::from)?;
+            let js_array = Array::new();
             for table in tables {
                 js_array.push(&JsValue::from(table));
             }
@@ -146,23 +112,23 @@ impl FlussAdmin {
     }
 
     /// Get information about a table
-    ///
-    /// # Arguments
-    ///
-    /// * `databaseName` - Database name
-    /// * `tableName` - Table name
     #[wasm_bindgen]
     pub fn get_table_info(&self, database_name: String, table_name: String) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
             let table_path = fluss::metadata::TablePath::new(&database_name, &table_name);
-            let info = self
-                .inner
+            let info = admin
                 .get_table_info(&table_path)
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
-            // Convert to JSON-serializable value
-            let json = serde_json::to_string(&info)
-                .map_err(crate::error::FlussWasmError::from)?;
+                .map_err(FlussWasmError::from)?;
+            // Convert to JSON-serializable string
+            let json = format!(
+                "{{\"table_id\":{},\"table_name\":\"{}\",\"database_name\":\"{}\",\"has_primary_key\":{}}}",
+                info.table_id,
+                table_name,
+                database_name,
+                info.has_primary_key()
+            );
             Ok(JsValue::from_str(&json))
         })
     }
@@ -170,13 +136,13 @@ impl FlussAdmin {
     /// Check if a table exists
     #[wasm_bindgen]
     pub fn table_exists(&self, database_name: String, table_name: String) -> Promise {
+        let admin = Arc::clone(&self.inner);
         future_to_promise(async move {
             let table_path = fluss::metadata::TablePath::new(&database_name, &table_name);
-            let exists = self
-                .inner
+            let exists = admin
                 .table_exists(&table_path)
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
+                .map_err(FlussWasmError::from)?;
             Ok(JsValue::from(exists))
         })
     }

@@ -33,13 +33,10 @@ name = "fluss_wasm"
 
 [features]
 default = ["console_error_panic_hook"]
-storage-all = ["fluss/storage-all"]
-storage-fs = ["fluss/storage-fs"]
-storage-s3 = ["fluss/storage-s3"]
-storage-oss = ["fluss/storage-oss"]
 
 [dependencies]
-# Core fluss client
+# Core fluss client - use fluss with default features
+# Note: WASM build requires zstd-sys compilation, which needs clang with WASM support
 fluss = { workspace = true }
 
 # WASM bindings
@@ -61,12 +58,8 @@ thiserror = "1.0"
 console_error_panic_hook = { version = "0.1", optional = true }
 
 # Logging
-log = { version = "0.4", features = ["kv_std"] }
+log = { version = "0.4" }
 wasm-logger = "0.2"
-
-# Arrow support (for RecordBatch)
-arrow = { workspace = true }
-arrow-schema = "57.0.0"
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

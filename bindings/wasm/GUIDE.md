@@ -4,6 +4,16 @@
 
 This document provides a complete guide for implementing and using the Apache Fluss WASM bindings.
 
+## Current Status
+
+⚠️ **Important Limitation**: The current implementation has a dependency on `zstd-sys` (via `opendal`), which requires C compilation and is not compatible with WASM targets.
+
+### Workarounds
+
+1. **For Node.js**: Use the native Node.js addon approach instead of pure WASM
+2. **For Production**: Consider using the Java/Scala client via Node.js child processes
+3. **Future**: The Fluss team is working on a pure-Rust compression backend
+
 ## Architecture
 
 ```
@@ -23,7 +33,46 @@ fluss-wasm/
 └── README.md           # Documentation
 ```
 
-## Build Instructions
+## Alternative Approaches
+
+### Option 1: Node.js Native Module (Recommended)
+
+Instead of pure WASM, create a Node.js native module using [Neon](https://neon-bindings.com/):
+
+```toml
+[dependencies]
+fluss = { workspace = true }
+neon = "1.0"
+tokio = { workspace = true }
+```
+
+This approach:
+- ✅ Full performance with native code
+- ✅ No WASM compilation issues
+- ✅ Direct access to Node.js APIs
+- ❌ Requires native compilation for each platform
+
+### Option 2: HTTP Proxy Pattern
+
+Create a lightweight HTTP proxy that wraps the Fluss Rust client:
+
+```
+┌──────────────┐     HTTP      ┌─────────────┐     TCP     ┌──────────┐
+│  Browser/TS  │ ────────────> │ HTTP Proxy  │ ───────────> │  Fluss   │
+│   (WASM)     │   JSON/REST   │  (Rust)     │   Protocol  │  Server  │
+└──────────────┘               └─────────────┘              └──────────┘
+```
+
+**Benefits:**
+- ✅ WASM only handles JSON serialization
+- ✅ No direct TCP connection needed in browser
+- ✅ Single proxy can serve multiple clients
+
+### Option 3: Wait for Pure-Rust Compression
+
+Track these upstream issues:
+- [`zstd` pure Rust implementation](https://github.com/gyscos/zstd-rs)
+- [`opendal` WASM support](https://github.com/apache/opendal/issues)
 
 ### Prerequisites
 

@@ -35,12 +35,12 @@ name = "fluss"
 [features]
 default = ["storage-memory", "storage-fs"]
 storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-oss"]
+integration_tests = []
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-s3 = ["opendal/services-s3"]
 storage-oss = ["opendal/services-oss"]
-integration_tests = []
 
 [dependencies]
 arrow = { workspace = true }

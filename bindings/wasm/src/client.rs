@@ -20,16 +20,17 @@
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 use js_sys::Promise;
+use std::sync::Arc;
 
 use crate::config::WasmConfig;
 use crate::admin::FlussAdmin;
 use crate::table::FlussTable;
-use crate::error::Result;
+use crate::error::{FlussWasmError, Result};
 
 /// Main client for connecting to a Fluss cluster
 #[wasm_bindgen]
 pub struct FlussClient {
-    inner: fluss::client::FlussConnection,
+    inner: Arc<fluss::client::FlussConnection>,
 }
 
 #[wasm_bindgen]
@@ -56,8 +57,8 @@ impl FlussClient {
             let config = parse_config(config)?;
             let connection = fluss::client::FlussConnection::new(config)
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
-            let client = FlussClient { inner: connection };
+                .map_err(FlussWasmError::from)?;
+            let client = FlussClient { inner: Arc::new(connection) };
             Ok(JsValue::from(client))
         })
     }
@@ -73,7 +74,8 @@ impl FlussClient {
     /// ```
     #[wasm_bindgen]
     pub fn get_admin(&self) -> Result<FlussAdmin> {
-        Ok(FlussAdmin::new(self.inner.get_admin()?))
+        let admin = self.inner.get_admin().map_err(FlussWasmError::from)?;
+        Ok(FlussAdmin::new(admin))
     }
 
     /// Get a table handle for the given database and table name
@@ -90,14 +92,21 @@ impl FlussClient {
     /// ```
     #[wasm_bindgen]
     pub fn get_table(&self, database: String, table: String) -> Promise {
+        let conn = Arc::clone(&self.inner);
         future_to_promise(async move {
             let table_path = fluss::metadata::TablePath::new(&database, &table);
-            let fluss_table = self
-                .inner
+            let table_info = conn
                 .get_table(&table_path)
                 .await
-                .map_err(crate::error::FlussWasmError::from)?;
-            Ok(JsValue::from(FlussTable::new(fluss_table)))
+                .map_err(FlussWasmError::from)?;
+
+            let fluss_table = FlussTable::new(
+                table_path.to_string(),
+                database,
+                table,
+                table_info.has_primary_key(),
+            );
+            Ok(JsValue::from(fluss_table))
         })
     }
 

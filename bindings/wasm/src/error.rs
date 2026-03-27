@@ -23,16 +23,25 @@ use wasm_bindgen::JsValue;
 #[derive(Debug, thiserror::Error)]
 pub enum FlussWasmError {
     #[error("Fluss client error: {0}")]
-    Fluss(#[from] fluss::error::FlussError),
+    Fluss(String),
 
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    #[error("WASM binding error: {0}")]
+    WasmBinding(#[from] serde_wasm_bindgen::Error),
 
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
     #[error("Not initialized: {0}")]
     NotInitialized(String),
+}
+
+impl From<fluss::error::Error> for FlussWasmError {
+    fn from(err: fluss::error::Error) -> Self {
+        FlussWasmError::Fluss(err.to_string())
+    }
 }
 
 impl From<FlussWasmError> for JsValue {

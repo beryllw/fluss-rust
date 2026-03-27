@@ -26,7 +26,6 @@ use wasm_bindgen::prelude::*;
 /// ```javascript
 /// const config = {
 ///     bootstrapServers: "localhost:9123",
-///     requestTimeoutMs: 30000,
 ///     // ... other options
 /// };
 /// ```
@@ -36,14 +35,6 @@ pub struct WasmConfig {
     /// Bootstrap servers, e.g., "localhost:9123"
     #[wasm_bindgen(getter_with_clone)]
     pub bootstrap_servers: String,
-
-    /// Request timeout in milliseconds
-    #[wasm_bindgen(getter_with_clone)]
-    pub request_timeout_ms: Option<u64>,
-
-    /// Maximum request size in bytes
-    #[wasm_bindgen(getter_with_clone)]
-    pub max_request_size: Option<usize>,
 }
 
 #[wasm_bindgen]
@@ -53,18 +44,14 @@ impl WasmConfig {
     pub fn new(bootstrap_servers: String) -> Self {
         Self {
             bootstrap_servers,
-            request_timeout_ms: None,
-            max_request_size: None,
         }
     }
 
     /// Create default config
-    #[wasm_bindgen(static_method_of = WasmConfig)]
+    #[wasm_bindgen]
     pub fn default() -> Self {
         Self {
             bootstrap_servers: String::new(),
-            request_timeout_ms: None,
-            max_request_size: None,
         }
     }
 
@@ -73,27 +60,12 @@ impl WasmConfig {
         self.bootstrap_servers = servers;
         self
     }
-
-    /// Set request timeout in milliseconds
-    pub fn with_request_timeout(mut self, timeout_ms: u64) -> Self {
-        self.request_timeout_ms = Some(timeout_ms);
-        self
-    }
-
-    /// Set max request size in bytes
-    pub fn with_max_request_size(mut self, size: usize) -> Self {
-        self.max_request_size = Some(size);
-        self
-    }
 }
 
 impl From<WasmConfig> for fluss::config::Config {
     fn from(config: WasmConfig) -> Self {
         let mut inner = fluss::config::Config::default();
         inner.bootstrap_servers = config.bootstrap_servers;
-        if let Some(timeout_ms) = config.request_timeout_ms {
-            inner.request_timeout = Some(std::time::Duration::from_millis(timeout_ms));
-        }
         inner
     }
 }
