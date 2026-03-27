@@ -1,0 +1,37 @@
+{
+  "name": "fluss-node",
+  "version": "0.2.0",
+  "description": "Apache Fluss Node.js client (napi-rs native binding)",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "fluss",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin"
+      ]
+    }
+  },
+  "scripts": {
+    "artifacts": "napi artifacts",
+    "build": "napi build --platform --release",
+    "build:debug": "napi build --platform",
+    "test": "node --import tsx --test --test-timeout=120000 __test__/unit/*.spec.ts __test__/integration/*.spec.ts; node --import tsx __test__/helpers/teardown.ts",
+    "test:unit": "node --import tsx --test __test__/unit/*.spec.ts",
+    "test:integration": "node --import tsx --test --test-timeout=120000 __test__/integration/*.spec.ts; node --import tsx __test__/helpers/teardown.ts",
+    "typecheck": "tsc --noEmit",
+    "example": "node example/example.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0",
+    "@types/node": "^22.0.0",
+    "testcontainers": "^10.18.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">= 18"
+  },
+  "license": "Apache-2.0"
+}

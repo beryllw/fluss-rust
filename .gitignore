@@ -36,6 +36,13 @@ uv.lock
 *CMakeFiles/
 .cache/
 
+# Node.js bindings
+bindings/node/node_modules
+bindings/node/package-lock.json
+bindings/node/npm-debug.log*
+bindings/node/yarn-debug.log*
+bindings/node/yarn-error.log*
+
 # Website (Docusaurus)
 website/node_modules
 website/build
