@@ -17,17 +17,29 @@
 
 [package]
 edition = { workspace = true }
+license.workspace = true
 rust-version = { workspace = true }
 version = { workspace = true }
+name = "fluss-rs"
+authors = { workspace = true }
+description = "The official rust client of Apache Fluss (Incubating)"
+homepage = "https://clients.fluss.apache.org/user-guide/rust/installation/"
+repository = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+documentation = "https://docs.rs/fluss-rs"
+
+[lib]
 name = "fluss"
 
 [features]
-default = ["storage-memory", "storage-fs", "storage-s3"]
-storage-all = ["storage-memory", "storage-fs", "storage-s3"]
+default = ["storage-memory", "storage-fs"]
+storage-all = ["storage-memory", "storage-fs", "storage-s3", "storage-oss"]
 
 storage-memory = ["opendal/services-memory"]
 storage-fs = ["opendal/services-fs"]
 storage-s3 = ["opendal/services-s3"]
+storage-oss = ["opendal/services-oss"]
 integration_tests = []
 
 [dependencies]
@@ -49,10 +61,9 @@ tokio = { workspace = true }
 parking_lot = "0.12"
 bytes = "1.10.1"
 dashmap = "6.1.0"
-bigdecimal = { version = "0.4", features = ["serde"] }
+bigdecimal = { workspace = true, features = ["serde"] }
 ordered-float = { version = "5", features = ["serde"] }
 parse-display = "0.10"
-ref-cast = "1.0"
 jiff = { workspace = true }
 opendal = "0.55.0"
 url = "2.5.7"
@@ -71,6 +82,5 @@ jiff = { workspace = true, features = ["js"] }
 testcontainers = "0.25.0"
 test-env-helpers = "0.2.2"
 
-
 [build-dependencies]
-prost-build = { version = "0.14" }
+prost-build = "0.14"

@@ -31,16 +31,14 @@ mod partition_getter;
 mod remote_log;
 mod scanner;
 mod upsert;
-mod writer;
 
-use crate::client::table::upsert::TableUpsert;
 pub use append::{AppendWriter, TableAppend};
 pub use lookup::{LookupResult, Lookuper, TableLookup};
 pub use remote_log::{
-    DEFAULT_SCANNER_REMOTE_LOG_DOWNLOAD_THREADS, DEFAULT_SCANNER_REMOTE_LOG_PREFETCH_NUM,
+    DEFAULT_REMOTE_FILE_DOWNLOAD_THREAD_NUM, DEFAULT_SCANNER_REMOTE_LOG_PREFETCH_NUM,
 };
 pub use scanner::{LogScanner, RecordBatchLogScanner, TableScan};
-pub use writer::{TableWriter, UpsertWriter};
+pub use upsert::{TableUpsert, UpsertWriter};
 
 #[allow(dead_code)]
 pub struct FlussTable<'a> {
@@ -62,14 +60,16 @@ impl<'a> FlussTable<'a> {
         }
     }
 
-    pub fn get_table_info(&self) -> &TableInfo {
-        &self.table_info
-    }
-
     pub fn new_append(&self) -> Result<TableAppend> {
+        if self.has_primary_key {
+            return Err(Error::UnsupportedOperation {
+                message: "Append is only supported for log tables (without primary key)"
+                    .to_string(),
+            });
+        }
         Ok(TableAppend::new(
             self.table_path.clone(),
-            self.table_info.clone(),
+            Arc::new(self.table_info.clone()),
             self.conn.get_or_create_writer_client()?,
         ))
     }
@@ -82,7 +82,7 @@ impl<'a> FlussTable<'a> {
         &self.metadata
     }
 
-    pub fn table_info(&self) -> &TableInfo {
+    pub fn get_table_info(&self) -> &TableInfo {
         &self.table_info
     }
 
@@ -114,14 +114,14 @@ impl<'a> FlussTable<'a> {
     ///     println!("Found value: {:?}", value);
     /// }
     /// ```
-    pub fn new_lookup(&self) -> Result<TableLookup<'_>> {
+    pub fn new_lookup(&self) -> Result<TableLookup> {
         if !self.has_primary_key {
             return Err(Error::UnsupportedOperation {
                 message: "Lookup is only supported for primary key tables".to_string(),
             });
         }
         Ok(TableLookup::new(
-            self.conn,
+            self.conn.get_connections(),
             self.table_info.clone(),
             self.metadata.clone(),
         ))

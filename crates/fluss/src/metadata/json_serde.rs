@@ -403,8 +403,7 @@ impl JsonSerde for Column {
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::JsonSerdeError {
                 message: format!("Missing required field: {}", Self::NAME),
-            })?
-            .to_string();
+            })?;
 
         let data_type_node = node
             .get(Self::DATA_TYPE)
@@ -414,7 +413,7 @@ impl JsonSerde for Column {
 
         let data_type = DataType::deserialize_json(data_type_node)?;
 
-        let mut column = Column::new(&name, data_type);
+        let mut column = Column::new(name, data_type);
 
         if let Some(comment) = node.get(Self::COMMENT).and_then(|v| v.as_str()) {
             column = column.with_comment(comment);
@@ -477,19 +476,16 @@ impl JsonSerde for Schema {
         let mut schema_builder = Schema::builder().with_columns(columns);
 
         if let Some(pk_node) = node.get(Self::PRIMARY_KEY_NAME) {
-            let pk_array = pk_node.as_array().ok_or_else(|| Error::InvalidTableError {
-                message: "Primary key must be an array".to_string(),
-            })?;
+            let pk_array = pk_node
+                .as_array()
+                .ok_or_else(|| Error::invalid_table("Primary key must be an array"))?;
 
             let mut primary_keys = Vec::with_capacity(pk_array.len());
             for name_node in pk_array {
                 primary_keys.push(
-                    name_node
-                        .as_str()
-                        .ok_or_else(|| Error::InvalidTableError {
-                            message: "Primary key element must be a string".to_string(),
-                        })?
-                        .to_string(),
+                    name_node.as_str().ok_or_else(|| {
+                        Error::invalid_table("Primary key element must be a string")
+                    })?,
                 );
             }
 

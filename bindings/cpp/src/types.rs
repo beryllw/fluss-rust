@@ -17,15 +17,11 @@
 
 use crate::ffi;
 use anyhow::{Result, anyhow};
-use arrow::array::{
-    Date32Array, LargeBinaryArray, LargeStringArray, Time32MillisecondArray, Time32SecondArray,
-    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
-};
-use arrow::datatypes::{DataType as ArrowDataType, TimeUnit};
-use fcore::row::InternalRow;
+use arrow::array::Array;
+use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use fluss as fcore;
 use std::borrow::Cow;
+use std::str::FromStr;
 
 pub const DATA_TYPE_BOOLEAN: i32 = 1;
 pub const DATA_TYPE_TINYINT: i32 = 2;
@@ -40,17 +36,13 @@ pub const DATA_TYPE_DATE: i32 = 10;
 pub const DATA_TYPE_TIME: i32 = 11;
 pub const DATA_TYPE_TIMESTAMP: i32 = 12;
 pub const DATA_TYPE_TIMESTAMP_LTZ: i32 = 13;
+pub const DATA_TYPE_DECIMAL: i32 = 14;
+pub const DATA_TYPE_CHAR: i32 = 15;
+pub const DATA_TYPE_BINARY: i32 = 16;
 
-pub const DATUM_TYPE_NULL: i32 = 0;
-pub const DATUM_TYPE_BOOL: i32 = 1;
-pub const DATUM_TYPE_INT32: i32 = 2;
-pub const DATUM_TYPE_INT64: i32 = 3;
-pub const DATUM_TYPE_FLOAT32: i32 = 4;
-pub const DATUM_TYPE_FLOAT64: i32 = 5;
-pub const DATUM_TYPE_STRING: i32 = 6;
-pub const DATUM_TYPE_BYTES: i32 = 7;
+// DATUM_TYPE_* constants removed — no longer needed with opaque types.
 
-fn ffi_data_type_to_core(dt: i32) -> Result<fcore::metadata::DataType> {
+fn ffi_data_type_to_core(dt: i32, precision: u32, scale: u32) -> Result<fcore::metadata::DataType> {
     match dt {
         DATA_TYPE_BOOLEAN => Ok(fcore::metadata::DataTypes::boolean()),
         DATA_TYPE_TINYINT => Ok(fcore::metadata::DataTypes::tinyint()),
@@ -63,13 +55,23 @@ fn ffi_data_type_to_core(dt: i32) -> Result<fcore::metadata::DataType> {
         DATA_TYPE_BYTES => Ok(fcore::metadata::DataTypes::bytes()),
         DATA_TYPE_DATE => Ok(fcore::metadata::DataTypes::date()),
         DATA_TYPE_TIME => Ok(fcore::metadata::DataTypes::time()),
-        DATA_TYPE_TIMESTAMP => Ok(fcore::metadata::DataTypes::timestamp()),
-        DATA_TYPE_TIMESTAMP_LTZ => Ok(fcore::metadata::DataTypes::timestamp_ltz()),
+        DATA_TYPE_TIMESTAMP => Ok(fcore::metadata::DataTypes::timestamp_with_precision(
+            precision,
+        )),
+        DATA_TYPE_TIMESTAMP_LTZ => Ok(fcore::metadata::DataTypes::timestamp_ltz_with_precision(
+            precision,
+        )),
+        DATA_TYPE_DECIMAL => {
+            let dt = fcore::metadata::DecimalType::new(precision, scale)?;
+            Ok(fcore::metadata::DataType::Decimal(dt))
+        }
+        DATA_TYPE_CHAR => Ok(fcore::metadata::DataTypes::char(precision)),
+        DATA_TYPE_BINARY => Ok(fcore::metadata::DataTypes::binary(precision as usize)),
         _ => Err(anyhow!("Unknown data type: {dt}")),
     }
 }
 
-fn core_data_type_to_ffi(dt: &fcore::metadata::DataType) -> i32 {
+pub fn core_data_type_to_ffi(dt: &fcore::metadata::DataType) -> i32 {
     match dt {
         fcore::metadata::DataType::Boolean(_) => DATA_TYPE_BOOLEAN,
         fcore::metadata::DataType::TinyInt(_) => DATA_TYPE_TINYINT,
@@ -84,6 +86,9 @@ fn core_data_type_to_ffi(dt: &fcore::metadata::DataType) -> i32 {
         fcore::metadata::DataType::Time(_) => DATA_TYPE_TIME,
         fcore::metadata::DataType::Timestamp(_) => DATA_TYPE_TIMESTAMP,
         fcore::metadata::DataType::TimestampLTz(_) => DATA_TYPE_TIMESTAMP_LTZ,
+        fcore::metadata::DataType::Decimal(_) => DATA_TYPE_DECIMAL,
+        fcore::metadata::DataType::Char(_) => DATA_TYPE_CHAR,
+        fcore::metadata::DataType::Binary(_) => DATA_TYPE_BINARY,
         _ => 0,
     }
 }
@@ -94,7 +99,13 @@ pub fn ffi_descriptor_to_core(
     let mut schema_builder = fcore::metadata::Schema::builder();
 
     for col in &descriptor.schema.columns {
-        let dt = ffi_data_type_to_core(col.data_type)?;
+        if col.precision < 0 || col.scale < 0 {
+            return Err(anyhow!(
+                "Column '{}': precision and scale must be non-negative",
+                col.name
+            ));
+        }
+        let dt = ffi_data_type_to_core(col.data_type, col.precision as u32, col.scale as u32)?;
         schema_builder = schema_builder.column(&col.name, dt);
         if !col.comment.is_empty() {
             schema_builder = schema_builder.with_comment(&col.comment);
@@ -124,6 +135,15 @@ pub fn ffi_descriptor_to_core(
         builder = builder.property(&prop.key, &prop.value);
     }
 
+    if !descriptor.custom_properties.is_empty() {
+        let custom: std::collections::HashMap<String, String> = descriptor
+            .custom_properties
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.value.clone()))
+            .collect();
+        builder = builder.custom_properties(custom);
+    }
+
     if !descriptor.comment.is_empty() {
         builder = builder.comment(&descriptor.comment);
     }
@@ -136,10 +156,24 @@ pub fn core_table_info_to_ffi(info: &fcore::metadata::TableInfo) -> ffi::FfiTabl
     let columns: Vec<ffi::FfiColumn> = schema
         .columns()
         .iter()
-        .map(|col| ffi::FfiColumn {
-            name: col.name().to_string(),
-            data_type: core_data_type_to_ffi(col.data_type()),
-            comment: col.comment().unwrap_or("").to_string(),
+        .map(|col| {
+            let (precision, scale) = match col.data_type() {
+                fcore::metadata::DataType::Decimal(dt) => {
+                    (dt.precision() as i32, dt.scale() as i32)
+                }
+                fcore::metadata::DataType::Timestamp(dt) => (dt.precision() as i32, 0),
+                fcore::metadata::DataType::TimestampLTz(dt) => (dt.precision() as i32, 0),
+                fcore::metadata::DataType::Char(dt) => (dt.length() as i32, 0),
+                fcore::metadata::DataType::Binary(dt) => (dt.length() as i32, 0),
+                _ => (0, 0),
+            };
+            ffi::FfiColumn {
+                name: col.name().to_string(),
+                data_type: core_data_type_to_ffi(col.data_type()),
+                comment: col.comment().unwrap_or("").to_string(),
+                precision,
+                scale,
+            }
         })
         .collect();
 
@@ -150,6 +184,15 @@ pub fn core_table_info_to_ffi(info: &fcore::metadata::TableInfo) -> ffi::FfiTabl
 
     let properties: Vec<ffi::HashMapValue> = info
         .get_properties()
+        .iter()
+        .map(|(k, v)| ffi::HashMapValue {
+            key: k.clone(),
+            value: v.clone(),
+        })
+        .collect();
+
+    let custom_properties: Vec<ffi::HashMapValue> = info
+        .get_custom_properties()
         .iter()
         .map(|(k, v)| ffi::HashMapValue {
             key: k.clone(),
@@ -173,6 +216,7 @@ pub fn core_table_info_to_ffi(info: &fcore::metadata::TableInfo) -> ffi::FfiTabl
         has_primary_key: info.has_primary_key(),
         is_partitioned: info.is_partitioned(),
         properties,
+        custom_properties,
         comment: info.get_comment().unwrap_or("").to_string(),
         schema: ffi::FfiSchema {
             columns,
@@ -198,6 +242,7 @@ pub fn empty_table_info() -> ffi::FfiTableInfo {
         has_primary_key: false,
         is_partitioned: false,
         properties: vec![],
+        custom_properties: vec![],
         comment: String::new(),
         schema: ffi::FfiSchema {
             columns: vec![],
@@ -206,259 +251,170 @@ pub fn empty_table_info() -> ffi::FfiTableInfo {
     }
 }
 
-pub fn ffi_row_to_core(row: &ffi::FfiGenericRow) -> fcore::row::GenericRow<'_> {
+/// Convert FFI database descriptor to core. Returns None if descriptor is effectively empty
+/// (no comment and no properties), so create_database can pass Option::None to core.
+pub fn ffi_database_descriptor_to_core(
+    d: &ffi::FfiDatabaseDescriptor,
+) -> Option<fcore::metadata::DatabaseDescriptor> {
+    if d.comment.is_empty() && d.properties.is_empty() {
+        return None;
+    }
+    let mut builder = fcore::metadata::DatabaseDescriptor::builder();
+    if !d.comment.is_empty() {
+        builder = builder.comment(&d.comment);
+    }
+    if !d.properties.is_empty() {
+        let props: std::collections::HashMap<String, String> = d
+            .properties
+            .iter()
+            .map(|kv| (kv.key.clone(), kv.value.clone()))
+            .collect();
+        builder = builder.custom_properties(props);
+    }
+    Some(builder.build())
+}
+
+/// Convert core DatabaseInfo to FFI.
+pub fn core_database_info_to_ffi(info: &fcore::metadata::DatabaseInfo) -> ffi::FfiDatabaseInfo {
+    let desc = info.database_descriptor();
+    let properties: Vec<ffi::HashMapValue> = desc
+        .custom_properties()
+        .iter()
+        .map(|(k, v)| ffi::HashMapValue {
+            key: k.clone(),
+            value: v.clone(),
+        })
+        .collect();
+    ffi::FfiDatabaseInfo {
+        database_name: info.database_name().to_string(),
+        comment: desc.comment().unwrap_or("").to_string(),
+        properties,
+        created_time: info.created_time(),
+        modified_time: info.modified_time(),
+    }
+}
+
+/// Resolve types in a GenericRow using schema metadata.
+/// Narrows Int32 → Int8/Int16, parses decimal strings, etc.
+/// Used by both AppendWriter and UpsertWriter.
+pub fn resolve_row_types(
+    row: &fcore::row::GenericRow<'_>,
+    schema: Option<&fcore::metadata::Schema>,
+) -> Result<fcore::row::GenericRow<'static>> {
     use fcore::row::Datum;
 
-    let mut generic_row = fcore::row::GenericRow::new(row.fields.len());
+    let mut out = fcore::row::GenericRow::new(row.values.len());
 
-    for (idx, field) in row.fields.iter().enumerate() {
-        let datum = match field.datum_type {
-            DATUM_TYPE_NULL => Datum::Null,
-            DATUM_TYPE_BOOL => Datum::Bool(field.bool_val),
-            DATUM_TYPE_INT32 => Datum::Int32(field.i32_val),
-            DATUM_TYPE_INT64 => Datum::Int64(field.i64_val),
-            DATUM_TYPE_FLOAT32 => Datum::Float32(field.f32_val.into()),
-            DATUM_TYPE_FLOAT64 => Datum::Float64(field.f64_val.into()),
-            DATUM_TYPE_STRING => Datum::String(Cow::Borrowed(field.string_val.as_str())),
-            DATUM_TYPE_BYTES => Datum::Blob(Cow::Borrowed(field.bytes_val.as_slice())),
-            _ => Datum::Null,
+    for (idx, datum) in row.values.iter().enumerate() {
+        let resolved = match datum {
+            Datum::Null => Datum::Null,
+            Datum::Bool(v) => Datum::Bool(*v),
+            Datum::Int32(v) => match schema
+                .and_then(|s| s.columns().get(idx))
+                .map(|c| c.data_type())
+            {
+                Some(fcore::metadata::DataType::TinyInt(_)) => Datum::Int8(
+                    i8::try_from(*v).map_err(|_| anyhow!("Column {idx}: {v} overflows TinyInt"))?,
+                ),
+                Some(fcore::metadata::DataType::SmallInt(_)) => Datum::Int16(
+                    i16::try_from(*v)
+                        .map_err(|_| anyhow!("Column {idx}: {v} overflows SmallInt"))?,
+                ),
+                _ => Datum::Int32(*v),
+            },
+            Datum::Int64(v) => Datum::Int64(*v),
+            Datum::Float32(v) => Datum::Float32(*v),
+            Datum::Float64(v) => Datum::Float64(*v),
+            Datum::Int8(v) => Datum::Int8(*v),
+            Datum::Int16(v) => Datum::Int16(*v),
+            Datum::String(cow) => {
+                // Check if the schema column is Decimal — if so, parse the string as decimal
+                match schema
+                    .and_then(|s| s.columns().get(idx))
+                    .map(|c| c.data_type())
+                {
+                    Some(fcore::metadata::DataType::Decimal(dt)) => {
+                        let (precision, scale) = (dt.precision(), dt.scale());
+                        let bd = bigdecimal::BigDecimal::from_str(cow.as_ref()).map_err(|e| {
+                            anyhow!("Column {idx}: invalid decimal string '{cow}': {e}")
+                        })?;
+                        let decimal = fcore::row::Decimal::from_big_decimal(bd, precision, scale)
+                            .map_err(|e| anyhow!("Column {idx}: {e}"))?;
+                        Datum::Decimal(decimal)
+                    }
+                    _ => Datum::String(Cow::Owned(cow.to_string())),
+                }
+            }
+            Datum::Blob(cow) => Datum::Blob(Cow::Owned(cow.to_vec())),
+            Datum::Decimal(d) => Datum::Decimal(d.clone()),
+            Datum::Date(d) => Datum::Date(*d),
+            Datum::Time(t) => Datum::Time(*t),
+            Datum::TimestampNtz(ts) => Datum::TimestampNtz(*ts),
+            Datum::TimestampLtz(ts) => Datum::TimestampLtz(*ts),
         };
-        generic_row.set_field(idx, datum);
+        out.set_field(idx, resolved);
     }
 
-    generic_row
+    Ok(out)
 }
 
-pub fn core_scan_records_to_ffi(records: &fcore::record::ScanRecords) -> ffi::FfiScanRecords {
-    let mut ffi_records = Vec::new();
+/// Convert a CompactedRow (lookup result) to an owned GenericRow<'static>.
+/// One copy for strings/bytes (Cow::Owned), but no second copy into FfiDatum.
+pub fn compacted_row_to_owned(
+    row: &dyn fcore::row::InternalRow,
+    table_info: &fcore::metadata::TableInfo,
+) -> Result<fcore::row::GenericRow<'static>> {
+    use fcore::row::Datum;
 
-    // Iterate over all buckets and their records
-    for (table_bucket, bucket_records) in records.records_by_buckets() {
-        let bucket_id = table_bucket.bucket_id();
-        for record in bucket_records {
-            let row = record.row();
-            let fields = core_row_to_ffi_fields(row);
+    let schema = table_info.get_schema();
+    let columns = schema.columns();
+    let mut out = fcore::row::GenericRow::new(columns.len());
 
-            ffi_records.push(ffi::FfiScanRecord {
-                bucket_id,
-                offset: record.offset(),
-                timestamp: record.timestamp(),
-                row: ffi::FfiGenericRow { fields },
-            });
-        }
-    }
-
-    ffi::FfiScanRecords {
-        records: ffi_records,
-    }
-}
-
-fn core_row_to_ffi_fields(row: &fcore::row::ColumnarRow) -> Vec<ffi::FfiDatum> {
-    fn new_datum(datum_type: i32) -> ffi::FfiDatum {
-        ffi::FfiDatum {
-            datum_type,
-            bool_val: false,
-            i32_val: 0,
-            i64_val: 0,
-            f32_val: 0.0,
-            f64_val: 0.0,
-            string_val: String::new(),
-            bytes_val: vec![],
-        }
-    }
-
-    let record_batch = row.get_record_batch();
-    let schema = record_batch.schema();
-    let row_id = row.get_row_id();
-
-    let mut fields = Vec::with_capacity(schema.fields().len());
-
-    for (i, field) in schema.fields().iter().enumerate() {
-        if row.is_null_at(i) {
-            fields.push(new_datum(DATUM_TYPE_NULL));
+    for (i, col) in columns.iter().enumerate() {
+        if row.is_null_at(i)? {
+            out.set_field(i, Datum::Null);
             continue;
         }
 
-        let datum = match field.data_type() {
-            ArrowDataType::Boolean => {
-                let mut datum = new_datum(DATUM_TYPE_BOOL);
-                datum.bool_val = row.get_boolean(i);
-                datum
+        let datum = match col.data_type() {
+            fcore::metadata::DataType::Boolean(_) => Datum::Bool(row.get_boolean(i)?),
+            fcore::metadata::DataType::TinyInt(_) => Datum::Int8(row.get_byte(i)?),
+            fcore::metadata::DataType::SmallInt(_) => Datum::Int16(row.get_short(i)?),
+            fcore::metadata::DataType::Int(_) => Datum::Int32(row.get_int(i)?),
+            fcore::metadata::DataType::BigInt(_) => Datum::Int64(row.get_long(i)?),
+            fcore::metadata::DataType::Float(_) => Datum::Float32(row.get_float(i)?.into()),
+            fcore::metadata::DataType::Double(_) => Datum::Float64(row.get_double(i)?.into()),
+            fcore::metadata::DataType::String(_) => {
+                Datum::String(Cow::Owned(row.get_string(i)?.to_string()))
             }
-            ArrowDataType::Int8 => {
-                let mut datum = new_datum(DATUM_TYPE_INT32);
-                datum.i32_val = row.get_byte(i) as i32;
-                datum
+            fcore::metadata::DataType::Bytes(_) => {
+                Datum::Blob(Cow::Owned(row.get_bytes(i)?.to_vec()))
             }
-            ArrowDataType::Int16 => {
-                let mut datum = new_datum(DATUM_TYPE_INT32);
-                datum.i32_val = row.get_short(i) as i32;
-                datum
+            fcore::metadata::DataType::Date(_) => Datum::Date(row.get_date(i)?),
+            fcore::metadata::DataType::Time(_) => Datum::Time(row.get_time(i)?),
+            fcore::metadata::DataType::Timestamp(dt) => {
+                Datum::TimestampNtz(row.get_timestamp_ntz(i, dt.precision())?)
             }
-            ArrowDataType::Int32 => {
-                let mut datum = new_datum(DATUM_TYPE_INT32);
-                datum.i32_val = row.get_int(i);
-                datum
+            fcore::metadata::DataType::TimestampLTz(dt) => {
+                Datum::TimestampLtz(row.get_timestamp_ltz(i, dt.precision())?)
             }
-            ArrowDataType::Int64 => {
-                let mut datum = new_datum(DATUM_TYPE_INT64);
-                datum.i64_val = row.get_long(i);
-                datum
+            fcore::metadata::DataType::Decimal(dt) => {
+                let decimal = row.get_decimal(i, dt.precision() as usize, dt.scale() as usize)?;
+                Datum::Decimal(decimal)
             }
-            ArrowDataType::Float32 => {
-                let mut datum = new_datum(DATUM_TYPE_FLOAT32);
-                datum.f32_val = row.get_float(i);
-                datum
+            fcore::metadata::DataType::Char(dt) => Datum::String(Cow::Owned(
+                row.get_char(i, dt.length() as usize)?.to_string(),
+            )),
+            fcore::metadata::DataType::Binary(dt) => {
+                Datum::Blob(Cow::Owned(row.get_binary(i, dt.length())?.to_vec()))
             }
-            ArrowDataType::Float64 => {
-                let mut datum = new_datum(DATUM_TYPE_FLOAT64);
-                datum.f64_val = row.get_double(i);
-                datum
-            }
-            ArrowDataType::Utf8 => {
-                let mut datum = new_datum(DATUM_TYPE_STRING);
-                // todo: avoid copy string
-                datum.string_val = row.get_string(i).to_string();
-                datum
-            }
-            ArrowDataType::LargeUtf8 => {
-                let array = record_batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .expect("LargeUtf8 column expected");
-                let mut datum = new_datum(DATUM_TYPE_STRING);
-                datum.string_val = array.value(row_id).to_string();
-                datum
-            }
-            ArrowDataType::Binary => {
-                let mut datum = new_datum(DATUM_TYPE_BYTES);
-                // todo: avoid copy bytes for blob
-                datum.bytes_val = row.get_bytes(i).to_vec();
-                datum
-            }
-            ArrowDataType::FixedSizeBinary(len) => {
-                let mut datum = new_datum(DATUM_TYPE_BYTES);
-                datum.bytes_val = row.get_binary(i, *len as usize).to_vec();
-                datum
-            }
-            ArrowDataType::LargeBinary => {
-                let array = record_batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .expect("LargeBinary column expected");
-                let mut datum = new_datum(DATUM_TYPE_BYTES);
-                datum.bytes_val = array.value(row_id).to_vec();
-                datum
-            }
-            ArrowDataType::Date32 => {
-                let array = record_batch
-                    .column(i)
-                    .as_any()
-                    .downcast_ref::<Date32Array>()
-                    .expect("Date32 column expected");
-                let mut datum = new_datum(DATUM_TYPE_INT32);
-                datum.i32_val = array.value(row_id);
-                datum
-            }
-            ArrowDataType::Timestamp(unit, _) => match unit {
-                TimeUnit::Second => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<TimestampSecondArray>()
-                        .expect("Timestamp(second) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT64);
-                    datum.i64_val = array.value(row_id);
-                    datum
-                }
-                TimeUnit::Millisecond => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<TimestampMillisecondArray>()
-                        .expect("Timestamp(millisecond) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT64);
-                    datum.i64_val = array.value(row_id);
-                    datum
-                }
-                TimeUnit::Microsecond => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<TimestampMicrosecondArray>()
-                        .expect("Timestamp(microsecond) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT64);
-                    datum.i64_val = array.value(row_id);
-                    datum
-                }
-                TimeUnit::Nanosecond => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<TimestampNanosecondArray>()
-                        .expect("Timestamp(nanosecond) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT64);
-                    datum.i64_val = array.value(row_id);
-                    datum
-                }
-            },
-            ArrowDataType::Time32(unit) => match unit {
-                TimeUnit::Second => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<Time32SecondArray>()
-                        .expect("Time32(second) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT32);
-                    datum.i32_val = array.value(row_id);
-                    datum
-                }
-                TimeUnit::Millisecond => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<Time32MillisecondArray>()
-                        .expect("Time32(millisecond) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT32);
-                    datum.i32_val = array.value(row_id);
-                    datum
-                }
-                _ => panic!("Will never come here. Unsupported Time32 unit for column {i}"),
-            },
-            ArrowDataType::Time64(unit) => match unit {
-                TimeUnit::Microsecond => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<Time64MicrosecondArray>()
-                        .expect("Time64(microsecond) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT64);
-                    datum.i64_val = array.value(row_id);
-                    datum
-                }
-                TimeUnit::Nanosecond => {
-                    let array = record_batch
-                        .column(i)
-                        .as_any()
-                        .downcast_ref::<Time64NanosecondArray>()
-                        .expect("Time64(nanosecond) column expected");
-                    let mut datum = new_datum(DATUM_TYPE_INT64);
-                    datum.i64_val = array.value(row_id);
-                    datum
-                }
-                _ => panic!("Will never come here. Unsupported Time64 unit for column {i}"),
-            },
-            other => panic!(
-                "Will never come here. Unsupported Arrow data type for column {i}: {other:?}"
-            ),
+            other => return Err(anyhow!("Unsupported data type for column {i}: {other:?}")),
         };
 
-        fields.push(datum);
+        out.set_field(i, datum);
     }
 
-    fields
+    Ok(out)
 }
 
 pub fn core_lake_snapshot_to_ffi(snapshot: &fcore::metadata::LakeSnapshot) -> ffi::FfiLakeSnapshot {
@@ -477,4 +433,32 @@ pub fn core_lake_snapshot_to_ffi(snapshot: &fcore::metadata::LakeSnapshot) -> ff
         snapshot_id: snapshot.snapshot_id,
         bucket_offsets,
     }
+}
+
+pub fn core_scan_batches_to_ffi(
+    batches: &[fcore::record::ScanBatch],
+) -> Result<ffi::FfiArrowRecordBatches, String> {
+    let mut ffi_batches = Vec::new();
+    for batch in batches {
+        let record_batch = batch.batch();
+        // Convert RecordBatch to StructArray first, then get the data
+        let struct_array = arrow::array::StructArray::from(record_batch.clone());
+        let ffi_array = Box::new(FFI_ArrowArray::new(&struct_array.into_data()));
+        let ffi_schema = Box::new(
+            FFI_ArrowSchema::try_from(record_batch.schema().as_ref()).map_err(|e| e.to_string())?,
+        );
+        // Export as raw pointers
+        ffi_batches.push(ffi::FfiArrowRecordBatch {
+            array_ptr: Box::into_raw(ffi_array) as usize,
+            schema_ptr: Box::into_raw(ffi_schema) as usize,
+            table_id: batch.bucket().table_id(),
+            partition_id: batch.bucket().partition_id().unwrap_or(-1),
+            bucket_id: batch.bucket().bucket_id(),
+            base_offset: batch.base_offset(),
+        });
+    }
+
+    Ok(ffi::FfiArrowRecordBatches {
+        batches: ffi_batches,
+    })
 }

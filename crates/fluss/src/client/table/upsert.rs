@@ -15,16 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::client::table::writer::{DeleteResult, TableWriter, UpsertResult, UpsertWriter};
-use crate::client::{RowBytes, WriteFormat, WriteRecord, WriterClient};
-use crate::error::Error::IllegalArgument;
+use crate::client::{RowBytes, WriteFormat, WriteRecord, WriteResultFuture, WriterClient};
+use crate::error::Error::{IllegalArgument, UnexpectedError};
 use crate::error::Result;
-use crate::metadata::{KvFormat, RowType, TableInfo, TablePath};
+use crate::metadata::{RowType, TableInfo, TablePath};
 use crate::row::InternalRow;
 use crate::row::encode::{KeyEncoder, KeyEncoderFactory, RowEncoder, RowEncoderFactory};
 use crate::row::field_getter::FieldGetter;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use crate::client::table::partition_getter::{PartitionGetter, get_physical_path};
 use bitvec::prelude::bitvec;
 use bytes::Bytes;
 
@@ -97,7 +97,7 @@ impl TableUpsert {
         self.partial_update(Some(valid_col_indices))
     }
 
-    pub fn create_writer(&self) -> Result<impl UpsertWriter> {
+    pub fn create_writer(&self) -> Result<UpsertWriter> {
         UpsertWriterFactory::create(
             Arc::new(self.table_path.clone()),
             Arc::new(self.table_info.clone()),
@@ -107,37 +107,29 @@ impl TableUpsert {
     }
 }
 
-#[allow(dead_code)]
-struct UpsertWriterImpl<RE>
-where
-    RE: RowEncoder,
-{
+pub struct UpsertWriter {
     table_path: Arc<TablePath>,
     writer_client: Arc<WriterClient>,
-    // TODO: Partitioning
-    // partition_field_getter: Option<Box<dyn KeyEncoder>>,
-    primary_key_encoder: Box<dyn KeyEncoder>,
+    partition_field_getter: Option<PartitionGetter>,
+    primary_key_encoder: Mutex<Box<dyn KeyEncoder>>,
     target_columns: Option<Arc<Vec<usize>>>,
     // Use primary key encoder as bucket key encoder when None
-    bucket_key_encoder: Option<Box<dyn KeyEncoder>>,
-    kv_format: KvFormat,
+    bucket_key_encoder: Option<Mutex<Box<dyn KeyEncoder>>>,
     write_format: WriteFormat,
-    row_encoder: RE,
+    row_encoder: Mutex<Box<dyn RowEncoder>>,
     field_getters: Box<[FieldGetter]>,
     table_info: Arc<TableInfo>,
 }
 
-#[allow(dead_code)]
 struct UpsertWriterFactory;
 
-#[allow(dead_code)]
 impl UpsertWriterFactory {
     pub fn create(
         table_path: Arc<TablePath>,
         table_info: Arc<TableInfo>,
         partial_update_columns: Option<Arc<Vec<usize>>>,
         writer_client: Arc<WriterClient>,
-    ) -> Result<impl UpsertWriter> {
+    ) -> Result<UpsertWriter> {
         let data_lake_format = &table_info.table_config.get_datalake_format()?;
         let row_type = table_info.row_type();
         let physical_pks = table_info.get_physical_primary_keys();
@@ -168,15 +160,27 @@ impl UpsertWriterFactory {
 
         let field_getters = FieldGetter::create_field_getters(row_type);
 
-        Ok(UpsertWriterImpl {
+        let partition_field_getter = if table_info.is_partitioned() {
+            Some(PartitionGetter::new(
+                row_type,
+                Arc::clone(table_info.get_partition_keys()),
+            )?)
+        } else {
+            None
+        };
+
+        Ok(UpsertWriter {
             table_path,
+            partition_field_getter,
             writer_client,
-            primary_key_encoder,
+            primary_key_encoder: Mutex::new(primary_key_encoder),
             target_columns: partial_update_columns,
-            bucket_key_encoder,
-            kv_format: kv_format.clone(),
+            bucket_key_encoder: bucket_key_encoder.map(Mutex::new),
             write_format,
-            row_encoder: RowEncoderFactory::create(kv_format, row_type.clone())?,
+            row_encoder: Mutex::new(Box::new(RowEncoderFactory::create(
+                kv_format,
+                row_type.clone(),
+            )?)),
             field_getters,
             table_info: table_info.clone(),
         })
@@ -278,8 +282,7 @@ impl UpsertWriterFactory {
     }
 }
 
-#[allow(dead_code)]
-impl<RE: RowEncoder> UpsertWriterImpl<RE> {
+impl UpsertWriter {
     fn check_field_count<R: InternalRow>(&self, row: &R) -> Result<()> {
         let expected = self.table_info.get_row_type().fields().len();
         if row.get_field_count() != expected {
@@ -294,45 +297,64 @@ impl<RE: RowEncoder> UpsertWriterImpl<RE> {
         Ok(())
     }
 
-    fn get_keys(&mut self, row: &dyn InternalRow) -> Result<(Bytes, Option<Bytes>)> {
-        let key = self.primary_key_encoder.encode_key(row)?;
-        let bucket_key = match &mut self.bucket_key_encoder {
-            Some(bucket_key_encoder) => Some(bucket_key_encoder.encode_key(row)?),
+    fn get_keys(&self, row: &dyn InternalRow) -> Result<(Bytes, Option<Bytes>)> {
+        let key = self
+            .primary_key_encoder
+            .lock()
+            .map_err(|e| UnexpectedError {
+                message: format!("primary_key_encoder lock poisoned: {e}"),
+                source: None,
+            })?
+            .encode_key(row)?;
+        let bucket_key = match &self.bucket_key_encoder {
+            Some(encoder) => Some(
+                encoder
+                    .lock()
+                    .map_err(|e| UnexpectedError {
+                        message: format!("bucket_key_encoder lock poisoned: {e}"),
+                        source: None,
+                    })?
+                    .encode_key(row)?,
+            ),
             None => Some(key.clone()),
         };
         Ok((key, bucket_key))
     }
 
-    fn encode_row<R: InternalRow>(&mut self, row: &R) -> Result<Bytes> {
-        self.row_encoder.start_new_row()?;
+    fn encode_row<R: InternalRow>(&self, row: &R) -> Result<Bytes> {
+        let mut encoder = self.row_encoder.lock().map_err(|e| UnexpectedError {
+            message: format!("row_encoder lock poisoned: {e}"),
+            source: None,
+        })?;
+        encoder.start_new_row()?;
         for (pos, field_getter) in self.field_getters.iter().enumerate() {
-            let datum = field_getter.get_field(row);
-            self.row_encoder.encode_field(pos, datum)?;
+            let datum = field_getter.get_field(row)?;
+            encoder.encode_field(pos, datum)?;
         }
-        self.row_encoder.finish_row()
+        encoder.finish_row()
     }
-}
 
-impl<RE: RowEncoder> TableWriter for UpsertWriterImpl<RE> {
     /// Flush data written that have not yet been sent to the server, forcing the client to send the
     /// requests to server and blocks on the completion of the requests associated with these
     /// records. A request is considered completed when it is successfully acknowledged according to
     /// the CLIENT_WRITER_ACKS configuration option you have specified or else it
     /// results in an error.
-    async fn flush(&self) -> Result<()> {
+    pub async fn flush(&self) -> Result<()> {
         self.writer_client.flush().await
     }
-}
 
-impl<RE: RowEncoder> UpsertWriter for UpsertWriterImpl<RE> {
     /// Inserts row into Fluss table if they do not already exist, or updates them if they do exist.
+    ///
+    /// This method returns a [`WriteResultFuture`] immediately after queueing the write,
+    /// enabling fire-and-forget semantics for efficient batching.
     ///
     /// # Arguments
     /// * row - the row to upsert.
     ///
     /// # Returns
-    /// Ok(UpsertResult) when completed normally
-    async fn upsert<R: InternalRow>(&mut self, row: &R) -> Result<UpsertResult> {
+    /// A [`WriteResultFuture`] that can be awaited to wait for server acknowledgment,
+    /// or dropped for fire-and-forget behavior (use `flush()` to ensure delivery).
+    pub fn upsert<R: InternalRow>(&self, row: &R) -> Result<WriteResultFuture> {
         self.check_field_count(row)?;
 
         let (key, bucket_key) = self.get_keys(row)?;
@@ -343,7 +365,12 @@ impl<RE: RowEncoder> UpsertWriter for UpsertWriterImpl<RE> {
         };
 
         let write_record = WriteRecord::for_upsert(
-            Arc::clone(&self.table_path),
+            Arc::clone(&self.table_info),
+            Arc::new(get_physical_path(
+                &self.table_path,
+                self.partition_field_getter.as_ref(),
+                row,
+            )?),
             self.table_info.schema_id,
             key,
             bucket_key,
@@ -352,27 +379,34 @@ impl<RE: RowEncoder> UpsertWriter for UpsertWriterImpl<RE> {
             Some(row_bytes),
         );
 
-        let result_handle = self.writer_client.send(&write_record).await?;
-        let result = result_handle.wait().await?;
-
-        result_handle.result(result).map(|_| UpsertResult)
+        let result_handle = self.writer_client.send(&write_record)?;
+        Ok(WriteResultFuture::new(result_handle))
     }
 
     /// Delete certain row by the input row in Fluss table, the input row must contain the primary
     /// key.
     ///
+    /// This method returns a [`WriteResultFuture`] immediately after queueing the delete,
+    /// enabling fire-and-forget semantics for efficient batching.
+    ///
     /// # Arguments
-    /// * row - the row to delete.
+    /// * row - the row to delete (must contain the primary key fields).
     ///
     /// # Returns
-    /// Ok(DeleteResult) when completed normally
-    async fn delete<R: InternalRow>(&mut self, row: &R) -> Result<DeleteResult> {
+    /// A [`WriteResultFuture`] that can be awaited to wait for server acknowledgment,
+    /// or dropped for fire-and-forget behavior (use `flush()` to ensure delivery).
+    pub fn delete<R: InternalRow>(&self, row: &R) -> Result<WriteResultFuture> {
         self.check_field_count(row)?;
 
         let (key, bucket_key) = self.get_keys(row)?;
 
         let write_record = WriteRecord::for_upsert(
-            Arc::clone(&self.table_path),
+            Arc::clone(&self.table_info),
+            Arc::new(get_physical_path(
+                &self.table_path,
+                self.partition_field_getter.as_ref(),
+                row,
+            )?),
             self.table_info.schema_id,
             key,
             bucket_key,
@@ -381,10 +415,8 @@ impl<RE: RowEncoder> UpsertWriter for UpsertWriterImpl<RE> {
             None,
         );
 
-        let result_handle = self.writer_client.send(&write_record).await?;
-        let result = result_handle.wait().await?;
-
-        result_handle.result(result).map(|_| DeleteResult)
+        let result_handle = self.writer_client.send(&write_record)?;
+        Ok(WriteResultFuture::new(result_handle))
     }
 }
 
@@ -397,8 +429,8 @@ mod tests {
     fn sanity_check() {
         // No target columns specified but table has auto-increment column
         let fields = vec![
-            DataField::new("id".to_string(), DataTypes::int().as_non_nullable(), None),
-            DataField::new("name".to_string(), DataTypes::string(), None),
+            DataField::new("id", DataTypes::int().as_non_nullable(), None),
+            DataField::new("name", DataTypes::string(), None),
         ];
         let row_type = RowType::new(fields);
         let primary_keys = vec!["id".to_string()];
@@ -418,9 +450,9 @@ mod tests {
 
         // Target columns do not contain primary key
         let fields = vec![
-            DataField::new("id".to_string(), DataTypes::int().as_non_nullable(), None),
-            DataField::new("name".to_string(), DataTypes::string(), None),
-            DataField::new("value".to_string(), DataTypes::int(), None),
+            DataField::new("id", DataTypes::int().as_non_nullable(), None),
+            DataField::new("name", DataTypes::string(), None),
+            DataField::new("value", DataTypes::int(), None),
         ];
         let row_type = RowType::new(fields);
         let primary_keys = vec!["id".to_string()];
@@ -443,8 +475,8 @@ mod tests {
 
         // Primary key column not found in row type
         let fields = vec![
-            DataField::new("id".to_string(), DataTypes::int().as_non_nullable(), None),
-            DataField::new("name".to_string(), DataTypes::string(), None),
+            DataField::new("id", DataTypes::int().as_non_nullable(), None),
+            DataField::new("name", DataTypes::string(), None),
         ];
         let row_type = RowType::new(fields);
         let primary_keys = vec!["nonexistent_pk".to_string()];
@@ -467,13 +499,9 @@ mod tests {
 
         // Target columns include auto-increment column
         let fields = vec![
-            DataField::new("id".to_string(), DataTypes::int().as_non_nullable(), None),
-            DataField::new(
-                "seq".to_string(),
-                DataTypes::bigint().as_non_nullable(),
-                None,
-            ),
-            DataField::new("name".to_string(), DataTypes::string(), None),
+            DataField::new("id", DataTypes::int().as_non_nullable(), None),
+            DataField::new("seq", DataTypes::bigint().as_non_nullable(), None),
+            DataField::new("name", DataTypes::string(), None),
         ];
         let row_type = RowType::new(fields);
         let primary_keys = vec!["id".to_string()];
@@ -493,13 +521,13 @@ mod tests {
 
         // Non-nullable column not in target columns (partial update requires nullable)
         let fields = vec![
-            DataField::new("id".to_string(), DataTypes::int().as_non_nullable(), None),
+            DataField::new("id", DataTypes::int().as_non_nullable(), None),
             DataField::new(
-                "required_field".to_string(),
+                "required_field",
                 DataTypes::string().as_non_nullable(),
                 None,
             ),
-            DataField::new("optional_field".to_string(), DataTypes::int(), None),
+            DataField::new("optional_field", DataTypes::int(), None),
         ];
         let row_type = RowType::new(fields);
         let primary_keys = vec!["id".to_string()];
@@ -518,3 +546,15 @@ mod tests {
         ));
     }
 }
+
+/// The result of upserting a record
+/// Currently this is an empty struct to allow for compatible evolution in the future
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct UpsertResult;
+
+/// The result of deleting a record
+/// Currently this is an empty struct to allow for compatible evolution in the future
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct DeleteResult;

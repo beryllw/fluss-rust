@@ -15,76 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::integration::fluss_cluster::FlussTestingCluster;
-use parking_lot::RwLock;
-
-use std::sync::Arc;
-use std::sync::LazyLock;
-
 #[cfg(test)]
-use test_env_helpers::*;
-
-// Module-level shared cluster instance (only for this test file)
-static SHARED_FLUSS_CLUSTER: LazyLock<Arc<RwLock<Option<FlussTestingCluster>>>> =
-    LazyLock::new(|| Arc::new(RwLock::new(None)));
-
-#[cfg(test)]
-#[before_all]
-#[after_all]
 mod admin_test {
-    use super::SHARED_FLUSS_CLUSTER;
-    use crate::integration::fluss_cluster::FlussTestingCluster;
-    use crate::integration::utils::{get_cluster, start_cluster, stop_cluster};
+    use crate::integration::utils::get_shared_cluster;
     use fluss::error::FlussError;
     use fluss::metadata::{
         DataTypes, DatabaseDescriptorBuilder, KvFormat, LogFormat, PartitionSpec, Schema,
         TableDescriptor, TablePath,
     };
     use std::collections::HashMap;
-    use std::sync::Arc;
-
-    fn before_all() {
-        start_cluster("test-admin", SHARED_FLUSS_CLUSTER.clone());
-    }
-
-    fn get_fluss_cluster() -> Arc<FlussTestingCluster> {
-        get_cluster(&SHARED_FLUSS_CLUSTER)
-    }
-
-    fn after_all() {
-        stop_cluster(SHARED_FLUSS_CLUSTER.clone());
-    }
 
     #[tokio::test]
     async fn test_create_database() {
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
 
-        let admin = connection.get_admin().await.expect("should get admin");
+        let admin = connection.get_admin().expect("should get admin");
 
         let db_descriptor = DatabaseDescriptorBuilder::default()
             .comment("test_db")
-            .custom_properties(
-                [
-                    ("k1".to_string(), "v1".to_string()),
-                    ("k2".to_string(), "v2".to_string()),
-                ]
-                .into(),
-            )
+            .custom_properties([("k1", "v1"), ("k2", "v2")].into())
             .build();
 
         let db_name = "test_create_database";
 
-        assert_eq!(admin.database_exists(db_name).await.unwrap(), false);
+        assert!(!admin.database_exists(db_name).await.unwrap());
 
         // create database
         admin
-            .create_database(db_name, false, Some(&db_descriptor))
+            .create_database(db_name, Some(&db_descriptor), false)
             .await
             .expect("should create database");
 
         // database should exist
-        assert_eq!(admin.database_exists(db_name).await.unwrap(), true);
+        assert!(admin.database_exists(db_name).await.unwrap());
 
         // get database
         let db_info = admin
@@ -96,36 +60,34 @@ mod admin_test {
         assert_eq!(db_info.database_descriptor(), &db_descriptor);
 
         // drop database
-        admin.drop_database(db_name, false, true).await;
+        admin
+            .drop_database(db_name, false, true)
+            .await
+            .expect("should drop_database");
 
         // database shouldn't exist now
-        assert_eq!(admin.database_exists(db_name).await.unwrap(), false);
-
-        // Note: We don't stop the shared cluster here as it's used by other tests
+        assert!(!admin.database_exists(db_name).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_create_table() {
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
-        let admin = connection
-            .get_admin()
-            .await
-            .expect("Failed to get admin client");
+        let admin = connection.get_admin().expect("Failed to get admin client");
 
         let test_db_name = "test_create_table_db";
         let db_descriptor = DatabaseDescriptorBuilder::default()
             .comment("Database for test_create_table")
             .build();
 
-        assert_eq!(admin.database_exists(test_db_name).await.unwrap(), false);
+        assert!(!admin.database_exists(test_db_name).await.unwrap());
         admin
-            .create_database(test_db_name, false, Some(&db_descriptor))
+            .create_database(test_db_name, Some(&db_descriptor), false)
             .await
             .expect("Failed to create test database");
 
         let test_table_name = "test_user_table";
-        let table_path = TablePath::new(test_db_name.to_string(), test_table_name.to_string());
+        let table_path = TablePath::new(test_db_name, test_table_name);
 
         // build table schema
         let table_schema = Schema::builder()
@@ -173,7 +135,7 @@ mod admin_test {
         );
 
         let table_info = admin
-            .get_table(&table_path)
+            .get_table_info(&table_path)
             .await
             .expect("Failed to get table info");
 
@@ -203,11 +165,17 @@ mod admin_test {
             "Bucket keys mismatch"
         );
 
-        assert_eq!(
-            table_info.get_properties(),
-            table_descriptor.properties(),
-            "Properties mismatch"
-        );
+        // The server may add extra default properties, so verify that all
+        // expected properties are present rather than requiring an exact match.
+        let actual_props = table_info.get_properties();
+        for (key, value) in table_descriptor.properties() {
+            assert_eq!(
+                actual_props.get(key),
+                Some(value),
+                "Property mismatch for key '{}'",
+                key
+            );
+        }
 
         // drop table
         admin
@@ -215,23 +183,23 @@ mod admin_test {
             .await
             .expect("Failed to drop table");
         // table shouldn't exist now
-        assert_eq!(admin.table_exists(&table_path).await.unwrap(), false);
+        assert!(!admin.table_exists(&table_path).await.unwrap());
 
         // drop database
-        admin.drop_database(test_db_name, false, true).await;
+        admin
+            .drop_database(test_db_name, false, true)
+            .await
+            .expect("Should drop database");
 
         // database shouldn't exist now
-        assert_eq!(admin.database_exists(test_db_name).await.unwrap(), false);
+        assert!(!admin.database_exists(test_db_name).await.unwrap());
     }
 
     #[tokio::test]
     async fn test_partition_apis() {
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
-        let admin = connection
-            .get_admin()
-            .await
-            .expect("Failed to get admin client");
+        let admin = connection.get_admin().expect("Failed to get admin client");
 
         let test_db_name = "test_partition_apis_db";
         let db_descriptor = DatabaseDescriptorBuilder::default()
@@ -239,30 +207,26 @@ mod admin_test {
             .build();
 
         admin
-            .create_database(test_db_name, true, Some(&db_descriptor))
+            .create_database(test_db_name, Some(&db_descriptor), true)
             .await
             .expect("Failed to create test database");
 
         let test_table_name = "partitioned_table";
-        let table_path = TablePath::new(test_db_name.to_string(), test_table_name.to_string());
+        let table_path = TablePath::new(test_db_name, test_table_name);
 
         let table_schema = Schema::builder()
             .column("id", DataTypes::int())
             .column("name", DataTypes::string())
             .column("dt", DataTypes::string())
             .column("region", DataTypes::string())
-            .primary_key(vec![
-                "id".to_string(),
-                "dt".to_string(),
-                "region".to_string(),
-            ])
+            .primary_key(vec!["id", "dt", "region"])
             .build()
             .expect("Failed to build table schema");
 
         let table_descriptor = TableDescriptor::builder()
             .schema(table_schema)
             .distributed_by(Some(3), vec!["id".to_string()])
-            .partitioned_by(vec!["dt".to_string(), "region".to_string()])
+            .partitioned_by(vec!["dt", "region"])
             .property("table.replication.factor", "1")
             .log_format(LogFormat::ARROW)
             .kv_format(KvFormat::COMPACTED)
@@ -285,8 +249,8 @@ mod admin_test {
         );
 
         let mut partition_values = HashMap::new();
-        partition_values.insert("dt".to_string(), "2024-01-15".to_string());
-        partition_values.insert("region".to_string(), "EMEA".to_string());
+        partition_values.insert("dt", "2024-01-15");
+        partition_values.insert("region", "EMEA");
         let partition_spec = PartitionSpec::new(partition_values);
 
         admin
@@ -311,7 +275,7 @@ mod admin_test {
 
         // list with partial spec filter - should find the partition
         let mut partition_values = HashMap::new();
-        partition_values.insert("dt".to_string(), "2024-01-15".to_string());
+        partition_values.insert("dt", "2024-01-15");
         let partial_partition_spec = PartitionSpec::new(partition_values);
 
         let partitions_with_spec = admin
@@ -331,7 +295,7 @@ mod admin_test {
 
         // list with non-matching spec - should find no partitions
         let mut non_matching_values = HashMap::new();
-        non_matching_values.insert("dt".to_string(), "2024-01-16".to_string());
+        non_matching_values.insert("dt", "2024-01-16");
         let non_matching_spec = PartitionSpec::new(non_matching_values);
         let partitions_non_matching = admin
             .list_partition_infos_with_spec(&table_path, Some(&non_matching_spec))
@@ -361,37 +325,242 @@ mod admin_test {
             .drop_table(&table_path, true)
             .await
             .expect("Failed to drop table");
-        admin.drop_database(test_db_name, true, true).await;
+        admin
+            .drop_database(test_db_name, true, true)
+            .await
+            .expect("Should drop database");
     }
 
     #[tokio::test]
     async fn test_fluss_error_response() {
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
-        let admin = connection
-            .get_admin()
-            .await
-            .expect("Failed to get admin client");
+        let admin = connection.get_admin().expect("Failed to get admin client");
 
-        let table_path = TablePath::new("fluss".to_string(), "not_exist".to_string());
+        let table_path = TablePath::new("fluss", "not_exist");
 
-        let result = admin.get_table(&table_path).await;
+        let result = admin.get_table_info(&table_path).await;
         assert!(result.is_err(), "Expected error but got Ok");
 
         let error = result.unwrap_err();
-        match error {
-            fluss::error::Error::FlussAPIError { api_error } => {
-                assert_eq!(
-                    api_error.code,
-                    FlussError::TableNotExist.code(),
-                    "Expected error code 7 (TableNotExist)"
-                );
-                assert_eq!(
-                    api_error.message, "Table 'fluss.not_exist' does not exist.",
-                    "Expected specific error message"
-                );
-            }
-            other => panic!("Expected FlussAPIError, got {:?}", other),
+        assert_eq!(
+            error.api_error(),
+            Some(FlussError::TableNotExist),
+            "Expected TableNotExist error, got {:?}",
+            error
+        );
+    }
+
+    /// Helper to assert that an error is a FlussAPIError with the expected code.
+    fn assert_api_error(error: fluss::error::Error, expected: FlussError) {
+        assert_eq!(
+            error.api_error(),
+            Some(expected),
+            "Expected {:?}, got {:?}",
+            expected,
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_error_database_not_exist() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().unwrap();
+
+        // get_database_info for non-existent database
+        let result = admin.get_database_info("no_such_db").await;
+        assert_api_error(result.unwrap_err(), FlussError::DatabaseNotExist);
+
+        // drop_database without ignore flag
+        let result = admin.drop_database("no_such_db", false, false).await;
+        assert_api_error(result.unwrap_err(), FlussError::DatabaseNotExist);
+
+        // list_tables for non-existent database
+        let result = admin.list_tables("no_such_db").await;
+        assert_api_error(result.unwrap_err(), FlussError::DatabaseNotExist);
+    }
+
+    #[tokio::test]
+    async fn test_error_database_already_exist() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().unwrap();
+
+        let db_name = "test_error_db_already_exist";
+        let descriptor = DatabaseDescriptorBuilder::default().build();
+
+        admin
+            .create_database(db_name, Some(&descriptor), false)
+            .await
+            .unwrap();
+
+        // create same database again without ignore flag
+        let result = admin
+            .create_database(db_name, Some(&descriptor), false)
+            .await;
+        assert_api_error(result.unwrap_err(), FlussError::DatabaseAlreadyExist);
+
+        // with ignore flag should succeed
+        admin
+            .create_database(db_name, Some(&descriptor), true)
+            .await
+            .expect("create_database with ignore_if_exists should succeed");
+
+        // cleanup
+        admin.drop_database(db_name, true, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_error_table_already_exist() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().unwrap();
+
+        let db_name = "test_error_tbl_already_exist_db";
+        let descriptor = DatabaseDescriptorBuilder::default().build();
+        admin
+            .create_database(db_name, Some(&descriptor), true)
+            .await
+            .unwrap();
+
+        let table_path = TablePath::new(db_name, "my_table");
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .build()
+            .unwrap();
+        let table_descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), vec![])
+            .property("table.replication.factor", "1")
+            .build()
+            .unwrap();
+
+        admin
+            .create_table(&table_path, &table_descriptor, false)
+            .await
+            .unwrap();
+
+        // create same table again without ignore flag
+        let result = admin
+            .create_table(&table_path, &table_descriptor, false)
+            .await;
+        assert_api_error(result.unwrap_err(), FlussError::TableAlreadyExist);
+
+        // with ignore flag should succeed
+        admin
+            .create_table(&table_path, &table_descriptor, true)
+            .await
+            .expect("create_table with ignore_if_exists should succeed");
+
+        // cleanup
+        admin.drop_table(&table_path, true).await.unwrap();
+        admin.drop_database(db_name, true, true).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_error_table_not_exist() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().unwrap();
+
+        let table_path = TablePath::new("fluss", "no_such_table");
+
+        // drop without ignore flag
+        let result = admin.drop_table(&table_path, false).await;
+        assert_api_error(result.unwrap_err(), FlussError::TableNotExist);
+
+        // drop with ignore flag should succeed
+        admin
+            .drop_table(&table_path, true)
+            .await
+            .expect("drop_table with ignore_if_not_exists should succeed");
+    }
+
+    #[tokio::test]
+    async fn test_get_server_nodes() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().unwrap();
+
+        let nodes = admin
+            .get_server_nodes()
+            .await
+            .expect("should get server nodes");
+
+        assert!(
+            !nodes.is_empty(),
+            "Expected at least one server node in the cluster"
+        );
+
+        let has_coordinator = nodes
+            .iter()
+            .any(|n| *n.server_type() == fluss::ServerType::CoordinatorServer);
+        assert!(has_coordinator, "Expected a coordinator server node");
+
+        let tablet_count = nodes
+            .iter()
+            .filter(|n| *n.server_type() == fluss::ServerType::TabletServer)
+            .count();
+        assert!(
+            tablet_count >= 1,
+            "Expected at least one tablet server node"
+        );
+
+        for node in &nodes {
+            assert!(
+                !node.host().is_empty(),
+                "Server node host should not be empty"
+            );
+            assert!(node.port() > 0, "Server node port should be > 0");
+            assert!(
+                !node.uid().is_empty(),
+                "Server node uid should not be empty"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn test_error_table_not_partitioned() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+        let admin = connection.get_admin().unwrap();
+
+        let db_name = "test_error_not_partitioned_db";
+        let descriptor = DatabaseDescriptorBuilder::default().build();
+        admin
+            .create_database(db_name, Some(&descriptor), true)
+            .await
+            .unwrap();
+
+        let table_path = TablePath::new(db_name, "non_partitioned_table");
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .build()
+            .unwrap();
+        let table_descriptor = TableDescriptor::builder()
+            .schema(schema)
+            .distributed_by(Some(1), vec![])
+            .property("table.replication.factor", "1")
+            .build()
+            .unwrap();
+
+        admin
+            .create_table(&table_path, &table_descriptor, false)
+            .await
+            .unwrap();
+
+        // list_partition_infos on non-partitioned table
+        let result = admin.list_partition_infos(&table_path).await;
+        assert_api_error(
+            result.unwrap_err(),
+            FlussError::TableNotPartitionedException,
+        );
+
+        // cleanup
+        admin.drop_table(&table_path, true).await.unwrap();
+        admin.drop_database(db_name, true, true).await.unwrap();
     }
 }

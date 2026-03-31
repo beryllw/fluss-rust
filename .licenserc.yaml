@@ -21,10 +21,12 @@ header:
     copyright-owner: Apache Software Foundation
 
   paths-ignore:
-    - '.github/PULL_REQUEST_TEMPLATE.md'
     - '.gitignore'
     - 'LICENSE'
     - 'NOTICE'
     - 'DISCLAIMER'
     - 'bindings/python/fluss/py.typed'
+    - 'website/**'
+    - '**/*.md'
+    - '**/DEPENDENCIES.*.tsv'
   comment: on-failure

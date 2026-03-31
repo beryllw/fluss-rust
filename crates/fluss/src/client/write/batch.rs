@@ -15,43 +15,56 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::BucketId;
 use crate::client::broadcast::{BatchWriteResult, BroadcastOnce};
 use crate::client::{Record, ResultHandle, WriteRecord};
 use crate::compression::ArrowCompressionInfo;
 use crate::error::{Error, Result};
-use crate::metadata::{KvFormat, RowType, TablePath};
+use crate::metadata::{KvFormat, PhysicalTablePath, RowType};
 use crate::record::MemoryLogRecordsArrowBuilder;
 use crate::record::kv::KvRecordBatchBuilder;
+use crate::record::{NO_BATCH_SEQUENCE, NO_WRITER_ID};
 use bytes::Bytes;
 use std::cmp::max;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-#[allow(dead_code)]
 pub struct InnerWriteBatch {
     batch_id: i64,
-    table_path: TablePath,
+    physical_table_path: Arc<PhysicalTablePath>,
     create_ms: i64,
-    bucket_id: BucketId,
     results: BroadcastOnce<BatchWriteResult>,
     completed: AtomicBool,
     attempts: AtomicI32,
     drained_ms: i64,
+    batch_sequence: i32,
+    writer_id: i64,
 }
 
 impl InnerWriteBatch {
-    fn new(batch_id: i64, table_path: TablePath, create_ms: i64, bucket_id: BucketId) -> Self {
+    fn new(batch_id: i64, physical_table_path: Arc<PhysicalTablePath>, create_ms: i64) -> Self {
         InnerWriteBatch {
             batch_id,
-            table_path,
+            physical_table_path,
             create_ms,
-            bucket_id,
             results: Default::default(),
             completed: AtomicBool::new(false),
             attempts: AtomicI32::new(0),
             drained_ms: -1,
+            batch_sequence: NO_BATCH_SEQUENCE,
+            writer_id: NO_WRITER_ID,
         }
+    }
+
+    pub fn batch_sequence(&self) -> i32 {
+        self.batch_sequence
+    }
+
+    pub fn writer_id(&self) -> i64 {
+        self.writer_id
+    }
+
+    pub fn has_batch_sequence(&self) -> bool {
+        self.batch_sequence != NO_BATCH_SEQUENCE
     }
 
     fn waited_time_ms(&self, now: i64) -> i64 {
@@ -74,8 +87,8 @@ impl InnerWriteBatch {
         self.drained_ms = max(self.drained_ms, now_ms);
     }
 
-    fn table_path(&self) -> &TablePath {
-        &self.table_path
+    fn physical_table_path(&self) -> &Arc<PhysicalTablePath> {
+        &self.physical_table_path
     }
 
     fn attempts(&self) -> i32 {
@@ -132,9 +145,11 @@ impl WriteBatch {
         }
     }
 
-    pub fn estimated_size_in_bytes(&self) -> i64 {
-        0
-        // todo: calculate estimated_size_in_bytes
+    pub fn estimated_size_in_bytes(&self) -> usize {
+        match self {
+            WriteBatch::ArrowLog(batch) => batch.estimated_size_in_bytes(),
+            WriteBatch::Kv(batch) => batch.estimated_size_in_bytes(),
+        }
     }
 
     pub fn is_closed(&self) -> bool {
@@ -163,8 +178,8 @@ impl WriteBatch {
         self.inner_batch().batch_id
     }
 
-    pub fn table_path(&self) -> &TablePath {
-        self.inner_batch().table_path()
+    pub fn physical_table_path(&self) -> &Arc<PhysicalTablePath> {
+        self.inner_batch().physical_table_path()
     }
 
     pub fn attempts(&self) -> i32 {
@@ -178,6 +193,25 @@ impl WriteBatch {
     pub fn is_done(&self) -> bool {
         self.inner_batch().is_done()
     }
+
+    pub fn batch_sequence(&self) -> i32 {
+        self.inner_batch().batch_sequence()
+    }
+
+    pub fn writer_id(&self) -> i64 {
+        self.inner_batch().writer_id()
+    }
+
+    pub fn has_batch_sequence(&self) -> bool {
+        self.inner_batch().has_batch_sequence()
+    }
+
+    pub fn set_writer_state(&mut self, writer_id: i64, batch_base_sequence: i32) {
+        match self {
+            WriteBatch::ArrowLog(batch) => batch.set_writer_state(writer_id, batch_base_sequence),
+            WriteBatch::Kv(batch) => batch.set_writer_state(writer_id, batch_base_sequence),
+        }
+    }
 }
 
 pub struct ArrowLogWriteBatch {
@@ -190,15 +224,14 @@ impl ArrowLogWriteBatch {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_id: i64,
-        table_path: TablePath,
+        physical_table_path: Arc<PhysicalTablePath>,
         schema_id: i32,
         arrow_compression_info: ArrowCompressionInfo,
         row_type: &RowType,
-        bucket_id: BucketId,
         create_ms: i64,
         to_append_record_batch: bool,
     ) -> Result<Self> {
-        let base = InnerWriteBatch::new(batch_id, table_path, create_ms, bucket_id);
+        let base = InnerWriteBatch::new(batch_id, physical_table_path, create_ms);
         Ok(Self {
             write_batch: base,
             arrow_builder: MemoryLogRecordsArrowBuilder::new(
@@ -229,6 +262,14 @@ impl ArrowLogWriteBatch {
         }
     }
 
+    pub fn set_writer_state(&mut self, writer_id: i64, batch_base_sequence: i32) {
+        self.arrow_builder
+            .set_writer_state(writer_id, batch_base_sequence);
+        self.write_batch.batch_sequence = batch_base_sequence;
+        self.write_batch.writer_id = writer_id;
+        self.built_records = None;
+    }
+
     pub fn build(&mut self) -> Result<Bytes> {
         if let Some(bytes) = &self.built_records {
             return Ok(bytes.clone());
@@ -245,6 +286,18 @@ impl ArrowLogWriteBatch {
     pub fn close(&mut self) {
         self.arrow_builder.close()
     }
+
+    /// Get an estimate of the number of bytes written to the underlying buffer.
+    /// The returned value is exactly correct if the batch has been built.
+    pub fn estimated_size_in_bytes(&self) -> usize {
+        if let Some(ref bytes) = self.built_records {
+            // Return actual size if already built
+            bytes.len()
+        } else {
+            // Delegate to arrow builder for estimated size
+            self.arrow_builder.estimated_size_in_bytes()
+        }
+    }
 }
 
 pub struct KvWriteBatch {
@@ -255,19 +308,17 @@ pub struct KvWriteBatch {
 }
 
 impl KvWriteBatch {
-    pub const DEFAULT_WRITE_LIMIT: usize = 256;
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         batch_id: i64,
-        table_path: TablePath,
+        physical_table_path: Arc<PhysicalTablePath>,
         schema_id: i32,
         write_limit: usize,
         kv_format: KvFormat,
-        bucket_id: BucketId,
         target_columns: Option<Arc<Vec<usize>>>,
         create_ms: i64,
     ) -> Self {
-        let base = InnerWriteBatch::new(batch_id, table_path, create_ms, bucket_id);
+        let base = InnerWriteBatch::new(batch_id, physical_table_path, create_ms);
         Self {
             write_batch: base,
             kv_batch_builder: KvRecordBatchBuilder::new(schema_id, write_limit, kv_format),
@@ -337,30 +388,203 @@ impl KvWriteBatch {
         self.kv_batch_builder.close()
     }
 
+    pub fn set_writer_state(&mut self, writer_id: i64, batch_base_sequence: i32) {
+        self.kv_batch_builder
+            .set_writer_state(writer_id, batch_base_sequence);
+        self.write_batch.batch_sequence = batch_base_sequence;
+        self.write_batch.writer_id = writer_id;
+    }
+
     pub fn target_columns(&self) -> Option<&Arc<Vec<usize>>> {
         self.target_columns.as_ref()
+    }
+
+    /// Get an estimate of the number of bytes written to the underlying buffer.
+    /// This returns the current size including header and all appended records.
+    pub fn estimated_size_in_bytes(&self) -> usize {
+        self.kv_batch_builder.get_size_in_bytes()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::{RowBytes, WriteFormat};
     use crate::metadata::TablePath;
+    use crate::test_utils::build_table_info;
 
     #[test]
     fn complete_only_once() {
-        let batch =
-            InnerWriteBatch::new(1, TablePath::new("db".to_string(), "tbl".to_string()), 0, 0);
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let physical_path = PhysicalTablePath::of(Arc::new(table_path));
+        let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 0);
         assert!(batch.complete(Ok(())));
         assert!(!batch.complete(Err(crate::client::broadcast::Error::Dropped)));
     }
 
     #[test]
     fn attempts_increment_on_reenqueue() {
-        let batch =
-            InnerWriteBatch::new(1, TablePath::new("db".to_string(), "tbl".to_string()), 0, 0);
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let physical_path = PhysicalTablePath::of(Arc::new(table_path));
+        let batch = InnerWriteBatch::new(1, Arc::new(physical_path), 0);
         assert_eq!(batch.attempts(), 0);
         batch.re_enqueued();
         assert_eq!(batch.attempts(), 1);
+    }
+
+    #[test]
+    fn test_arrow_log_write_batch_estimated_size() {
+        use crate::client::WriteRecord;
+        use crate::compression::{
+            ArrowCompressionInfo, ArrowCompressionType, DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+        };
+        use crate::metadata::{DataField, DataTypes, RowType};
+        use crate::row::GenericRow;
+        use arrow::array::{Int32Array, RecordBatch, StringArray};
+        use std::sync::Arc;
+
+        let row_type = RowType::new(vec![
+            DataField::new("id".to_string(), DataTypes::int(), None),
+            DataField::new("name".to_string(), DataTypes::string(), None),
+        ]);
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_table_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+
+        // Test 1: RowAppendRecordBatchBuilder (to_append_record_batch=false)
+        {
+            let mut batch = ArrowLogWriteBatch::new(
+                1,
+                Arc::clone(&physical_table_path),
+                1,
+                ArrowCompressionInfo {
+                    compression_type: ArrowCompressionType::None,
+                    compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+                },
+                &row_type,
+                0,
+                false,
+            )
+            .unwrap();
+
+            // Append rows
+            for _ in 0..200 {
+                let mut row = GenericRow::new(2);
+                row.set_field(0, 1_i32);
+                row.set_field(1, "hello");
+                let record = WriteRecord::for_append(
+                    Arc::clone(&table_info),
+                    Arc::clone(&physical_table_path),
+                    1,
+                    &row,
+                );
+                batch.try_append(&record).unwrap();
+            }
+
+            let estimated_size = batch.estimated_size_in_bytes();
+            assert!(estimated_size > 0);
+
+            let built_data = batch.build().unwrap();
+            let actual_size = built_data.len();
+
+            let diff = actual_size - estimated_size;
+            let threshold = actual_size / 10; // 10% tolerance
+            assert!(
+                diff <= threshold,
+                "RowAppend: estimated_size {estimated_size} and actual_size {actual_size} differ by more than 10%"
+            );
+        }
+
+        // Test 2: PrebuiltRecordBatchBuilder (to_append_record_batch=true)
+        {
+            let mut batch = ArrowLogWriteBatch::new(
+                1,
+                physical_table_path.clone(),
+                1,
+                ArrowCompressionInfo {
+                    compression_type: ArrowCompressionType::None,
+                    compression_level: DEFAULT_NON_ZSTD_COMPRESSION_LEVEL,
+                },
+                &row_type,
+                0,
+                true,
+            )
+            .unwrap();
+
+            // Create a pre-built RecordBatch
+            let schema = crate::record::to_arrow_schema(&row_type).unwrap();
+            let ids: Vec<i32> = (0..200).collect();
+            let names: Vec<&str> = (0..200).map(|_| "hello").collect();
+            let record_batch = RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int32Array::from(ids)),
+                    Arc::new(StringArray::from(names)),
+                ],
+            )
+            .unwrap();
+
+            let record = WriteRecord::for_append_record_batch(
+                Arc::clone(&table_info),
+                Arc::clone(&physical_table_path),
+                1,
+                record_batch,
+            );
+            batch.try_append(&record).unwrap();
+
+            let estimated_size = batch.estimated_size_in_bytes();
+            assert!(estimated_size > 0);
+
+            let built_data = batch.build().unwrap();
+            let actual_size = built_data.len();
+
+            let diff = actual_size - estimated_size;
+            let threshold = actual_size / 10; // 10% tolerance
+            assert!(
+                diff <= threshold,
+                "Prebuilt: estimated_size {estimated_size} and actual_size {actual_size} differ by more than 10%"
+            );
+        }
+    }
+
+    #[test]
+    fn test_kv_write_batch_estimated_size() {
+        use crate::metadata::KvFormat;
+
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+        let table_info = Arc::new(build_table_info(table_path.clone(), 1, 1));
+        let physical_path = Arc::new(PhysicalTablePath::of(Arc::new(table_path)));
+
+        let mut batch = KvWriteBatch::new(
+            1,
+            Arc::clone(&physical_path),
+            1,
+            256,
+            KvFormat::COMPACTED,
+            None,
+            0,
+        );
+
+        for _ in 0..200 {
+            let record = WriteRecord::for_upsert(
+                Arc::clone(&table_info),
+                Arc::clone(&physical_path),
+                1,
+                Bytes::from(vec![1_u8, 2_u8, 3_u8]),
+                None,
+                WriteFormat::CompactedKv,
+                None,
+                Some(RowBytes::Owned(Bytes::from(vec![1_u8, 2_u8, 3_u8]))),
+            );
+            batch.try_append(&record).unwrap();
+        }
+
+        let estimated_size = batch.estimated_size_in_bytes();
+        let actual_size = batch.build().unwrap().len();
+
+        assert_eq!(
+            actual_size, estimated_size,
+            "estimated size {estimated_size} is not equal to actual size"
+        );
     }
 }

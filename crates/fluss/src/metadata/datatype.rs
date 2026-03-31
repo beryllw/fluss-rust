@@ -390,6 +390,12 @@ impl CharType {
     }
 }
 
+impl Default for CharType {
+    fn default() -> Self {
+        Self::new(1)
+    }
+}
+
 impl Display for CharType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "CHAR({})", self.length)?;
@@ -503,6 +509,13 @@ impl DecimalType {
     }
 }
 
+impl Default for DecimalType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_PRECISION, Self::DEFAULT_SCALE)
+            .expect("Invalid default decimal precision or scale")
+    }
+}
+
 impl Display for DecimalType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "DECIMAL({}, {})", self.precision, self.scale)?;
@@ -548,13 +561,13 @@ impl Display for DateType {
     }
 }
 
-#[derive(Default, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TimeType {
     nullable: bool,
     precision: u32,
 }
 
-impl TimeType {
+impl Default for TimeType {
     fn default() -> Self {
         Self::new(Self::DEFAULT_PRECISION).expect("Invalid default time precision")
     }
@@ -798,6 +811,12 @@ impl BinaryType {
     }
 }
 
+impl Default for BinaryType {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LENGTH)
+    }
+}
+
 impl Display for BinaryType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "BINARY({})", self.length)?;
@@ -928,6 +947,19 @@ impl RowType {
 
     pub fn get_field_names(&self) -> Vec<&str> {
         self.fields.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    pub fn project_with_field_names(&self, field_names: &[String]) -> Result<RowType> {
+        let indices: Vec<usize> = field_names
+            .iter()
+            .map(|name| {
+                self.get_field_index(name).ok_or_else(|| IllegalArgument {
+                    message: format!("Field '{name}' does not exist in the row type"),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        self.project(indices.as_slice())
     }
 
     pub fn project(&self, project_field_positions: &[usize]) -> Result<RowType> {
@@ -1105,13 +1137,13 @@ impl DataTypes {
     }
 
     /// Field definition with field name and data type.
-    pub fn field(name: String, data_type: DataType) -> DataField {
+    pub fn field<N: Into<String>>(name: N, data_type: DataType) -> DataField {
         DataField::new(name, data_type, None)
     }
 
     /// Field definition with field name, data type, and a description.
-    pub fn field_with_description(
-        name: String,
+    pub fn field_with_description<N: Into<String>>(
+        name: N,
         data_type: DataType,
         description: String,
     ) -> DataField {
@@ -1142,9 +1174,13 @@ pub struct DataField {
 }
 
 impl DataField {
-    pub fn new(name: String, data_type: DataType, description: Option<String>) -> DataField {
+    pub fn new<N: Into<String>>(
+        name: N,
+        data_type: DataType,
+        description: Option<String>,
+    ) -> DataField {
         DataField {
-            name,
+            name: name.into(),
             data_type,
             description,
         }
@@ -1309,13 +1345,13 @@ fn test_map_display() {
 #[test]
 fn test_row_display() {
     let fields = vec![
-        DataTypes::field("id".to_string(), DataTypes::int()),
-        DataTypes::field("name".to_string(), DataTypes::string()),
+        DataTypes::field("id", DataTypes::int()),
+        DataTypes::field("name", DataTypes::string()),
     ];
     let row_type = RowType::new(fields);
     assert_eq!(row_type.to_string(), "ROW<id INT, name STRING>");
 
-    let fields_non_null = vec![DataTypes::field("age".to_string(), DataTypes::bigint())];
+    let fields_non_null = vec![DataTypes::field("age", DataTypes::bigint())];
     let row_type_non_null = RowType::with_nullable(false, fields_non_null);
     assert_eq!(row_type_non_null.to_string(), "ROW<age BIGINT> NOT NULL");
 }
@@ -1345,23 +1381,23 @@ fn test_datatype_display() {
 
 #[test]
 fn test_datafield_display() {
-    let field = DataTypes::field("user_id".to_string(), DataTypes::bigint());
+    let field = DataTypes::field("user_id", DataTypes::bigint());
     assert_eq!(field.to_string(), "user_id BIGINT");
 
-    let field2 = DataTypes::field("email".to_string(), DataTypes::string());
+    let field2 = DataTypes::field("email", DataTypes::string());
     assert_eq!(field2.to_string(), "email STRING");
 
-    let field3 = DataTypes::field("score".to_string(), DataTypes::decimal(10, 2));
+    let field3 = DataTypes::field("score", DataTypes::decimal(10, 2));
     assert_eq!(field3.to_string(), "score DECIMAL(10, 2)");
 }
 
 #[test]
 fn test_complex_nested_display() {
     let row_type = DataTypes::row(vec![
-        DataTypes::field("id".to_string(), DataTypes::int()),
-        DataTypes::field("tags".to_string(), DataTypes::array(DataTypes::string())),
+        DataTypes::field("id", DataTypes::int()),
+        DataTypes::field("tags", DataTypes::array(DataTypes::string())),
         DataTypes::field(
-            "metadata".to_string(),
+            "metadata",
             DataTypes::map(DataTypes::string(), DataTypes::string()),
         ),
     ]);
@@ -1385,12 +1421,16 @@ fn test_deeply_nested_types() {
     let nested = DataTypes::array(DataTypes::map(
         DataTypes::string(),
         DataTypes::row(vec![
-            DataTypes::field("x".to_string(), DataTypes::int()),
-            DataTypes::field("y".to_string(), DataTypes::int()),
+            DataTypes::field("x", DataTypes::int()),
+            DataTypes::field("y", DataTypes::int()),
         ]),
     ));
     assert_eq!(nested.to_string(), "ARRAY<MAP<STRING, ROW<x INT, y INT>>>");
 }
+
+// ============================================================================
+// DecimalType validation tests
+// ============================================================================
 
 #[test]
 fn test_decimal_invalid_precision() {
@@ -1418,6 +1458,76 @@ fn test_decimal_invalid_scale() {
     );
 }
 
+// ============================================================================
+// DecimalType validation tests - edge cases
+// ============================================================================
+
+#[test]
+fn test_decimal_valid_precision_and_scale() {
+    // Valid: precision=10, scale=2
+    let result = DecimalType::with_nullable(true, 10, 2);
+    assert!(result.is_ok());
+    let decimal = result.unwrap();
+    assert_eq!(decimal.precision(), 10);
+    assert_eq!(decimal.scale(), 2);
+    // Nullable: should NOT contain "NOT NULL"
+    assert!(!decimal.to_string().contains("NOT NULL"));
+
+    // Valid: precision=38, scale=0
+    let result = DecimalType::with_nullable(true, 38, 0);
+    assert!(result.is_ok());
+    let decimal = result.unwrap();
+    assert_eq!(decimal.precision(), 38);
+    assert_eq!(decimal.scale(), 0);
+
+    // Valid: precision=1, scale=0
+    let result = DecimalType::with_nullable(false, 1, 0);
+    assert!(result.is_ok());
+    let decimal = result.unwrap();
+    assert_eq!(decimal.precision(), 1);
+    assert_eq!(decimal.scale(), 0);
+    // Non-nullable: should contain "NOT NULL"
+    assert!(decimal.to_string().contains("NOT NULL"));
+}
+
+#[test]
+fn test_decimal_invalid_precision_zero() {
+    // Invalid: precision=0 (edge case not covered by existing tests)
+    let result = DecimalType::with_nullable(true, 0, 0);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Decimal precision must be between 1 and 38")
+    );
+}
+
+#[test]
+fn test_decimal_scale_equals_precision_boundary() {
+    // Boundary: precision=10, scale=10 (scale == precision is valid)
+    let result = DecimalType::with_nullable(true, 10, 10);
+    assert!(result.is_ok());
+    let decimal = result.unwrap();
+    assert_eq!(decimal.precision(), 10);
+    assert_eq!(decimal.scale(), 10);
+}
+
+// ============================================================================
+// TimeType validation tests
+// ============================================================================
+
+#[test]
+fn test_time_valid_precision() {
+    // Test all valid precision values 0 through 9
+    for precision in 0..=9 {
+        let result = TimeType::with_nullable(true, precision);
+        assert!(result.is_ok(), "precision {precision} should be valid");
+        let time = result.unwrap();
+        assert_eq!(time.precision(), precision);
+    }
+}
+
 #[test]
 fn test_time_invalid_precision() {
     // TimeType::with_nullable should return an error for invalid precision
@@ -1429,6 +1539,21 @@ fn test_time_invalid_precision() {
             .to_string()
             .contains("Time precision must be between 0 and 9")
     );
+}
+
+// ============================================================================
+// TimestampType validation tests
+// ============================================================================
+
+#[test]
+fn test_timestamp_valid_precision() {
+    // Test all valid precision values 0 through 9
+    for precision in 0..=9 {
+        let result = TimestampType::with_nullable(true, precision);
+        assert!(result.is_ok(), "precision {precision} should be valid");
+        let timestamp_type = result.unwrap();
+        assert_eq!(timestamp_type.precision(), precision);
+    }
 }
 
 #[test]
@@ -1455,4 +1580,118 @@ fn test_timestamp_ltz_invalid_precision() {
             .to_string()
             .contains("Timestamp with local time zone precision must be between 0 and 9")
     );
+}
+
+// ============================================================================
+// RowType projection tests
+// ============================================================================
+
+#[test]
+fn test_row_type_project_valid_indices() {
+    // Create a 3-column row type
+    let row_type = RowType::with_data_types_and_field_names(
+        vec![DataTypes::int(), DataTypes::string(), DataTypes::bigint()],
+        vec!["id", "name", "age"],
+    );
+
+    // Valid projection by indices: [0, 2]
+    let projected = row_type.project(&[0, 2]).unwrap();
+    assert_eq!(projected.fields().len(), 2);
+    assert_eq!(projected.fields()[0].name, "id");
+    assert_eq!(projected.fields()[1].name, "age");
+}
+
+#[test]
+fn test_row_type_project_empty_indices() {
+    // Create a 3-column row type
+    let row_type = RowType::with_data_types_and_field_names(
+        vec![DataTypes::int(), DataTypes::string(), DataTypes::bigint()],
+        vec!["id", "name", "age"],
+    );
+
+    // Projection with an empty indices array should yield an empty RowType
+    let projected = row_type.project(&[]).unwrap();
+    assert_eq!(projected.fields().len(), 0);
+}
+
+#[test]
+fn test_row_type_project_with_field_names_valid() {
+    // Create a 3-column row type
+    let row_type = RowType::with_data_types_and_field_names(
+        vec![DataTypes::int(), DataTypes::string(), DataTypes::bigint()],
+        vec!["id", "name", "age"],
+    );
+
+    // Valid projection by names: ["id", "name"]
+    let projected = row_type
+        .project_with_field_names(&["id".to_string(), "name".to_string()])
+        .unwrap();
+    assert_eq!(projected.fields().len(), 2);
+    assert_eq!(projected.fields()[0].name, "id");
+    assert_eq!(projected.fields()[1].name, "name");
+}
+
+#[test]
+fn test_row_type_project_index_out_of_bounds() {
+    // Create a 3-column row type
+    let row_type = RowType::with_data_types_and_field_names(
+        vec![DataTypes::int(), DataTypes::string(), DataTypes::bigint()],
+        vec!["id", "name", "age"],
+    );
+
+    // Error: index out of bounds
+    let result = row_type.project(&[0, 5]);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid field position: 5")
+    );
+}
+
+#[test]
+fn test_row_type_project_with_field_names_nonexistent() {
+    // Create a 3-column row type
+    let row_type = RowType::with_data_types_and_field_names(
+        vec![DataTypes::int(), DataTypes::string(), DataTypes::bigint()],
+        vec!["id", "name", "age"],
+    );
+
+    // Error: non-existent field name should throw exception
+    let result = row_type.project_with_field_names(&["nonexistent".to_string()]);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Field 'nonexistent' does not exist in the row type")
+    );
+
+    // Mixed existing and non-existing: should also error on the first non-existent field
+    let result = row_type.project_with_field_names(&["id".to_string(), "nonexistent".to_string()]);
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("Field 'nonexistent' does not exist in the row type")
+    );
+}
+
+#[test]
+fn test_row_type_project_duplicate_indices() {
+    // Create a 3-column row type
+    let row_type = RowType::with_data_types_and_field_names(
+        vec![DataTypes::int(), DataTypes::string(), DataTypes::bigint()],
+        vec!["id", "name", "age"],
+    );
+
+    // Projection with duplicate indices: [0, 0, 1]
+    // This documents the expected behavior - duplicates are allowed
+    let projected = row_type.project(&[0, 0, 1]).unwrap();
+    assert_eq!(projected.fields().len(), 3);
+    assert_eq!(projected.fields()[0].name, "id");
+    assert_eq!(projected.fields()[1].name, "id");
+    assert_eq!(projected.fields()[2].name, "name");
 }

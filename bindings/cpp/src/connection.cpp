@@ -17,9 +17,9 @@
  * under the License.
  */
 
+#include "ffi_converter.hpp"
 #include "fluss.hpp"
 #include "lib.rs.h"
-#include "ffi_converter.hpp"
 #include "rust/cxx.h"
 
 namespace fluss {
@@ -35,9 +35,7 @@ void Connection::Destroy() noexcept {
     }
 }
 
-Connection::Connection(Connection&& other) noexcept : conn_(other.conn_) {
-    other.conn_ = nullptr;
-}
+Connection::Connection(Connection&& other) noexcept : conn_(other.conn_) { other.conn_ = nullptr; }
 
 Connection& Connection::operator=(Connection&& other) noexcept {
     if (this != &other) {
@@ -48,48 +46,43 @@ Connection& Connection::operator=(Connection&& other) noexcept {
     return *this;
 }
 
-Result Connection::Connect(const std::string& bootstrap_server, Connection& out) {
-    try {
-        out.conn_ = ffi::new_connection(bootstrap_server);
-        return utils::make_ok();
-    } catch (const rust::Error& e) {
-        return utils::make_error(1, e.what());
-    } catch (const std::exception& e) {
-        return utils::make_error(1, e.what());
+Result Connection::Create(const Configuration& config, Connection& out) {
+    auto ffi_config = utils::to_ffi_config(config);
+    auto ffi_result = ffi::new_connection(ffi_config);
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.conn_ = utils::ptr_from_ffi<ffi::Connection>(ffi_result);
     }
+    return result;
 }
 
 bool Connection::Available() const { return conn_ != nullptr; }
 
 Result Connection::GetAdmin(Admin& out) {
     if (!Available()) {
-        return utils::make_error(1, "Connection not available");
+        return utils::make_client_error("Connection not available");
     }
 
-    try {
-        out.admin_ = conn_->get_admin();
-        return utils::make_ok();
-    } catch (const rust::Error& e) {
-        return utils::make_error(1, e.what());
-    } catch (const std::exception& e) {
-        return utils::make_error(1, e.what());
+    auto ffi_result = conn_->get_admin();
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.admin_ = utils::ptr_from_ffi<ffi::Admin>(ffi_result);
     }
+    return result;
 }
 
 Result Connection::GetTable(const TablePath& table_path, Table& out) {
     if (!Available()) {
-        return utils::make_error(1, "Connection not available");
+        return utils::make_client_error("Connection not available");
     }
 
-    try {
-        auto ffi_path = utils::to_ffi_table_path(table_path);
-        out.table_ = conn_->get_table(ffi_path);
-        return utils::make_ok();
-    } catch (const rust::Error& e) {
-        return utils::make_error(1, e.what());
-    } catch (const std::exception& e) {
-        return utils::make_error(1, e.what());
+    auto ffi_path = utils::to_ffi_table_path(table_path);
+    auto ffi_result = conn_->get_table(ffi_path);
+    auto result = utils::from_ffi_result(ffi_result.result);
+    if (result.Ok()) {
+        out.table_ = utils::ptr_from_ffi<ffi::Table>(ffi_result);
     }
+    return result;
 }
 
 }  // namespace fluss

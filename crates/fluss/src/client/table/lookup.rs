@@ -16,16 +16,19 @@
 // under the License.
 
 use crate::bucketing::BucketingFunction;
-use crate::client::connection::FlussConnection;
 use crate::client::metadata::Metadata;
+use crate::client::table::partition_getter::PartitionGetter;
 use crate::error::{Error, Result};
-use crate::metadata::{RowType, TableBucket, TableInfo};
+use crate::metadata::{PhysicalTablePath, RowType, TableBucket, TableInfo, TablePath};
+use crate::record::RowAppendRecordBatchBuilder;
 use crate::record::kv::SCHEMA_ID_LENGTH;
 use crate::row::InternalRow;
 use crate::row::compacted::CompactedRow;
 use crate::row::encode::{KeyEncoder, KeyEncoderFactory};
 use crate::rpc::ApiError;
+use crate::rpc::RpcClient;
 use crate::rpc::message::LookupRequest;
+use arrow::array::RecordBatch;
 use std::sync::Arc;
 
 /// The result of a lookup operation.
@@ -33,23 +36,36 @@ use std::sync::Arc;
 /// Contains the rows returned from a lookup. For primary key lookups,
 /// this will contain at most one row. For prefix key lookups (future),
 /// this may contain multiple rows.
-pub struct LookupResult<'a> {
+pub struct LookupResult {
     rows: Vec<Vec<u8>>,
-    row_type: &'a RowType,
+    row_type: Arc<RowType>,
 }
 
-impl<'a> LookupResult<'a> {
+impl LookupResult {
     /// Creates a new LookupResult from a list of row bytes.
-    fn new(rows: Vec<Vec<u8>>, row_type: &'a RowType) -> Self {
+    fn new(rows: Vec<Vec<u8>>, row_type: Arc<RowType>) -> Self {
         Self { rows, row_type }
     }
 
     /// Creates an empty LookupResult.
-    fn empty(row_type: &'a RowType) -> Self {
+    fn empty(row_type: Arc<RowType>) -> Self {
         Self {
             rows: Vec::new(),
             row_type,
         }
+    }
+
+    /// Extracts the row payload by stripping the schema id prefix.
+    fn extract_payload(bytes: &[u8]) -> Result<&[u8]> {
+        bytes
+            .get(SCHEMA_ID_LENGTH..)
+            .ok_or_else(|| Error::RowConvertError {
+                message: format!(
+                    "Row payload too short: {} bytes, need at least {} for schema id",
+                    bytes.len(),
+                    SCHEMA_ID_LENGTH
+                ),
+            })
     }
 
     /// Returns the only row in the result set as a [`CompactedRow`].
@@ -61,14 +77,14 @@ impl<'a> LookupResult<'a> {
     /// - `Ok(Some(row))`: If exactly one row exists.
     /// - `Ok(None)`: If the result set is empty.
     /// - `Err(Error::UnexpectedError)`: If the result set contains more than one row.
-    ///
+    /// - `Err(Error)`: If the row payload is too short to contain a schema id.
     pub fn get_single_row(&self) -> Result<Option<CompactedRow<'_>>> {
         match self.rows.len() {
             0 => Ok(None),
-            1 => Ok(Some(CompactedRow::from_bytes(
-                self.row_type,
-                &self.rows[0][SCHEMA_ID_LENGTH..],
-            ))),
+            1 => {
+                let payload = Self::extract_payload(&self.rows[0])?;
+                Ok(Some(CompactedRow::from_bytes(&self.row_type, payload)))
+            }
             _ => Err(Error::UnexpectedError {
                 message: "LookupResult contains multiple rows, use get_rows() instead".to_string(),
                 source: None,
@@ -76,13 +92,41 @@ impl<'a> LookupResult<'a> {
         }
     }
 
-    /// Returns all rows as CompactedRows.
-    pub fn get_rows(&self) -> Vec<CompactedRow<'_>> {
+    /// Returns all rows in the result set as [`CompactedRow`]s.
+    ///
+    /// # Returns
+    /// - `Ok(rows)` - All rows in the result set.
+    /// - `Err(Error)` - If any row payload is too short to contain a schema id.
+    pub fn get_rows(&self) -> Result<Vec<CompactedRow<'_>>> {
         self.rows
             .iter()
             // TODO Add schema id check and fetch when implementing prefix lookup
-            .map(|bytes| CompactedRow::from_bytes(self.row_type, &bytes[SCHEMA_ID_LENGTH..]))
+            .map(|bytes| {
+                let payload = Self::extract_payload(bytes)?;
+                Ok(CompactedRow::from_bytes(&self.row_type, payload))
+            })
             .collect()
+    }
+
+    /// Converts all rows in this result into an Arrow [`RecordBatch`].
+    ///
+    /// This is useful for integration with DataFusion or other Arrow-based tools.
+    ///
+    /// # Returns
+    /// - `Ok(RecordBatch)` - All rows in columnar Arrow format. Returns an empty
+    ///   batch (with the correct schema) if the result set is empty.
+    /// - `Err(Error)` - If the conversion fails.
+    pub fn to_record_batch(&self) -> Result<RecordBatch> {
+        let mut builder = RowAppendRecordBatchBuilder::new(&self.row_type)?;
+
+        for bytes in &self.rows {
+            let payload = Self::extract_payload(bytes)?;
+
+            let row = CompactedRow::from_bytes(&self.row_type, payload);
+            builder.append(&row)?;
+        }
+
+        builder.build_arrow_record_batch().map(Arc::unwrap_or_clone)
     }
 }
 
@@ -103,20 +147,20 @@ impl<'a> LookupResult<'a> {
 /// ```
 // TODO: Add lookup_by(column_names) for prefix key lookups (PrefixKeyLookuper)
 // TODO: Add create_typed_lookuper<T>() for typed lookups with POJO mapping
-pub struct TableLookup<'a> {
-    conn: &'a FlussConnection,
+pub struct TableLookup {
+    rpc_client: Arc<RpcClient>,
     table_info: TableInfo,
     metadata: Arc<Metadata>,
 }
 
-impl<'a> TableLookup<'a> {
+impl TableLookup {
     pub(super) fn new(
-        conn: &'a FlussConnection,
+        rpc_client: Arc<RpcClient>,
         table_info: TableInfo,
         metadata: Arc<Metadata>,
     ) -> Self {
         Self {
-            conn,
+            rpc_client,
             table_info,
             metadata,
         }
@@ -126,27 +170,52 @@ impl<'a> TableLookup<'a> {
     ///
     /// The lookuper will automatically encode the key and compute the bucket
     /// for each lookup using the appropriate bucketing function.
-    pub fn create_lookuper(self) -> Result<Lookuper<'a>> {
+    pub fn create_lookuper(self) -> Result<Lookuper> {
         let num_buckets = self.table_info.get_num_buckets();
 
         // Get data lake format from table config for bucketing function
         let data_lake_format = self.table_info.get_table_config().get_datalake_format()?;
         let bucketing_function = <dyn BucketingFunction>::of(data_lake_format.as_ref());
 
-        // Create key encoder for the primary key fields
-        let pk_fields = self.table_info.get_physical_primary_keys().to_vec();
-        let key_encoder = KeyEncoderFactory::of(
-            self.table_info.row_type(),
-            pk_fields.as_slice(),
-            &data_lake_format,
-        )?;
+        let row_type = self.table_info.row_type();
+        let primary_keys = self.table_info.get_primary_keys();
+        let lookup_row_type = row_type.project_with_field_names(primary_keys)?;
 
+        let physical_primary_keys = self.table_info.get_physical_primary_keys().to_vec();
+        let primary_key_encoder =
+            KeyEncoderFactory::of(&lookup_row_type, &physical_primary_keys, &data_lake_format)?;
+
+        let bucket_key_encoder = if self.table_info.is_default_bucket_key() {
+            None
+        } else {
+            let bucket_keys = self.table_info.get_bucket_keys().to_vec();
+            Some(KeyEncoderFactory::of(
+                &lookup_row_type,
+                &bucket_keys,
+                &data_lake_format,
+            )?)
+        };
+
+        let partition_getter = if self.table_info.is_partitioned() {
+            Some(PartitionGetter::new(
+                &lookup_row_type,
+                Arc::clone(self.table_info.get_partition_keys()),
+            )?)
+        } else {
+            None
+        };
+
+        let row_type = Arc::new(self.table_info.row_type().clone());
         Ok(Lookuper {
-            conn: self.conn,
+            rpc_client: self.rpc_client,
+            table_path: Arc::new(self.table_info.table_path.clone()),
+            row_type,
             table_info: self.table_info,
             metadata: self.metadata,
             bucketing_function,
-            key_encoder,
+            primary_key_encoder,
+            bucket_key_encoder,
+            partition_getter,
             num_buckets,
         })
     }
@@ -163,17 +232,20 @@ impl<'a> TableLookup<'a> {
 /// let row = GenericRow::new(vec![Datum::Int32(42)]); // lookup key
 /// let result = lookuper.lookup(&row).await?;
 /// ```
-// TODO: Support partitioned tables (extract partition from key)
-pub struct Lookuper<'a> {
-    conn: &'a FlussConnection,
+pub struct Lookuper {
+    rpc_client: Arc<RpcClient>,
     table_info: TableInfo,
+    row_type: Arc<RowType>,
+    table_path: Arc<TablePath>,
     metadata: Arc<Metadata>,
     bucketing_function: Box<dyn BucketingFunction>,
-    key_encoder: Box<dyn KeyEncoder>,
+    primary_key_encoder: Box<dyn KeyEncoder>,
+    bucket_key_encoder: Option<Box<dyn KeyEncoder>>,
+    partition_getter: Option<PartitionGetter>,
     num_buckets: i32,
 }
 
-impl<'a> Lookuper<'a> {
+impl Lookuper {
     /// Looks up a value by its primary key.
     ///
     /// The key is encoded and the bucket is automatically computed using
@@ -185,45 +257,64 @@ impl<'a> Lookuper<'a> {
     /// # Returns
     /// * `Ok(LookupResult)` - The lookup result (may be empty if key not found)
     /// * `Err(Error)` - If the lookup fails
-    pub async fn lookup(&mut self, row: &dyn InternalRow) -> Result<LookupResult<'_>> {
+    pub async fn lookup(&mut self, row: &dyn InternalRow) -> Result<LookupResult> {
         // todo: support batch lookup
-        // Encode the key from the row
-        let encoded_key = self.key_encoder.encode_key(row)?;
-        let key_bytes = encoded_key.to_vec();
+        let pk_bytes = self.primary_key_encoder.encode_key(row)?;
+        let pk_bytes_vec = pk_bytes.to_vec();
+        let bk_bytes = match &mut self.bucket_key_encoder {
+            Some(encoder) => &encoder.encode_key(row)?,
+            None => &pk_bytes,
+        };
 
-        // Compute bucket from encoded key
+        let partition_id = if let Some(ref partition_getter) = self.partition_getter {
+            let partition_name = partition_getter.get_partition(row)?;
+            let physical_table_path = PhysicalTablePath::of_partitioned(
+                Arc::clone(&self.table_path),
+                Some(partition_name),
+            );
+            let cluster = self.metadata.get_cluster();
+            match cluster.get_partition_id(&physical_table_path) {
+                Some(id) => Some(id),
+                None => {
+                    // Partition doesn't exist, return empty result (like Java)
+                    return Ok(LookupResult::empty(Arc::clone(&self.row_type)));
+                }
+            }
+        } else {
+            None
+        };
+
         let bucket_id = self
             .bucketing_function
-            .bucketing(&key_bytes, self.num_buckets)?;
+            .bucketing(bk_bytes, self.num_buckets)?;
 
         let table_id = self.table_info.get_table_id();
-        let table_bucket = TableBucket::new(table_id, bucket_id);
+        let table_bucket = TableBucket::new_with_partition(table_id, partition_id, bucket_id);
 
         // Find the leader for this bucket
         let cluster = self.metadata.get_cluster();
-        let leader =
-            cluster
-                .leader_for(&table_bucket)
-                .ok_or_else(|| Error::LeaderNotAvailable {
-                    message: format!("No leader found for table bucket: {table_bucket}"),
-                })?;
+        let leader = self
+            .metadata
+            .leader_for(self.table_path.as_ref(), &table_bucket)
+            .await?
+            .ok_or_else(|| {
+                Error::leader_not_available(format!(
+                    "No leader found for table bucket: {table_bucket}"
+                ))
+            })?;
 
         // Get connection to the tablet server
-        let tablet_server =
-            cluster
-                .get_tablet_server(leader.id())
-                .ok_or_else(|| Error::LeaderNotAvailable {
-                    message: format!(
-                        "Tablet server {} is not found in metadata cache",
-                        leader.id()
-                    ),
-                })?;
+        let tablet_server = cluster.get_tablet_server(leader.id()).ok_or_else(|| {
+            Error::leader_not_available(format!(
+                "Tablet server {} is not found in metadata cache",
+                leader.id()
+            ))
+        })?;
 
-        let connections = self.conn.get_connections();
-        let connection = connections.get_connection(tablet_server).await?;
+        let connection = self.rpc_client.get_connection(tablet_server).await?;
 
         // Send lookup request
-        let request = LookupRequest::new(table_id, None, bucket_id, vec![key_bytes]);
+        let request = LookupRequest::new(table_id, partition_id, bucket_id, vec![pk_bytes_vec]);
         let response = connection.request(request).await?;
 
         // Extract the values from response
@@ -247,14 +338,79 @@ impl<'a> Lookuper<'a> {
                 .filter_map(|pb_value| pb_value.values)
                 .collect();
 
-            return Ok(LookupResult::new(rows, self.table_info.row_type()));
+            return Ok(LookupResult::new(rows, Arc::clone(&self.row_type)));
         }
 
-        Ok(LookupResult::empty(self.table_info.row_type()))
+        Ok(LookupResult::empty(Arc::clone(&self.row_type)))
     }
 
     /// Returns a reference to the table info.
     pub fn table_info(&self) -> &TableInfo {
         &self.table_info
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metadata::{DataField, DataTypes};
+    use crate::row::binary::BinaryWriter;
+    use crate::row::compacted::CompactedRowWriter;
+    use arrow::array::Int32Array;
+
+    fn make_row_bytes(schema_id: i16, row_data: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(SCHEMA_ID_LENGTH + row_data.len());
+        bytes.extend_from_slice(&schema_id.to_le_bytes());
+        bytes.extend_from_slice(row_data);
+        bytes
+    }
+
+    #[test]
+    fn test_to_record_batch_empty() {
+        let row_type = Arc::new(RowType::new(vec![DataField::new(
+            "id",
+            DataTypes::int(),
+            None,
+        )]));
+        let result = LookupResult::empty(row_type);
+        let batch = result.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 0);
+        assert_eq!(batch.num_columns(), 1);
+    }
+
+    #[test]
+    fn test_to_record_batch_with_row() {
+        let row_type = Arc::new(RowType::new(vec![DataField::new(
+            "id",
+            DataTypes::int(),
+            None,
+        )]));
+
+        let mut writer = CompactedRowWriter::new(1);
+        writer.write_int(42);
+        let row_bytes = make_row_bytes(0, writer.buffer());
+
+        let result = LookupResult::new(vec![row_bytes], Arc::clone(&row_type));
+        let batch = result.to_record_batch().unwrap();
+
+        assert_eq!(batch.num_rows(), 1);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col.value(0), 42);
+    }
+
+    #[test]
+    fn test_to_record_batch_payload_too_short() {
+        let row_type = Arc::new(RowType::new(vec![DataField::new(
+            "id",
+            DataTypes::int(),
+            None,
+        )]));
+        // Only 1 byte — shorter than SCHEMA_ID_LENGTH (2)
+        let result = LookupResult::new(vec![vec![0u8]], Arc::clone(&row_type));
+        assert!(result.to_record_batch().is_err());
     }
 }

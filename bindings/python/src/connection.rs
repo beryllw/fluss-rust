@@ -29,13 +29,13 @@ pub struct FlussConnection {
 impl FlussConnection {
     /// Create a new FlussConnection (async)
     #[staticmethod]
-    fn connect<'py>(py: Python<'py>, config: &Config) -> PyResult<Bound<'py, PyAny>> {
+    fn create<'py>(py: Python<'py>, config: &Config) -> PyResult<Bound<'py, PyAny>> {
         let rust_config = config.get_core_config();
 
         future_into_py(py, async move {
             let connection = fcore::client::FlussConnection::new(rust_config)
                 .await
-                .map_err(|e| FlussError::new_err(e.to_string()))?;
+                .map_err(|e| FlussError::from_core_error(&e))?;
 
             let py_connection = FlussConnection {
                 inner: Arc::new(connection),
@@ -46,19 +46,13 @@ impl FlussConnection {
     }
 
     /// Get admin interface
-    fn get_admin<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let client = self.inner.clone();
+    fn get_admin(&self, py: Python<'_>) -> PyResult<Py<FlussAdmin>> {
+        let admin = self
+            .inner
+            .get_admin()
+            .map_err(|e| FlussError::from_core_error(&e))?;
 
-        future_into_py(py, async move {
-            let admin = client
-                .get_admin()
-                .await
-                .map_err(|e| FlussError::new_err(e.to_string()))?;
-
-            let py_admin = FlussAdmin::from_core(admin);
-
-            Python::attach(|py| Py::new(py, py_admin))
-        })
+        Py::new(py, FlussAdmin::from_core(admin))
     }
 
     /// Get a table
@@ -74,12 +68,12 @@ impl FlussConnection {
             let core_table = client
                 .get_table(&core_path)
                 .await
-                .map_err(|e| FlussError::new_err(e.to_string()))?;
+                .map_err(|e| FlussError::from_core_error(&e))?;
 
             let py_table = FlussTable::new_table(
                 client.clone(),
                 core_table.metadata().clone(),
-                core_table.table_info().clone(),
+                core_table.get_table_info().clone(),
                 core_table.table_path().clone(),
                 core_table.has_primary_key(),
             );

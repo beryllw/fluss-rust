@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::BucketId;
-use crate::metadata::{TableBucket, TablePath};
+use crate::metadata::{PhysicalTablePath, TableBucket};
+use std::fmt;
+use std::sync::Arc;
 
 #[allow(clippy::module_inception)]
 mod cluster;
@@ -46,7 +48,7 @@ impl ServerNode {
         }
     }
 
-    pub fn uid(&self) -> &String {
+    pub fn uid(&self) -> &str {
         &self.uid
     }
 
@@ -57,6 +59,18 @@ impl ServerNode {
     pub fn id(&self) -> i32 {
         self.id
     }
+
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u32 {
+        self.port
+    }
+
+    pub fn server_type(&self) -> &ServerType {
+        &self.server_type
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -65,23 +79,32 @@ pub enum ServerType {
     CoordinatorServer,
 }
 
+impl fmt::Display for ServerType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ServerType::TabletServer => write!(f, "TabletServer"),
+            ServerType::CoordinatorServer => write!(f, "CoordinatorServer"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BucketLocation {
     pub table_bucket: TableBucket,
     leader: Option<ServerNode>,
-    pub table_path: TablePath,
+    physical_table_path: Arc<PhysicalTablePath>,
 }
 
 impl BucketLocation {
     pub fn new(
         table_bucket: TableBucket,
         leader: Option<ServerNode>,
-        table_path: TablePath,
+        physical_table_path: Arc<PhysicalTablePath>,
     ) -> BucketLocation {
         BucketLocation {
             table_bucket,
             leader,
-            table_path,
+            physical_table_path,
         }
     }
 
@@ -95,5 +118,9 @@ impl BucketLocation {
 
     pub fn bucket_id(&self) -> BucketId {
         self.table_bucket.bucket_id()
+    }
+
+    pub fn physical_table_path(&self) -> &Arc<PhysicalTablePath> {
+        &self.physical_table_path
     }
 }

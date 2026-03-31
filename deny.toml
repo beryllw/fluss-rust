@@ -15,9 +15,22 @@
 # specific language governing permissions and limitations
 # under the License.
 
-module(
-    name = "fluss_cpp",
-)
+[licenses]
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Zlib",
+]
 
-bazel_dep(name = "rules_cc", version = "0.0.17")
-bazel_dep(name = "platforms", version = "0.0.10")
+exceptions = [
+    # open data licenses that SHOULD be OK
+    { crate = "webpki-roots", allow = [
+        "CDLA-Permissive-2.0",
+    ] },
+]

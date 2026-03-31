@@ -24,9 +24,13 @@ version = { workspace = true }
 
 
 [dependencies]
-fluss = { workspace = true }
+fluss = { workspace = true, features = ["storage-all"] }
 tokio = { workspace = true }
 clap = { workspace = true }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
+
 [[example]]
 name = "example-table"
 path = "src/example_table.rs"
@@ -34,3 +38,7 @@ path = "src/example_table.rs"
 [[example]]
 name = "example-upsert-lookup"
 path = "src/example_kv_table.rs"
+
+[[example]]
+name = "example-partitioned-upsert-lookup"
+path = "src/example_partitioned_kv_table.rs"

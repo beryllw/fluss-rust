@@ -17,18 +17,18 @@
 
 [package]
 name = "fluss_python"
-edition = "2024"
-version = "0.1.0"
-license = "apache-2.0"
-rust-version = "1.85"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [lib]
 name = "fluss"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.26.0", features = ["extension-module"] }
-fluss = { path = "../../crates/fluss" }
+pyo3 = { version = "0.26.0", features = ["extension-module", "generate-import-lib"] }
+fluss = { workspace = true, features = ["storage-all"] }
 tokio = { workspace = true }
 arrow = { workspace = true }
 arrow-pyarrow = "57.0.0"
@@ -37,3 +37,4 @@ arrow-array = "57.0.0"
 pyo3-async-runtimes = { version = "0.26.0", features = ["tokio-runtime"] }
 jiff = { workspace = true }
 bigdecimal = "0.4"
+indexmap = "2"

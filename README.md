@@ -1,21 +1,3 @@
-<!--
- Licensed to the Apache Software Foundation (ASF) under one
- or more contributor license agreements.  See the NOTICE file
- distributed with this work for additional information
- regarding copyright ownership.  The ASF licenses this file
- to you under the Apache License, Version 2.0 (the
- "License"); you may not use this file except in compliance
- with the License.  You may obtain a copy of the License at
-
-      http://www.apache.org/licenses/LICENSE-2.0
-
- Unless required by applicable law or agreed to in writing, software
- distributed under the License is distributed on an "AS IS" BASIS,
- WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- See the License for the specific language governing permissions and
- limitations under the License.
--->
-
 # Apache Fluss™ Rust (Incubating)
 
 ![Experimental](https://img.shields.io/badge/status-experimental-orange)
@@ -42,10 +24,10 @@ If your cluster does not fulfill these software requirements you will need to in
 Fluss requires the JAVA_HOME environment variable to be set on all nodes and point to the directory of your Java installation.
 
 #### Fluss Setup
-Go to the [downloads](https://fluss.apache.org/downloads/) page and download the Fluss-0.6.0. Make sure to pick the Fluss package matching your Java version. After downloading the latest release, extract it:
+Go to the [downloads](https://fluss.apache.org/downloads/) page and download the latest Fluss release (currently 0.8.0). Make sure to pick the Fluss package matching your Java version. After downloading the latest release, extract it:
 ```shell
-tar -xzf fluss-0.7-SNAPSHOT-bin.tgz
-cd fluss-0.7-SNAPSHOT/
+tar -xzf fluss-0.8.0-incubating-bin.tgz
+cd fluss-0.8.0-incubating/
 ```
 You can start Fluss local cluster by running the following command:
 ```shell
@@ -68,7 +50,7 @@ The example code is as follows:
 pub async fn main() -> Result<()> {
     // 1: create the table;
     let mut args = Args::default();
-    args.bootstrap_server = "127.0.0.1:9123".to_string();
+    args.bootstrap_servers = "127.0.0.1:9123".to_string();
     let conn_config = ConnectionConfig::from_args(args);
     let conn = FlussConnection::new(conn_config).await;
 
@@ -91,7 +73,7 @@ pub async fn main() -> Result<()> {
         .unwrap();
 
     // 2: get the table
-    let table_info = admin.get_table(&table_path).await.unwrap();
+    let table_info = admin.get_table_info(&table_path).await.unwrap();
     print!("Get created table:\n {}\n", table_info);
 
     // let's sleep 2 seconds to wait leader ready
@@ -101,7 +83,8 @@ pub async fn main() -> Result<()> {
     let table = conn.get_table(&table_path).await;
     let append_writer = table.new_append().create_writer();
     let batch = record_batch!(("c1", Int32, [1, 2, 3, 4, 5, 6]), ("c2", Utf8, ["a1", "a2", "a3", "a4", "a5", "a6"])).unwrap();
-    append_writer.append(batch).await?;
+    append_writer.append(batch)?;
+    append_writer.flush().await?;
     println!("Start to scan log records......");
     // 4: scan the records
     let log_scanner = table.new_scan().create_log_scanner();
@@ -132,6 +115,10 @@ Then, stop your Fluss cluster. Go to your Fluss home, stop it via the following 
 ./bin/local-cluster.sh stop
 ```
 
+## Documentation
+
+- [Development Guide](DEVELOPMENT.md) – Build, test, and contribute to fluss-rust.
+- [Release Guide](website/docs/release/create-release.md) – How to build, release, and sign official Fluss client packages (Rust, Python, C++).
 
 ## License
 

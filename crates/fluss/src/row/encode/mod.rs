@@ -18,7 +18,7 @@
 mod compacted_key_encoder;
 mod compacted_row_encoder;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::metadata::{DataLakeFormat, KvFormat, RowType};
 use crate::row::encode::compacted_key_encoder::CompactedKeyEncoder;
 use crate::row::encode::compacted_row_encoder::CompactedRowEncoder;
@@ -27,7 +27,7 @@ use bytes::Bytes;
 
 /// An interface for encoding key of row into bytes.
 #[allow(dead_code)]
-pub trait KeyEncoder {
+pub trait KeyEncoder: Send + Sync {
     fn encode_key(&mut self, row: &dyn InternalRow) -> Result<Bytes>;
 }
 
@@ -48,15 +48,15 @@ impl KeyEncoderFactory {
         data_lake_format: &Option<DataLakeFormat>,
     ) -> Result<Box<dyn KeyEncoder>> {
         match data_lake_format {
-            Some(DataLakeFormat::Paimon) => {
-                unimplemented!("KeyEncoder for Paimon format is currently unimplemented")
-            }
+            Some(DataLakeFormat::Paimon) => Err(Error::UnsupportedOperation {
+                message: "KeyEncoder for Paimon format is not yet implemented".to_string(),
+            }),
             Some(DataLakeFormat::Lance) => Ok(Box::new(CompactedKeyEncoder::create_key_encoder(
                 row_type, key_fields,
             )?)),
-            Some(DataLakeFormat::Iceberg) => {
-                unimplemented!("KeyEncoder for Iceberg format is currently unimplemented")
-            }
+            Some(DataLakeFormat::Iceberg) => Err(Error::UnsupportedOperation {
+                message: "KeyEncoder for Iceberg format is not yet implemented".to_string(),
+            }),
             None => Ok(Box::new(CompactedKeyEncoder::create_key_encoder(
                 row_type, key_fields,
             )?)),
@@ -64,14 +64,14 @@ impl KeyEncoderFactory {
     }
 }
 
-/// An encoder to write [`BinaryRow`]. It's used to write row
-/// multi-times one by one. When writing a new row:
+/// An encoder to write binary row data. It's used to write rows
+/// one by one. When writing a new row:
 ///
 /// 1. call method [`RowEncoder::start_new_row()`] to start the writing.
 /// 2. call method [`RowEncoder::encode_field()`] to write the row's field.
-/// 3. call method [`RowEncoder::finishRow()`] to finish the writing and get the written row.
+/// 3. call method [`RowEncoder::finish_row()`] to finish the writing and get the written row.
 #[allow(dead_code)]
-pub trait RowEncoder {
+pub trait RowEncoder: Send + Sync {
     /// Start to write a new row.
     ///
     /// # Returns

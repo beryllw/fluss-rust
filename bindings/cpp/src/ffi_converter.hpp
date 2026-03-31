@@ -19,22 +19,30 @@
 
 #pragma once
 
+#include <cassert>
+
 #include "fluss.hpp"
 #include "lib.rs.h"
 
 namespace fluss {
 namespace utils {
 
-inline Result make_error(int32_t code, std::string msg) {
-    return Result{code, std::move(msg)};
+inline Result make_error(int32_t code, std::string msg) { return Result{code, std::move(msg)}; }
+
+inline Result make_client_error(std::string msg) {
+    return Result{ErrorCode::CLIENT_ERROR, std::move(msg)};
 }
 
-inline Result make_ok() {
-    return Result{0, {}};
-}
+inline Result make_ok() { return Result{0, {}}; }
 
 inline Result from_ffi_result(const ffi::FfiResult& ffi_result) {
     return Result{ffi_result.error_code, std::string(ffi_result.error_message)};
+}
+
+template <typename T>
+inline T* ptr_from_ffi(const ffi::FfiPtrResult& r) {
+    assert(r.ptr != 0 && "ptr_from_ffi: null pointer in FfiPtrResult");
+    return reinterpret_cast<T*>(r.ptr);
 }
 
 inline ffi::FfiTablePath to_ffi_table_path(const TablePath& path) {
@@ -44,11 +52,43 @@ inline ffi::FfiTablePath to_ffi_table_path(const TablePath& path) {
     return ffi_path;
 }
 
+inline ffi::FfiConfig to_ffi_config(const Configuration& config) {
+    ffi::FfiConfig ffi_config;
+    ffi_config.bootstrap_servers = rust::String(config.bootstrap_servers);
+    ffi_config.writer_request_max_size = config.writer_request_max_size;
+    ffi_config.writer_acks = rust::String(config.writer_acks);
+    ffi_config.writer_retries = config.writer_retries;
+    ffi_config.writer_batch_size = config.writer_batch_size;
+    ffi_config.writer_bucket_no_key_assigner = rust::String(config.writer_bucket_no_key_assigner);
+    ffi_config.scanner_remote_log_prefetch_num = config.scanner_remote_log_prefetch_num;
+    ffi_config.remote_file_download_thread_num = config.remote_file_download_thread_num;
+    ffi_config.scanner_remote_log_read_concurrency = config.scanner_remote_log_read_concurrency;
+    ffi_config.scanner_log_max_poll_records = config.scanner_log_max_poll_records;
+    ffi_config.scanner_log_fetch_max_bytes = config.scanner_log_fetch_max_bytes;
+    ffi_config.scanner_log_fetch_min_bytes = config.scanner_log_fetch_min_bytes;
+    ffi_config.scanner_log_fetch_wait_max_time_ms = config.scanner_log_fetch_wait_max_time_ms;
+    ffi_config.scanner_log_fetch_max_bytes_for_bucket = config.scanner_log_fetch_max_bytes_for_bucket;
+    ffi_config.writer_batch_timeout_ms = config.writer_batch_timeout_ms;
+    ffi_config.writer_enable_idempotence = config.writer_enable_idempotence;
+    ffi_config.writer_max_inflight_requests_per_bucket =
+        config.writer_max_inflight_requests_per_bucket;
+    ffi_config.writer_buffer_memory_size = config.writer_buffer_memory_size;
+    ffi_config.writer_buffer_wait_timeout_ms = config.writer_buffer_wait_timeout_ms;
+    ffi_config.connect_timeout_ms = config.connect_timeout_ms;
+    ffi_config.security_protocol = rust::String(config.security_protocol);
+    ffi_config.security_sasl_mechanism = rust::String(config.security_sasl_mechanism);
+    ffi_config.security_sasl_username = rust::String(config.security_sasl_username);
+    ffi_config.security_sasl_password = rust::String(config.security_sasl_password);
+    return ffi_config;
+}
+
 inline ffi::FfiColumn to_ffi_column(const Column& col) {
     ffi::FfiColumn ffi_col;
     ffi_col.name = rust::String(col.name);
-    ffi_col.data_type = static_cast<int32_t>(col.data_type);
+    ffi_col.data_type = static_cast<int32_t>(col.data_type.id());
     ffi_col.comment = rust::String(col.comment);
+    ffi_col.precision = col.data_type.precision();
+    ffi_col.scale = col.data_type.scale();
     return ffi_col;
 }
 
@@ -98,46 +138,24 @@ inline ffi::FfiTableDescriptor to_ffi_table_descriptor(const TableDescriptor& de
     }
     ffi_desc.properties = std::move(props);
 
+    rust::Vec<ffi::HashMapValue> custom_props;
+    for (const auto& [k, v] : desc.custom_properties) {
+        ffi::HashMapValue prop;
+        prop.key = rust::String(k);
+        prop.value = rust::String(v);
+        custom_props.push_back(prop);
+    }
+    ffi_desc.custom_properties = std::move(custom_props);
+
     ffi_desc.comment = rust::String(desc.comment);
 
     return ffi_desc;
 }
 
-inline ffi::FfiDatum to_ffi_datum(const Datum& datum) {
-    ffi::FfiDatum ffi_datum;
-    ffi_datum.datum_type = static_cast<int32_t>(datum.type);
-    ffi_datum.bool_val = datum.bool_val;
-    ffi_datum.i32_val = datum.i32_val;
-    ffi_datum.i64_val = datum.i64_val;
-    ffi_datum.f32_val = datum.f32_val;
-    ffi_datum.f64_val = datum.f64_val;
-    ffi_datum.string_val = rust::String(datum.string_val);
-
-    rust::Vec<uint8_t> bytes;
-    for (auto b : datum.bytes_val) {
-        bytes.push_back(b);
-    }
-    ffi_datum.bytes_val = std::move(bytes);
-
-    return ffi_datum;
-}
-
-inline ffi::FfiGenericRow to_ffi_generic_row(const GenericRow& row) {
-    ffi::FfiGenericRow ffi_row;
-
-    rust::Vec<ffi::FfiDatum> fields;
-    for (const auto& field : row.fields) {
-        fields.push_back(to_ffi_datum(field));
-    }
-    ffi_row.fields = std::move(fields);
-
-    return ffi_row;
-}
-
 inline Column from_ffi_column(const ffi::FfiColumn& ffi_col) {
     return Column{
         std::string(ffi_col.name),
-        static_cast<DataType>(ffi_col.data_type),
+        DataType(static_cast<TypeId>(ffi_col.data_type), ffi_col.precision, ffi_col.scale),
         std::string(ffi_col.comment)};
 }
 
@@ -160,9 +178,8 @@ inline TableInfo from_ffi_table_info(const ffi::FfiTableInfo& ffi_info) {
 
     info.table_id = ffi_info.table_id;
     info.schema_id = ffi_info.schema_id;
-    info.table_path = TablePath{
-        std::string(ffi_info.table_path.database_name),
-        std::string(ffi_info.table_path.table_name)};
+    info.table_path = TablePath{std::string(ffi_info.table_path.database_name),
+                                std::string(ffi_info.table_path.table_name)};
     info.created_time = ffi_info.created_time;
     info.modified_time = ffi_info.modified_time;
 
@@ -186,56 +203,14 @@ inline TableInfo from_ffi_table_info(const ffi::FfiTableInfo& ffi_info) {
         info.properties[std::string(prop.key)] = std::string(prop.value);
     }
 
+    for (const auto& prop : ffi_info.custom_properties) {
+        info.custom_properties[std::string(prop.key)] = std::string(prop.value);
+    }
+
     info.comment = std::string(ffi_info.comment);
     info.schema = from_ffi_schema(ffi_info.schema);
 
     return info;
-}
-
-inline Datum from_ffi_datum(const ffi::FfiDatum& ffi_datum) {
-    Datum datum;
-    datum.type = static_cast<DatumType>(ffi_datum.datum_type);
-    datum.bool_val = ffi_datum.bool_val;
-    datum.i32_val = ffi_datum.i32_val;
-    datum.i64_val = ffi_datum.i64_val;
-    datum.f32_val = ffi_datum.f32_val;
-    datum.f64_val = ffi_datum.f64_val;
-    // todo: avoid copy string
-    datum.string_val = std::string(ffi_datum.string_val);
-
-    for (auto b : ffi_datum.bytes_val) {
-        datum.bytes_val.push_back(b);
-    }
-
-    return datum;
-}
-
-inline GenericRow from_ffi_generic_row(const ffi::FfiGenericRow& ffi_row) {
-    GenericRow row;
-
-    for (const auto& field : ffi_row.fields) {
-        row.fields.push_back(from_ffi_datum(field));
-    }
-
-    return row;
-}
-
-inline ScanRecord from_ffi_scan_record(const ffi::FfiScanRecord& ffi_record) {
-    return ScanRecord{
-        ffi_record.bucket_id,
-        ffi_record.offset,
-        ffi_record.timestamp,
-        from_ffi_generic_row(ffi_record.row)};
-}
-
-inline ScanRecords from_ffi_scan_records(const ffi::FfiScanRecords& ffi_records) {
-    ScanRecords records;
-
-    for (const auto& record : ffi_records.records) {
-        records.records.push_back(from_ffi_scan_record(record));
-    }
-
-    return records;
 }
 
 inline LakeSnapshot from_ffi_lake_snapshot(const ffi::FfiLakeSnapshot& ffi_snapshot) {
@@ -243,14 +218,35 @@ inline LakeSnapshot from_ffi_lake_snapshot(const ffi::FfiLakeSnapshot& ffi_snaps
     snapshot.snapshot_id = ffi_snapshot.snapshot_id;
 
     for (const auto& offset : ffi_snapshot.bucket_offsets) {
-        snapshot.bucket_offsets.push_back(BucketOffset{
-            offset.table_id,
-            offset.partition_id,
-            offset.bucket_id,
-            offset.offset});
+        snapshot.bucket_offsets.push_back(
+            BucketOffset{offset.table_id, offset.partition_id, offset.bucket_id, offset.offset});
     }
 
     return snapshot;
+}
+
+inline ffi::FfiDatabaseDescriptor to_ffi_database_descriptor(const DatabaseDescriptor& desc) {
+    ffi::FfiDatabaseDescriptor ffi_desc;
+    ffi_desc.comment = rust::String(desc.comment);
+    for (const auto& [k, v] : desc.properties) {
+        ffi::HashMapValue kv;
+        kv.key = rust::String(k);
+        kv.value = rust::String(v);
+        ffi_desc.properties.push_back(std::move(kv));
+    }
+    return ffi_desc;
+}
+
+inline DatabaseInfo from_ffi_database_info(const ffi::FfiDatabaseInfo& ffi_info) {
+    DatabaseInfo info;
+    info.database_name = std::string(ffi_info.database_name);
+    info.comment = std::string(ffi_info.comment);
+    info.created_time = ffi_info.created_time;
+    info.modified_time = ffi_info.modified_time;
+    for (const auto& prop : ffi_info.properties) {
+        info.properties[std::string(prop.key)] = std::string(prop.value);
+    }
+    return info;
 }
 
 }  // namespace utils

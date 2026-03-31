@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::compression::ArrowCompressionInfo;
-use crate::error::Error::{IllegalArgument, InvalidTableError};
+use crate::error::Error::IllegalArgument;
 use crate::error::{Error, Result};
 use crate::metadata::DataLakeFormat;
 use crate::metadata::datatype::{DataField, DataType, RowType};
@@ -25,6 +25,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use strum_macros::EnumString;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,16 +36,16 @@ pub struct Column {
 }
 
 impl Column {
-    pub fn new(name: &str, data_type: DataType) -> Self {
+    pub fn new<N: Into<String>>(name: N, data_type: DataType) -> Self {
         Self {
-            name: name.to_string(),
+            name: name.into(),
             data_type,
             comment: None,
         }
     }
 
-    pub fn with_comment(mut self, comment: &str) -> Self {
-        self.comment = Some(comment.to_string());
+    pub fn with_comment<C: Into<String>>(mut self, comment: C) -> Self {
+        self.comment = Some(comment.into());
         self
     }
 
@@ -77,9 +78,9 @@ pub struct PrimaryKey {
 }
 
 impl PrimaryKey {
-    pub fn new(constraint_name: &str, column_names: Vec<String>) -> Self {
+    pub fn new<N: Into<String>>(constraint_name: N, column_names: Vec<String>) -> Self {
         Self {
-            constraint_name: constraint_name.to_string(),
+            constraint_name: constraint_name.into(),
             column_names,
         }
     }
@@ -172,13 +173,13 @@ impl SchemaBuilder {
                 self
             }
             _ => {
-                panic!("data type msut be row type")
+                panic!("data type must be row type")
             }
         }
     }
 
-    pub fn column(mut self, name: &str, data_type: DataType) -> Self {
-        self.columns.push(Column::new(name, data_type));
+    pub fn column<N: Into<String>>(mut self, name: N, data_type: DataType) -> Self {
+        self.columns.push(Column::new(name.into(), data_type));
         self
     }
 
@@ -187,20 +188,34 @@ impl SchemaBuilder {
         self
     }
 
-    pub fn with_comment(mut self, comment: &str) -> Self {
+    pub fn with_comment<C: Into<String>>(mut self, comment: C) -> Self {
         if let Some(last) = self.columns.last_mut() {
-            *last = last.clone().with_comment(comment);
+            *last = last.clone().with_comment(comment.into());
         }
         self
     }
 
-    pub fn primary_key(self, column_names: Vec<String>) -> Self {
-        let constraint_name = format!("PK_{}", column_names.join("_"));
-        self.primary_key_named(&constraint_name, column_names)
+    pub fn primary_key<I, S>(self, column_names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let names: Vec<String> = column_names.into_iter().map(|s| s.into()).collect();
+
+        let constraint_name = format!("PK_{}", names.join("_"));
+
+        self.primary_key_named(&constraint_name, names)
     }
 
-    pub fn primary_key_named(mut self, constraint_name: &str, column_names: Vec<String>) -> Self {
-        self.primary_key = Some(PrimaryKey::new(constraint_name, column_names));
+    pub fn primary_key_named<N: Into<String>, P: Into<String>>(
+        mut self,
+        constraint_name: N,
+        column_names: Vec<P>,
+    ) -> Self {
+        self.primary_key = Some(PrimaryKey::new(
+            constraint_name.into(),
+            column_names.into_iter().map(|s| s.into()).collect(),
+        ));
         self
     }
 
@@ -208,19 +223,19 @@ impl SchemaBuilder {
     /// whenever a new row is inserted into the table, the new row will be assigned with the next
     /// available value from the auto-increment sequence. A table can have at most one auto
     /// increment column.
-    pub fn enable_auto_increment(mut self, column_name: &str) -> Result<Self> {
+    pub fn enable_auto_increment<N: Into<String>>(mut self, column_name: N) -> Result<Self> {
         if !self.auto_increment_col_names.is_empty() {
             return Err(IllegalArgument {
                 message: "Multiple auto increment columns are not supported yet.".to_string(),
             });
         }
 
-        self.auto_increment_col_names.push(column_name.to_string());
+        self.auto_increment_col_names.push(column_name.into());
         Ok(self)
     }
 
-    pub fn build(&mut self) -> Result<Schema> {
-        let columns = Self::normalize_columns(&mut self.columns, self.primary_key.as_ref())?;
+    pub fn build(&self) -> Result<Schema> {
+        let columns = Self::normalize_columns(&self.columns, self.primary_key.as_ref())?;
 
         let column_names: HashSet<_> = columns.iter().map(|c| &c.name).collect();
         for auto_inc_col in &self.auto_increment_col_names {
@@ -251,14 +266,14 @@ impl SchemaBuilder {
     }
 
     fn normalize_columns(
-        columns: &mut [Column],
+        columns: &[Column],
         primary_key: Option<&PrimaryKey>,
     ) -> Result<Vec<Column>> {
         let names: Vec<_> = columns.iter().map(|c| &c.name).collect();
         if let Some(duplicates) = Self::find_duplicates(&names) {
-            return Err(InvalidTableError {
-                message: format!("Duplicate column names found: {duplicates:?}"),
-            });
+            return Err(Error::invalid_table(format!(
+                "Duplicate column names found: {duplicates:?}"
+            )));
         }
 
         let Some(pk) = primary_key else {
@@ -268,9 +283,9 @@ impl SchemaBuilder {
         let pk_set: HashSet<_> = pk.column_names.iter().collect();
         let all_columns: HashSet<_> = columns.iter().map(|c| &c.name).collect();
         if !pk_set.is_subset(&all_columns) {
-            return Err(InvalidTableError {
-                message: format!("Primary key columns {pk_set:?} not found in schema"),
-            });
+            return Err(Error::invalid_table(format!(
+                "Primary key columns {pk_set:?} not found in schema"
+            )));
         }
 
         Ok(columns
@@ -325,7 +340,7 @@ pub struct TableDescriptorBuilder {
     schema: Option<Schema>,
     properties: HashMap<String, String>,
     custom_properties: HashMap<String, String>,
-    partition_keys: Vec<String>,
+    partition_keys: Arc<[String]>,
     comment: Option<String>,
     table_distribution: Option<TableDistribution>,
 }
@@ -352,29 +367,43 @@ impl TableDescriptorBuilder {
         self
     }
 
-    pub fn property<T: ToString>(mut self, key: &str, value: T) -> Self {
-        self.properties.insert(key.to_string(), value.to_string());
+    pub fn property<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
+        self.properties.insert(key.into(), value.into());
         self
     }
 
-    pub fn properties(mut self, properties: HashMap<String, String>) -> Self {
-        self.properties.extend(properties);
+    pub fn properties<K: Into<String>, V: Into<String>>(
+        mut self,
+        properties: HashMap<K, V>,
+    ) -> Self {
+        for (k, v) in properties {
+            self.properties.insert(k.into(), v.into());
+        }
         self
     }
 
-    pub fn custom_property(mut self, key: &str, value: &str) -> Self {
-        self.custom_properties
-            .insert(key.to_string(), value.to_string());
+    pub fn custom_property<K: Into<String>, V: Into<String>>(mut self, key: K, value: V) -> Self {
+        self.custom_properties.insert(key.into(), value.into());
         self
     }
 
-    pub fn custom_properties(mut self, custom_properties: HashMap<String, String>) -> Self {
-        self.custom_properties.extend(custom_properties);
+    pub fn custom_properties<K: Into<String>, V: Into<String>>(
+        mut self,
+        custom_properties: HashMap<K, V>,
+    ) -> Self {
+        for (k, v) in custom_properties {
+            self.custom_properties.insert(k.into(), v.into());
+        }
         self
     }
 
-    pub fn partitioned_by(mut self, partition_keys: Vec<String>) -> Self {
-        self.partition_keys = partition_keys;
+    pub fn partitioned_by<P: Into<String>>(mut self, partition_keys: Vec<P>) -> Self {
+        self.partition_keys = Arc::from(
+            partition_keys
+                .into_iter()
+                .map(|s| s.into())
+                .collect::<Vec<String>>(),
+        );
         self
     }
 
@@ -386,8 +415,8 @@ impl TableDescriptorBuilder {
         self
     }
 
-    pub fn comment(mut self, comment: &str) -> Self {
-        self.comment = Some(comment.to_string());
+    pub fn comment<S: Into<String>>(mut self, comment: S) -> Self {
+        self.comment = Some(comment.into());
         self
     }
 
@@ -413,7 +442,7 @@ impl TableDescriptorBuilder {
 pub struct TableDescriptor {
     schema: Schema,
     comment: Option<String>,
-    partition_keys: Vec<String>,
+    partition_keys: Arc<[String]>,
     table_distribution: Option<TableDistribution>,
     properties: HashMap<String, String>,
     custom_properties: HashMap<String, String>,
@@ -477,18 +506,21 @@ impl TableDescriptor {
     pub fn replication_factor(&self) -> Result<i32> {
         self.properties
             .get("table.replication.factor")
-            .ok_or_else(|| InvalidTableError {
-                message: "Replication factor is not set".to_string(),
-            })?
+            .ok_or_else(|| Error::invalid_table("Replication factor is not set"))?
             .parse()
-            .map_err(|_e| InvalidTableError {
-                message: "Replication factor can't be convert into int".to_string(),
-            })
+            .map_err(|_e| Error::invalid_table("Replication factor can't be converted to int"))
     }
 
-    pub fn with_properties(&self, new_properties: HashMap<String, String>) -> Self {
+    pub fn with_properties<K: Into<String>, V: Into<String>>(
+        &self,
+        new_properties: HashMap<K, V>,
+    ) -> Self {
+        let mut properties = HashMap::new();
+        for (k, v) in new_properties {
+            properties.insert(k.into(), v.into());
+        }
         Self {
-            properties: new_properties,
+            properties,
             ..self.clone()
         }
     }
@@ -533,13 +565,11 @@ impl TableDescriptor {
         bucket_keys.retain(|k| !partition_keys.contains(k));
 
         if bucket_keys.is_empty() {
-            return Err(InvalidTableError {
-                message: format!(
-                    "Primary Key constraint {:?} should not be same with partition fields {:?}.",
-                    schema.primary_key().unwrap().column_names(),
-                    partition_keys
-                ),
-            });
+            return Err(Error::invalid_table(format!(
+                "Primary Key constraint {:?} should not be same with partition fields {:?}.",
+                schema.primary_key().unwrap().column_names(),
+                partition_keys
+            )));
         }
 
         Ok(bucket_keys)
@@ -556,12 +586,10 @@ impl TableDescriptor {
                 .iter()
                 .any(|k| partition_keys.contains(k))
             {
-                return Err(InvalidTableError {
-                    message: format!(
-                        "Bucket key {:?} shouldn't include any column in partition keys {:?}.",
-                        distribution.bucket_keys, partition_keys
-                    ),
-                });
+                return Err(Error::invalid_table(format!(
+                    "Bucket key {:?} shouldn't include any column in partition keys {:?}.",
+                    distribution.bucket_keys, partition_keys
+                )));
             }
 
             return if let Some(pk) = schema.primary_key() {
@@ -580,15 +608,13 @@ impl TableDescriptor {
                         .iter()
                         .all(|k| pk_columns.contains(k))
                     {
-                        return Err(InvalidTableError {
-                            message: format!(
-                                "Bucket keys must be a subset of primary keys excluding partition keys for primary-key tables. \
-                                The primary keys are {:?}, the partition keys are {:?}, but the user-defined bucket keys are {:?}.",
-                                pk.column_names(),
-                                partition_keys,
-                                distribution.bucket_keys
-                            ),
-                        });
+                        return Err(Error::invalid_table(format!(
+                            "Bucket keys must be a subset of primary keys excluding partition keys for primary-key tables. \
+                            The primary keys are {:?}, the partition keys are {:?}, but the user-defined bucket keys are {:?}.",
+                            pk.column_names(),
+                            partition_keys,
+                            distribution.bucket_keys
+                        )));
                     }
                     Ok(Some(distribution))
                 }
@@ -631,9 +657,7 @@ impl LogFormat {
         match s.to_uppercase().as_str() {
             "ARROW" => Ok(LogFormat::ARROW),
             "INDEXED" => Ok(LogFormat::INDEXED),
-            _ => Err(InvalidTableError {
-                message: format!("Unknown log format: {s}"),
-            }),
+            _ => Err(Error::invalid_table(format!("Unknown log format: {s}"))),
         }
     }
 }
@@ -659,9 +683,7 @@ impl KvFormat {
         match s.to_uppercase().as_str() {
             "INDEXED" => Ok(KvFormat::INDEXED),
             "COMPACTED" => Ok(KvFormat::COMPACTED),
-            _ => Err(InvalidTableError {
-                message: format!("Unknown kv format: {s}"),
-            }),
+            _ => Err(Error::invalid_table(format!("Unknown kv format: {s}"))),
         }
     }
 }
@@ -683,10 +705,10 @@ const MAX_NAME_LENGTH: usize = 200;
 const INTERNAL_NAME_PREFIX: &str = "__";
 
 impl TablePath {
-    pub fn new(db: String, tbl: String) -> Self {
+    pub fn new<D: Into<String>, T: Into<String>>(db: D, tbl: T) -> Self {
         TablePath {
-            database: db,
-            table: tbl,
+            database: db.into(),
+            table: tbl.into(),
         }
     }
 
@@ -712,14 +734,12 @@ impl TablePath {
         }
         if identifier.len() > MAX_NAME_LENGTH {
             return Some(format!(
-                "the length of '{}' is longer than the max allowed length {}",
-                identifier, MAX_NAME_LENGTH
+                "the length of '{identifier}' is longer than the max allowed length {MAX_NAME_LENGTH}"
             ));
         }
         if Self::contains_invalid_pattern(identifier) {
             return Some(format!(
-                "'{}' contains one or more characters other than ASCII alphanumerics, '_' and '-'",
-                identifier
+                "'{identifier}' contains one or more characters other than ASCII alphanumerics, '_' and '-'"
             ));
         }
         None
@@ -728,8 +748,7 @@ impl TablePath {
     pub fn validate_prefix(identifier: &str) -> Option<String> {
         if identifier.starts_with(INTERNAL_NAME_PREFIX) {
             return Some(format!(
-                "'{}' is not allowed as prefix, since it is reserved for internal databases/internal tables/internal partitions in Fluss server",
-                INTERNAL_NAME_PREFIX
+                "'{INTERNAL_NAME_PREFIX}' is not allowed as prefix, since it is reserved for internal databases/internal tables/internal partitions in Fluss server"
             ));
         }
         None
@@ -752,33 +771,33 @@ impl TablePath {
 /// `partition_name` will be `Some(...)`; otherwise, it will be `None`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PhysicalTablePath {
-    table_path: TablePath,
+    table_path: Arc<TablePath>,
     partition_name: Option<String>,
 }
 
 impl PhysicalTablePath {
-    pub fn of(table_path: TablePath) -> Self {
+    pub fn of(table_path: Arc<TablePath>) -> Self {
         Self {
             table_path,
             partition_name: None,
         }
     }
 
-    pub fn of_partitioned(table_path: TablePath, partition_name: Option<String>) -> Self {
+    pub fn of_partitioned(table_path: Arc<TablePath>, partition_name: Option<String>) -> Self {
         Self {
             table_path,
             partition_name,
         }
     }
 
-    pub fn of_with_names(
-        database_name: String,
-        table_name: String,
-        partition_name: Option<String>,
+    pub fn of_with_names<D: Into<String>, T: Into<String>, P: Into<String>>(
+        database_name: D,
+        table_name: T,
+        partition_name: Option<P>,
     ) -> Self {
         Self {
-            table_path: TablePath::new(database_name, table_name),
-            partition_name,
+            table_path: Arc::new(TablePath::new(database_name, table_name)),
+            partition_name: partition_name.map(|p| p.into()),
         }
     }
 
@@ -818,7 +837,7 @@ pub struct TableInfo {
     pub primary_keys: Vec<String>,
     pub physical_primary_keys: Vec<String>,
     pub bucket_keys: Vec<String>,
-    pub partition_keys: Vec<String>,
+    pub partition_keys: Arc<[String]>,
     pub num_buckets: i32,
     pub properties: HashMap<String, String>,
     pub table_config: TableConfig,
@@ -831,6 +850,75 @@ pub struct TableInfo {
 impl TableInfo {
     pub fn row_type(&self) -> &RowType {
         &self.row_type
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoPartitionStrategy {
+    auto_partition_enabled: bool,
+    auto_partition_key: Option<String>,
+    auto_partition_time_unit: String,
+    auto_partition_num_precreate: i32,
+    auto_partition_num_retention: i32,
+    auto_partition_timezone: String,
+}
+
+impl AutoPartitionStrategy {
+    pub fn from(properties: &HashMap<String, String>) -> Self {
+        Self {
+            auto_partition_enabled: properties
+                .get("table.auto-partition.enabled")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(false),
+            auto_partition_key: properties
+                .get("table.auto-partition.key")
+                .map(|s| s.to_string()),
+            auto_partition_time_unit: properties
+                .get("table.auto-partition.time-unit")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "DAY".to_string()),
+            auto_partition_num_precreate: properties
+                .get("table.auto-partition.num-precreate")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            auto_partition_num_retention: properties
+                .get("table.auto-partition.num-retention")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(7),
+            auto_partition_timezone: properties
+                .get("table.auto-partition.time-zone")
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    jiff::tz::TimeZone::system()
+                        .iana_name()
+                        .unwrap_or("UTC")
+                        .to_string()
+                }),
+        }
+    }
+
+    pub fn is_auto_partition_enabled(&self) -> bool {
+        self.auto_partition_enabled
+    }
+
+    pub fn key(&self) -> Option<&str> {
+        self.auto_partition_key.as_deref()
+    }
+
+    pub fn time_unit(&self) -> &str {
+        &self.auto_partition_time_unit
+    }
+
+    pub fn num_precreate(&self) -> i32 {
+        self.auto_partition_num_precreate
+    }
+
+    pub fn num_retention(&self) -> i32 {
+        self.auto_partition_num_retention
+    }
+
+    pub fn timezone(&self) -> &str {
+        &self.auto_partition_timezone
     }
 }
 
@@ -865,6 +953,21 @@ impl TableConfig {
             .map(String::as_str)
             .unwrap_or(DEFAULT_KV_FORMAT);
         kv_format.parse().map_err(Into::into)
+    }
+
+    pub fn get_log_format(&self) -> Result<LogFormat> {
+        // TODO: Consolidate configurations logic, constants, defaults in a single place
+        const DEFAULT_LOG_FORMAT: &str = "ARROW";
+        let log_format = self
+            .properties
+            .get("table.log.format")
+            .map(String::as_str)
+            .unwrap_or(DEFAULT_LOG_FORMAT);
+        LogFormat::parse(log_format)
+    }
+
+    pub fn get_auto_partition_strategy(&self) -> AutoPartitionStrategy {
+        AutoPartitionStrategy::from(&self.properties)
     }
 }
 
@@ -912,7 +1015,7 @@ impl TableInfo {
         schema_id: i32,
         schema: Schema,
         bucket_keys: Vec<String>,
-        partition_keys: Vec<String>,
+        partition_keys: Arc<[String]>,
         num_buckets: i32,
         properties: HashMap<String, String>,
         custom_properties: HashMap<String, String>,
@@ -1003,10 +1106,14 @@ impl TableInfo {
     }
 
     pub fn is_auto_partitioned(&self) -> bool {
-        self.is_partitioned() && todo!()
+        self.is_partitioned()
+            && self
+                .table_config
+                .get_auto_partition_strategy()
+                .is_auto_partition_enabled()
     }
 
-    pub fn get_partition_keys(&self) -> &[String] {
+    pub fn get_partition_keys(&self) -> &Arc<[String]> {
         &self.partition_keys
     }
 
@@ -1041,13 +1148,13 @@ impl TableInfo {
     pub fn to_table_descriptor(&self) -> Result<TableDescriptor> {
         let mut builder = TableDescriptor::builder()
             .schema(self.schema.clone())
-            .partitioned_by(self.partition_keys.clone())
+            .partitioned_by(self.partition_keys.to_vec())
             .distributed_by(Some(self.num_buckets), self.bucket_keys.clone())
             .properties(self.properties.clone())
             .custom_properties(self.custom_properties.clone());
 
         if let Some(comment) = &self.comment {
-            builder = builder.comment(&comment.clone());
+            builder = builder.comment(comment.clone());
         }
 
         builder.build()
@@ -1096,9 +1203,21 @@ pub struct TableBucket {
 
 impl TableBucket {
     pub fn new(table_id: TableId, bucket: BucketId) -> Self {
-        TableBucket {
+        Self {
             table_id,
             partition_id: None,
+            bucket,
+        }
+    }
+
+    pub fn new_with_partition(
+        table_id: TableId,
+        partition_id: Option<PartitionId>,
+        bucket: BucketId,
+    ) -> Self {
+        TableBucket {
+            table_id,
+            partition_id,
             bucket,
         }
     }
@@ -1161,6 +1280,7 @@ impl LakeSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::DataTypes;
 
     #[test]
     fn test_validate() {
@@ -1195,8 +1315,7 @@ mod tests {
         assert_invalid_name(
             &invalid_long_name,
             &format!(
-                "the length of '{}' is longer than the max allowed length {}",
-                invalid_long_name, MAX_NAME_LENGTH
+                "the length of '{invalid_long_name}' is longer than the max allowed length {MAX_NAME_LENGTH}"
             ),
         );
     }
@@ -1205,8 +1324,7 @@ mod tests {
         let result = TablePath::detect_invalid_name(name);
         assert!(
             result.is_some(),
-            "Expected '{}' to be invalid, but it was valid",
-            name
+            "Expected '{name}' to be invalid, but it was valid"
         );
         assert!(
             result.as_ref().unwrap().contains(expected_message),
@@ -1214,5 +1332,98 @@ mod tests {
             expected_message,
             result.unwrap()
         );
+    }
+
+    #[test]
+    fn test_is_auto_partitioned() {
+        let schema = Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .unwrap();
+
+        let table_path = TablePath::new("db".to_string(), "tbl".to_string());
+
+        // 1. Not partitioned, auto partition disabled
+        let mut properties = HashMap::new();
+        let table_info = TableInfo::new(
+            table_path.clone(),
+            1,
+            1,
+            schema.clone(),
+            vec!["id".to_string()],
+            Arc::from(vec![]), // No partition keys
+            1,
+            properties.clone(),
+            HashMap::new(),
+            None,
+            0,
+            0,
+        );
+        assert!(!table_info.is_auto_partitioned());
+
+        // 2. Not partitioned, auto partition enabled
+        properties.insert(
+            "table.auto-partition.enabled".to_string(),
+            "true".to_string(),
+        );
+        let table_info = TableInfo::new(
+            table_path.clone(),
+            1,
+            1,
+            schema.clone(),
+            vec!["id".to_string()],
+            Arc::from(vec![]), // No partition keys
+            1,
+            properties.clone(),
+            HashMap::new(),
+            None,
+            0,
+            0,
+        );
+        assert!(!table_info.is_auto_partitioned());
+
+        // 3. Partitioned, auto partition disabled
+        properties.insert(
+            "table.auto-partition.enabled".to_string(),
+            "false".to_string(),
+        );
+        let table_info = TableInfo::new(
+            table_path.clone(),
+            1,
+            1,
+            schema.clone(),
+            vec!["id".to_string()],
+            Arc::from(vec!["name".to_string()]), // Partition keys
+            1,
+            properties.clone(),
+            HashMap::new(),
+            None,
+            0,
+            0,
+        );
+        assert!(!table_info.is_auto_partitioned());
+
+        // 4. Partitioned, auto partition enabled
+        properties.insert(
+            "table.auto-partition.enabled".to_string(),
+            "true".to_string(),
+        );
+        let table_info = TableInfo::new(
+            table_path.clone(),
+            1,
+            1,
+            schema.clone(),
+            vec!["id".to_string()],
+            Arc::from(vec!["name".to_string()]), // Partition keys
+            1,
+            properties.clone(),
+            HashMap::new(),
+            None,
+            0,
+            0,
+        );
+        assert!(table_info.is_auto_partitioned());
     }
 }

@@ -19,6 +19,57 @@ use crate::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
 
+/// Represents the type of change for a record in a log
+#[pyclass(eq, eq_int)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChangeType {
+    /// Append-only operation
+    AppendOnly = 0,
+    /// Insert operation
+    Insert = 1,
+    /// Update operation containing the previous content of the updated row
+    UpdateBefore = 2,
+    /// Update operation containing the new content of the updated row
+    UpdateAfter = 3,
+    /// Delete operation
+    Delete = 4,
+}
+
+#[pymethods]
+impl ChangeType {
+    /// Returns a short string representation of this ChangeType
+    pub fn short_string(&self) -> &'static str {
+        match self {
+            ChangeType::AppendOnly => "+A",
+            ChangeType::Insert => "+I",
+            ChangeType::UpdateBefore => "-U",
+            ChangeType::UpdateAfter => "+U",
+            ChangeType::Delete => "-D",
+        }
+    }
+
+    fn __str__(&self) -> &'static str {
+        self.short_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ChangeType.{self:?}")
+    }
+}
+
+impl ChangeType {
+    /// Convert from core ChangeType
+    pub fn from_core(change_type: fcore::record::ChangeType) -> Self {
+        match change_type {
+            fcore::record::ChangeType::AppendOnly => ChangeType::AppendOnly,
+            fcore::record::ChangeType::Insert => ChangeType::Insert,
+            fcore::record::ChangeType::UpdateBefore => ChangeType::UpdateBefore,
+            fcore::record::ChangeType::UpdateAfter => ChangeType::UpdateAfter,
+            fcore::record::ChangeType::Delete => ChangeType::Delete,
+        }
+    }
+}
+
 /// Represents a table path with database and table name
 #[pyclass]
 #[derive(Clone)]
@@ -169,7 +220,13 @@ impl Schema {
             .collect()
     }
 
-    // TODO: support primaryKey
+    /// Get primary key column names, returns empty list if no primary key is defined
+    fn get_primary_keys(&self) -> Vec<String> {
+        self.__schema
+            .primary_key()
+            .map(|pk| pk.column_names().to_vec())
+            .unwrap_or_default()
+    }
 
     fn __str__(&self) -> String {
         format!("Schema: columns={:?}", self.get_columns())
@@ -218,11 +275,11 @@ impl TableDescriptor {
         schema: &Schema, // fluss schema
         kwargs: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
-        let mut partition_keys = Vec::new();
+        let mut partition_keys: Vec<String> = Vec::new();
         let mut bucket_count = None;
         let mut bucket_keys = Vec::new();
-        let mut properties = std::collections::HashMap::new();
-        let mut custom_properties = std::collections::HashMap::new();
+        let mut properties: HashMap<String, String> = HashMap::new();
+        let mut custom_properties: HashMap<String, String> = HashMap::new();
         let mut comment: Option<String> = None;
         let mut log_format = None;
         let mut kv_format = None;
@@ -530,7 +587,11 @@ impl TableBucket {
 
     /// Convert to core TableBucket (internal use)
     pub fn to_core(&self) -> fcore::metadata::TableBucket {
-        fcore::metadata::TableBucket::new(self.table_id, self.bucket)
+        fcore::metadata::TableBucket::new_with_partition(
+            self.table_id,
+            self.partition_id,
+            self.bucket,
+        )
     }
 }
 
@@ -600,5 +661,107 @@ impl LakeSnapshot {
             snapshot_id: snapshot.snapshot_id,
             table_buckets_offset: snapshot.table_buckets_offset,
         }
+    }
+}
+
+/// Descriptor for a Fluss database (comment and custom properties)
+#[pyclass]
+#[derive(Clone)]
+pub struct DatabaseDescriptor {
+    __descriptor: fcore::metadata::DatabaseDescriptor,
+}
+
+#[pymethods]
+impl DatabaseDescriptor {
+    /// Create a new DatabaseDescriptor
+    #[new]
+    #[pyo3(signature = (comment=None, custom_properties=None))]
+    pub fn new(
+        comment: Option<String>,
+        custom_properties: Option<HashMap<String, String>>,
+    ) -> PyResult<Self> {
+        let mut builder = fcore::metadata::DatabaseDescriptor::builder();
+        if let Some(c) = comment {
+            builder = builder.comment(&c);
+        }
+        if let Some(props) = custom_properties {
+            builder = builder.custom_properties(props);
+        }
+        let __descriptor = builder.build();
+        Ok(Self { __descriptor })
+    }
+
+    /// Get comment if set
+    #[getter]
+    pub fn comment(&self) -> Option<String> {
+        self.__descriptor.comment().map(|s| s.to_string())
+    }
+
+    /// Get custom properties
+    pub fn get_custom_properties(&self) -> HashMap<String, String> {
+        self.__descriptor.custom_properties().clone()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DatabaseDescriptor(comment={:?}, custom_properties={:?})",
+            self.comment(),
+            self.get_custom_properties()
+        )
+    }
+}
+
+impl DatabaseDescriptor {
+    pub fn to_core(&self) -> &fcore::metadata::DatabaseDescriptor {
+        &self.__descriptor
+    }
+}
+
+/// Information about a Fluss database
+#[pyclass]
+pub struct DatabaseInfo {
+    __info: fcore::metadata::DatabaseInfo,
+}
+
+#[pymethods]
+impl DatabaseInfo {
+    /// Get the database name
+    #[getter]
+    pub fn database_name(&self) -> String {
+        self.__info.database_name().to_string()
+    }
+
+    /// Get the database descriptor
+    pub fn get_database_descriptor(&self) -> DatabaseDescriptor {
+        DatabaseDescriptor {
+            __descriptor: self.__info.database_descriptor().clone(),
+        }
+    }
+
+    /// Get created time
+    #[getter]
+    pub fn created_time(&self) -> i64 {
+        self.__info.created_time()
+    }
+
+    /// Get modified time
+    #[getter]
+    pub fn modified_time(&self) -> i64 {
+        self.__info.modified_time()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "DatabaseInfo(database_name='{}', created_time={}, modified_time={})",
+            self.database_name(),
+            self.created_time(),
+            self.modified_time()
+        )
+    }
+}
+
+impl DatabaseInfo {
+    pub fn from_core(info: fcore::metadata::DatabaseInfo) -> Self {
+        Self { __info: info }
     }
 }

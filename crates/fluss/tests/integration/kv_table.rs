@@ -16,41 +16,11 @@
  * limitations under the License.
  */
 
-use parking_lot::RwLock;
-use std::sync::Arc;
-use std::sync::LazyLock;
-
-use crate::integration::fluss_cluster::FlussTestingCluster;
 #[cfg(test)]
-use test_env_helpers::*;
-
-// Module-level shared cluster instance (only for this test file)
-static SHARED_FLUSS_CLUSTER: LazyLock<Arc<RwLock<Option<FlussTestingCluster>>>> =
-    LazyLock::new(|| Arc::new(RwLock::new(None)));
-
-#[cfg(test)]
-#[before_all]
-#[after_all]
 mod kv_table_test {
-    use super::SHARED_FLUSS_CLUSTER;
-    use crate::integration::fluss_cluster::FlussTestingCluster;
-    use crate::integration::utils::{create_table, get_cluster, start_cluster, stop_cluster};
-    use fluss::client::UpsertWriter;
+    use crate::integration::utils::{create_partitions, create_table, get_shared_cluster};
     use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
     use fluss::row::{GenericRow, InternalRow};
-    use std::sync::Arc;
-
-    fn before_all() {
-        start_cluster("test_kv_table", SHARED_FLUSS_CLUSTER.clone());
-    }
-
-    fn get_fluss_cluster() -> Arc<FlussTestingCluster> {
-        get_cluster(&SHARED_FLUSS_CLUSTER)
-    }
-
-    fn after_all() {
-        stop_cluster(SHARED_FLUSS_CLUSTER.clone());
-    }
 
     fn make_key(id: i32) -> GenericRow<'static> {
         let mut row = GenericRow::new(3);
@@ -60,12 +30,12 @@ mod kv_table_test {
 
     #[tokio::test]
     async fn upsert_delete_and_lookup() {
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
 
-        let admin = connection.get_admin().await.expect("Failed to get admin");
+        let admin = connection.get_admin().unwrap();
 
-        let table_path = TablePath::new("fluss".to_string(), "test_upsert_and_lookup".to_string());
+        let table_path = TablePath::new("fluss", "test_upsert_and_lookup");
 
         let table_descriptor = TableDescriptor::builder()
             .schema(
@@ -73,7 +43,7 @@ mod kv_table_test {
                     .column("id", DataTypes::int())
                     .column("name", DataTypes::string())
                     .column("age", DataTypes::bigint())
-                    .primary_key(vec!["id".to_string()])
+                    .primary_key(vec!["id"])
                     .build()
                     .expect("Failed to build schema"),
             )
@@ -82,29 +52,24 @@ mod kv_table_test {
 
         create_table(&admin, &table_path, &table_descriptor).await;
 
-        let table = connection
-            .get_table(&table_path)
-            .await
-            .expect("Failed to get table");
+        let table = connection.get_table(&table_path).await.unwrap();
 
         let table_upsert = table.new_upsert().expect("Failed to create upsert");
-        let mut upsert_writer = table_upsert
+        let upsert_writer = table_upsert
             .create_writer()
             .expect("Failed to create writer");
 
         let test_data = [(1, "Verso", 32i64), (2, "Noco", 25), (3, "Esquie", 35)];
 
-        // Upsert rows
+        // Upsert rows (fire-and-forget, then flush)
         for (id, name, age) in &test_data {
             let mut row = GenericRow::new(3);
             row.set_field(0, *id);
             row.set_field(1, *name);
             row.set_field(2, *age);
-            upsert_writer
-                .upsert(&row)
-                .await
-                .expect("Failed to upsert row");
+            upsert_writer.upsert(&row).expect("Failed to upsert row");
         }
+        upsert_writer.flush().await.expect("Failed to flush");
 
         // Lookup records
         let mut lookuper = table
@@ -119,53 +84,49 @@ mod kv_table_test {
                 .lookup(&make_key(*id))
                 .await
                 .expect("Failed to lookup");
-            let row = result
-                .get_single_row()
-                .expect("Failed to get row")
-                .expect("Row should exist");
+            let row = result.get_single_row().unwrap().expect("Row should exist");
 
-            assert_eq!(row.get_int(0), *id, "id mismatch");
-            assert_eq!(row.get_string(1), *expected_name, "name mismatch");
-            assert_eq!(row.get_long(2), *expected_age, "age mismatch");
+            assert_eq!(row.get_int(0).unwrap(), *id, "id mismatch");
+            assert_eq!(row.get_string(1).unwrap(), *expected_name, "name mismatch");
+            assert_eq!(row.get_long(2).unwrap(), *expected_age, "age mismatch");
         }
 
-        // Update the record with new age
+        // Update the record with new age (await acknowledgment)
         let mut updated_row = GenericRow::new(3);
         updated_row.set_field(0, 1);
         updated_row.set_field(1, "Verso");
         updated_row.set_field(2, 33i64);
         upsert_writer
             .upsert(&updated_row)
+            .expect("Failed to upsert updated row")
             .await
-            .expect("Failed to upsert updated row");
+            .expect("Failed to wait for upsert acknowledgment");
 
         // Verify the update
         let result = lookuper
             .lookup(&make_key(1))
             .await
             .expect("Failed to lookup after update");
-        let found_row = result
-            .get_single_row()
-            .expect("Failed to get row")
-            .expect("Row should exist");
+        let found_row = result.get_single_row().unwrap().expect("Row should exist");
         assert_eq!(
-            found_row.get_long(2),
-            updated_row.get_long(2),
+            found_row.get_long(2).unwrap(),
+            updated_row.get_long(2).unwrap(),
             "Age should be updated"
         );
         assert_eq!(
-            found_row.get_string(1),
-            updated_row.get_string(1),
+            found_row.get_string(1).unwrap(),
+            updated_row.get_string(1).unwrap(),
             "Name should remain unchanged"
         );
 
-        // Delete record with id=1
+        // Delete record with id=1 (await acknowledgment)
         let mut delete_row = GenericRow::new(3);
         delete_row.set_field(0, 1);
         upsert_writer
             .delete(&delete_row)
+            .expect("Failed to delete")
             .await
-            .expect("Failed to delete");
+            .expect("Failed to wait for delete acknowledgment");
 
         // Verify deletion
         let result = lookuper
@@ -173,10 +134,7 @@ mod kv_table_test {
             .await
             .expect("Failed to lookup deleted record");
         assert!(
-            result
-                .get_single_row()
-                .expect("Failed to get row")
-                .is_none(),
+            result.get_single_row().unwrap().is_none(),
             "Record 1 should not exist after delete"
         );
 
@@ -187,10 +145,7 @@ mod kv_table_test {
                 .await
                 .expect("Failed to lookup");
             assert!(
-                result
-                    .get_single_row()
-                    .expect("Failed to get row")
-                    .is_some(),
+                result.get_single_row().unwrap().is_some(),
                 "Record {} should still exist after deleting record 1",
                 i
             );
@@ -202,10 +157,7 @@ mod kv_table_test {
             .await
             .expect("Failed to lookup non-existent key");
         assert!(
-            result
-                .get_single_row()
-                .expect("Failed to get row")
-                .is_none(),
+            result.get_single_row().unwrap().is_none(),
             "Non-existent key should return None"
         );
 
@@ -217,12 +169,12 @@ mod kv_table_test {
 
     #[tokio::test]
     async fn composite_primary_keys() {
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
 
-        let admin = connection.get_admin().await.expect("Failed to get admin");
+        let admin = connection.get_admin().unwrap();
 
-        let table_path = TablePath::new("fluss".to_string(), "test_composite_pk".to_string());
+        let table_path = TablePath::new("fluss", "test_composite_pk");
 
         let table_descriptor = TableDescriptor::builder()
             .schema(
@@ -230,7 +182,7 @@ mod kv_table_test {
                     .column("region", DataTypes::string())
                     .column("user_id", DataTypes::int())
                     .column("score", DataTypes::bigint())
-                    .primary_key(vec!["region".to_string(), "user_id".to_string()])
+                    .primary_key(vec!["region", "user_id"])
                     .build()
                     .expect("Failed to build schema"),
             )
@@ -239,13 +191,10 @@ mod kv_table_test {
 
         create_table(&admin, &table_path, &table_descriptor).await;
 
-        let table = connection
-            .get_table(&table_path)
-            .await
-            .expect("Failed to get table");
+        let table = connection.get_table(&table_path).await.unwrap();
 
         let table_upsert = table.new_upsert().expect("Failed to create upsert");
-        let mut upsert_writer = table_upsert
+        let upsert_writer = table_upsert
             .create_writer()
             .expect("Failed to create writer");
 
@@ -262,8 +211,9 @@ mod kv_table_test {
             row.set_field(0, *region);
             row.set_field(1, *user_id);
             row.set_field(2, *score);
-            upsert_writer.upsert(&row).await.expect("Failed to upsert");
+            upsert_writer.upsert(&row).expect("Failed to upsert");
         }
+        upsert_writer.flush().await.expect("Failed to flush");
 
         // Lookup with composite key
         let mut lookuper = table
@@ -277,45 +227,45 @@ mod kv_table_test {
         key.set_field(0, "US");
         key.set_field(1, 1);
         let result = lookuper.lookup(&key).await.expect("Failed to lookup");
-        let row = result
-            .get_single_row()
-            .expect("Failed to get row")
-            .expect("Row should exist");
-        assert_eq!(row.get_long(2), 100, "Score for (US, 1) should be 100");
+        let row = result.get_single_row().unwrap().expect("Row should exist");
+        assert_eq!(
+            row.get_long(2).unwrap(),
+            100,
+            "Score for (US, 1) should be 100"
+        );
 
         // Lookup (EU, 2) - should return score 250
         let mut key = GenericRow::new(3);
         key.set_field(0, "EU");
         key.set_field(1, 2);
         let result = lookuper.lookup(&key).await.expect("Failed to lookup");
-        let row = result
-            .get_single_row()
-            .expect("Failed to get row")
-            .expect("Row should exist");
-        assert_eq!(row.get_long(2), 250, "Score for (EU, 2) should be 250");
+        let row = result.get_single_row().unwrap().expect("Row should exist");
+        assert_eq!(
+            row.get_long(2).unwrap(),
+            250,
+            "Score for (EU, 2) should be 250"
+        );
 
-        // Update (US, 1) score
+        // Update (US, 1) score (await acknowledgment)
         let mut update_row = GenericRow::new(3);
         update_row.set_field(0, "US");
         update_row.set_field(1, 1);
         update_row.set_field(2, 500i64);
         upsert_writer
             .upsert(&update_row)
+            .expect("Failed to update")
             .await
-            .expect("Failed to update");
+            .expect("Failed to wait for update acknowledgment");
 
         // Verify update
         let mut key = GenericRow::new(3);
         key.set_field(0, "US");
         key.set_field(1, 1);
         let result = lookuper.lookup(&key).await.expect("Failed to lookup");
-        let row = result
-            .get_single_row()
-            .expect("Failed to get row")
-            .expect("Row should exist");
+        let row = result.get_single_row().unwrap().expect("Row should exist");
         assert_eq!(
-            row.get_long(2),
-            update_row.get_long(2),
+            row.get_long(2).unwrap(),
+            update_row.get_long(2).unwrap(),
             "Row score should be updated"
         );
 
@@ -329,12 +279,12 @@ mod kv_table_test {
     async fn partial_update() {
         use fluss::row::Datum;
 
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
 
-        let admin = connection.get_admin().await.expect("Failed to get admin");
+        let admin = connection.get_admin().expect("Failed to get admin");
 
-        let table_path = TablePath::new("fluss".to_string(), "test_partial_update".to_string());
+        let table_path = TablePath::new("fluss", "test_partial_update");
 
         let table_descriptor = TableDescriptor::builder()
             .schema(
@@ -343,7 +293,7 @@ mod kv_table_test {
                     .column("name", DataTypes::string())
                     .column("age", DataTypes::bigint())
                     .column("score", DataTypes::bigint())
-                    .primary_key(vec!["id".to_string()])
+                    .primary_key(vec!["id"])
                     .build()
                     .expect("Failed to build schema"),
             )
@@ -359,7 +309,7 @@ mod kv_table_test {
 
         // Insert initial record with all columns
         let table_upsert = table.new_upsert().expect("Failed to create upsert");
-        let mut upsert_writer = table_upsert
+        let upsert_writer = table_upsert
             .create_writer()
             .expect("Failed to create writer");
 
@@ -370,8 +320,9 @@ mod kv_table_test {
         row.set_field(3, 6942i64);
         upsert_writer
             .upsert(&row)
+            .expect("Failed to upsert initial row")
             .await
-            .expect("Failed to upsert initial row");
+            .expect("Failed to wait for upsert acknowledgment");
 
         // Verify initial record
         let mut lookuper = table
@@ -389,20 +340,20 @@ mod kv_table_test {
             .expect("Failed to get row")
             .expect("Row should exist");
 
-        assert_eq!(found_row.get_int(0), 1);
-        assert_eq!(found_row.get_string(1), "Verso");
-        assert_eq!(found_row.get_long(2), 32i64);
-        assert_eq!(found_row.get_long(3), 6942i64);
+        assert_eq!(found_row.get_int(0).unwrap(), 1);
+        assert_eq!(found_row.get_string(1).unwrap(), "Verso");
+        assert_eq!(found_row.get_long(2).unwrap(), 32i64);
+        assert_eq!(found_row.get_long(3).unwrap(), 6942i64);
 
         // Create partial update writer to update only score column
         let partial_upsert = table_upsert
             .partial_update_with_column_names(&["id", "score"])
             .expect("Failed to create TableUpsert with partial update");
-        let mut partial_writer = partial_upsert
+        let partial_writer = partial_upsert
             .create_writer()
             .expect("Failed to create UpsertWriter with partial write");
 
-        // Update only the score column
+        // Update only the score column (await acknowledgment)
         let mut partial_row = GenericRow::new(4);
         partial_row.set_field(0, 1);
         partial_row.set_field(1, Datum::Null); // not in partial update column
@@ -410,8 +361,9 @@ mod kv_table_test {
         partial_row.set_field(3, 420i64);
         partial_writer
             .upsert(&partial_row)
+            .expect("Failed to upsert")
             .await
-            .expect("Failed to upsert");
+            .expect("Failed to wait for upsert acknowledgment");
 
         // Verify partial update - name and age should remain unchanged
         let result = lookuper
@@ -423,14 +375,189 @@ mod kv_table_test {
             .expect("Failed to get row")
             .expect("Row should exist");
 
-        assert_eq!(found_row.get_int(0), 1, "id should remain 1");
+        assert_eq!(found_row.get_int(0).unwrap(), 1, "id should remain 1");
         assert_eq!(
-            found_row.get_string(1),
+            found_row.get_string(1).unwrap(),
             "Verso",
             "name should remain unchanged"
         );
-        assert_eq!(found_row.get_long(2), 32, "age should remain unchanged");
-        assert_eq!(found_row.get_long(3), 420, "score should be updated to 420");
+        assert_eq!(
+            found_row.get_long(2).unwrap(),
+            32,
+            "age should remain unchanged"
+        );
+        assert_eq!(
+            found_row.get_long(3).unwrap(),
+            420,
+            "score should be updated to 420"
+        );
+
+        admin
+            .drop_table(&table_path, false)
+            .await
+            .expect("Failed to drop table");
+    }
+
+    #[tokio::test]
+    async fn partitioned_table_upsert_and_lookup() {
+        let cluster = get_shared_cluster();
+        let connection = cluster.get_fluss_connection().await;
+
+        let admin = connection.get_admin().expect("Failed to get admin");
+
+        let table_path = TablePath::new("fluss", "test_partitioned_kv_table");
+
+        // Create a partitioned KV table with region as partition key
+        let table_descriptor = TableDescriptor::builder()
+            .schema(
+                Schema::builder()
+                    .column("region", DataTypes::string())
+                    .column("user_id", DataTypes::int())
+                    .column("name", DataTypes::string())
+                    .column("score", DataTypes::bigint())
+                    .primary_key(vec!["region", "user_id"])
+                    .build()
+                    .expect("Failed to build schema"),
+            )
+            .partitioned_by(vec!["region"])
+            .build()
+            .expect("Failed to build table");
+
+        create_table(&admin, &table_path, &table_descriptor).await;
+
+        // Create partitions for each region before inserting data
+        create_partitions(&admin, &table_path, "region", &["US", "EU", "APAC"]).await;
+
+        let connection = cluster.get_fluss_connection().await;
+
+        let table = connection
+            .get_table(&table_path)
+            .await
+            .expect("Failed to get table");
+
+        let table_upsert = table.new_upsert().expect("Failed to create upsert");
+
+        let upsert_writer = table_upsert
+            .create_writer()
+            .expect("Failed to create writer");
+
+        // Insert records with different partitions
+        let test_data = [
+            ("US", 1, "Gustave", 100i64),
+            ("US", 2, "Lune", 200i64),
+            ("EU", 1, "Sciel", 150i64),
+            ("EU", 2, "Maelle", 250i64),
+            ("APAC", 1, "Noco", 300i64),
+        ];
+
+        for (region, user_id, name, score) in &test_data {
+            let mut row = GenericRow::new(4);
+            row.set_field(0, *region);
+            row.set_field(1, *user_id);
+            row.set_field(2, *name);
+            row.set_field(3, *score);
+            upsert_writer.upsert(&row).expect("Failed to upsert");
+        }
+        upsert_writer.flush().await.expect("Failed to flush");
+
+        // Create lookuper
+        let mut lookuper = table
+            .new_lookup()
+            .expect("Failed to create lookup")
+            .create_lookuper()
+            .expect("Failed to create lookuper");
+
+        // Lookup records - the lookup key includes partition key columns
+        for (region, user_id, expected_name, expected_score) in &test_data {
+            let mut key = GenericRow::new(4);
+            key.set_field(0, *region);
+            key.set_field(1, *user_id);
+
+            let result = lookuper.lookup(&key).await.expect("Failed to lookup");
+            let row = result
+                .get_single_row()
+                .expect("Failed to get row")
+                .expect("Row should exist");
+
+            assert_eq!(row.get_string(0).unwrap(), *region, "region mismatch");
+            assert_eq!(row.get_int(1).unwrap(), *user_id, "user_id mismatch");
+            assert_eq!(row.get_string(2).unwrap(), *expected_name, "name mismatch");
+            assert_eq!(row.get_long(3).unwrap(), *expected_score, "score mismatch");
+        }
+
+        // Test update within a partition (await acknowledgment)
+        let mut updated_row = GenericRow::new(4);
+        updated_row.set_field(0, "US");
+        updated_row.set_field(1, 1);
+        updated_row.set_field(2, "Gustave Updated");
+        updated_row.set_field(3, 999i64);
+        upsert_writer
+            .upsert(&updated_row)
+            .expect("Failed to upsert updated row")
+            .await
+            .expect("Failed to wait for upsert acknowledgment");
+
+        // Verify the update
+        let mut key = GenericRow::new(4);
+        key.set_field(0, "US");
+        key.set_field(1, 1);
+        let result = lookuper.lookup(&key).await.expect("Failed to lookup");
+        let row = result
+            .get_single_row()
+            .expect("Failed to get row")
+            .expect("Row should exist");
+        assert_eq!(row.get_string(2).unwrap(), "Gustave Updated");
+        assert_eq!(row.get_long(3).unwrap(), 999);
+
+        // Lookup in non-existent partition should return empty result
+        let mut non_existent_key = GenericRow::new(4);
+        non_existent_key.set_field(0, "UNKNOWN_REGION");
+        non_existent_key.set_field(1, 1);
+        let result = lookuper
+            .lookup(&non_existent_key)
+            .await
+            .expect("Failed to lookup non-existent partition");
+        assert!(
+            result
+                .get_single_row()
+                .expect("Failed to get row")
+                .is_none(),
+            "Lookup in non-existent partition should return None"
+        );
+
+        // Delete a record within a partition (await acknowledgment)
+        let mut delete_key = GenericRow::new(4);
+        delete_key.set_field(0, "EU");
+        delete_key.set_field(1, 1);
+        upsert_writer
+            .delete(&delete_key)
+            .expect("Failed to delete")
+            .await
+            .expect("Failed to wait for delete acknowledgment");
+
+        // Verify deletion
+        let mut key = GenericRow::new(4);
+        key.set_field(0, "EU");
+        key.set_field(1, 1);
+        let result = lookuper.lookup(&key).await.expect("Failed to lookup");
+        assert!(
+            result
+                .get_single_row()
+                .expect("Failed to get row")
+                .is_none(),
+            "Deleted record should not exist"
+        );
+
+        // Verify other records in the same partition still exist
+        let mut key = GenericRow::new(4);
+        key.set_field(0, "EU");
+        key.set_field(1, 2);
+        let result = lookuper.lookup(&key).await.expect("Failed to lookup");
+        let row = result
+            .get_single_row()
+            .expect("Failed to get row")
+            .expect("Row should exist");
+        assert_eq!(row.get_string(2).unwrap(), "Maelle");
 
         admin
             .drop_table(&table_path, false)
@@ -443,12 +570,12 @@ mod kv_table_test {
     async fn all_supported_datatypes() {
         use fluss::row::{Date, Datum, Decimal, Time, TimestampLtz, TimestampNtz};
 
-        let cluster = get_fluss_cluster();
+        let cluster = get_shared_cluster();
         let connection = cluster.get_fluss_connection().await;
 
-        let admin = connection.get_admin().await.expect("Failed to get admin");
+        let admin = connection.get_admin().expect("Failed to get admin");
 
-        let table_path = TablePath::new("fluss".to_string(), "test_all_datatypes".to_string());
+        let table_path = TablePath::new("fluss", "test_all_datatypes");
 
         // Create a table with all supported primitive datatypes
         let table_descriptor = TableDescriptor::builder()
@@ -479,7 +606,7 @@ mod kv_table_test {
                     // Binary types
                     .column("col_bytes", DataTypes::bytes())
                     .column("col_binary", DataTypes::binary(20))
-                    .primary_key(vec!["pk_int".to_string()])
+                    .primary_key(vec!["pk_int"])
                     .build()
                     .expect("Failed to build schema"),
             )
@@ -494,7 +621,7 @@ mod kv_table_test {
             .expect("Failed to get table");
 
         let table_upsert = table.new_upsert().expect("Failed to create upsert");
-        let mut upsert_writer = table_upsert
+        let upsert_writer = table_upsert
             .create_writer()
             .expect("Failed to create writer");
 
@@ -539,8 +666,9 @@ mod kv_table_test {
 
         upsert_writer
             .upsert(&row)
+            .expect("Failed to upsert row with all datatypes")
             .await
-            .expect("Failed to upsert row with all datatypes");
+            .expect("Failed to wait for upsert acknowledgment");
 
         // Lookup the record
         let mut lookuper = table
@@ -559,62 +687,88 @@ mod kv_table_test {
             .expect("Row should exist");
 
         // Verify all datatypes
-        assert_eq!(found_row.get_int(0), pk_int, "pk_int mismatch");
+        assert_eq!(found_row.get_int(0).unwrap(), pk_int, "pk_int mismatch");
         assert_eq!(
-            found_row.get_boolean(1),
+            found_row.get_boolean(1).unwrap(),
             col_boolean,
             "col_boolean mismatch"
         );
-        assert_eq!(found_row.get_byte(2), col_tinyint, "col_tinyint mismatch");
         assert_eq!(
-            found_row.get_short(3),
+            found_row.get_byte(2).unwrap(),
+            col_tinyint,
+            "col_tinyint mismatch"
+        );
+        assert_eq!(
+            found_row.get_short(3).unwrap(),
             col_smallint,
             "col_smallint mismatch"
         );
-        assert_eq!(found_row.get_int(4), col_int, "col_int mismatch");
-        assert_eq!(found_row.get_long(5), col_bigint, "col_bigint mismatch");
+        assert_eq!(found_row.get_int(4).unwrap(), col_int, "col_int mismatch");
+        assert_eq!(
+            found_row.get_long(5).unwrap(),
+            col_bigint,
+            "col_bigint mismatch"
+        );
         assert!(
-            (found_row.get_float(6) - col_float).abs() < f32::EPSILON,
+            (found_row.get_float(6).unwrap() - col_float).abs() < f32::EPSILON,
             "col_float mismatch: expected {}, got {}",
             col_float,
-            found_row.get_float(6)
+            found_row.get_float(6).unwrap()
         );
         assert!(
-            (found_row.get_double(7) - col_double).abs() < f64::EPSILON,
+            (found_row.get_double(7).unwrap() - col_double).abs() < f64::EPSILON,
             "col_double mismatch: expected {}, got {}",
             col_double,
-            found_row.get_double(7)
+            found_row.get_double(7).unwrap()
         );
-        assert_eq!(found_row.get_char(8, 10), col_char, "col_char mismatch");
-        assert_eq!(found_row.get_string(9), col_string, "col_string mismatch");
         assert_eq!(
-            found_row.get_decimal(10, 10, 2),
+            found_row.get_char(8, 10).unwrap(),
+            col_char,
+            "col_char mismatch"
+        );
+        assert_eq!(
+            found_row.get_string(9).unwrap(),
+            col_string,
+            "col_string mismatch"
+        );
+        assert_eq!(
+            found_row.get_decimal(10, 10, 2).unwrap(),
             col_decimal,
             "col_decimal mismatch"
         );
         assert_eq!(
-            found_row.get_date(11).get_inner(),
+            found_row.get_date(11).unwrap().get_inner(),
             col_date.get_inner(),
             "col_date mismatch"
         );
         assert_eq!(
-            found_row.get_time(12).get_inner(),
+            found_row.get_time(12).unwrap().get_inner(),
             col_time.get_inner(),
             "col_time mismatch"
         );
         assert_eq!(
-            found_row.get_timestamp_ntz(13, 6).get_millisecond(),
+            found_row
+                .get_timestamp_ntz(13, 6)
+                .unwrap()
+                .get_millisecond(),
             col_timestamp.get_millisecond(),
             "col_timestamp mismatch"
         );
         assert_eq!(
-            found_row.get_timestamp_ltz(14, 6).get_epoch_millisecond(),
+            found_row
+                .get_timestamp_ltz(14, 6)
+                .unwrap()
+                .get_epoch_millisecond(),
             col_timestamp_ltz.get_epoch_millisecond(),
             "col_timestamp_ltz mismatch"
         );
-        assert_eq!(found_row.get_bytes(15), col_bytes, "col_bytes mismatch");
         assert_eq!(
-            found_row.get_binary(16, 20),
+            found_row.get_bytes(15).unwrap(),
+            col_bytes,
+            "col_bytes mismatch"
+        );
+        assert_eq!(
+            found_row.get_binary(16, 20).unwrap(),
             col_binary,
             "col_binary mismatch"
         );
@@ -642,8 +796,9 @@ mod kv_table_test {
 
         upsert_writer
             .upsert(&row_with_nulls)
+            .expect("Failed to upsert row with nulls")
             .await
-            .expect("Failed to upsert row with nulls");
+            .expect("Failed to wait for upsert acknowledgment");
 
         // Lookup row with nulls
         let mut key2 = GenericRow::new(17);
@@ -656,29 +811,75 @@ mod kv_table_test {
             .expect("Row should exist");
 
         // Verify all nullable columns are null
-        assert_eq!(found_row_nulls.get_int(0), pk_int_2, "pk_int mismatch");
-        assert!(found_row_nulls.is_null_at(1), "col_boolean should be null");
-        assert!(found_row_nulls.is_null_at(2), "col_tinyint should be null");
-        assert!(found_row_nulls.is_null_at(3), "col_smallint should be null");
-        assert!(found_row_nulls.is_null_at(4), "col_int should be null");
-        assert!(found_row_nulls.is_null_at(5), "col_bigint should be null");
-        assert!(found_row_nulls.is_null_at(6), "col_float should be null");
-        assert!(found_row_nulls.is_null_at(7), "col_double should be null");
-        assert!(found_row_nulls.is_null_at(8), "col_char should be null");
-        assert!(found_row_nulls.is_null_at(9), "col_string should be null");
-        assert!(found_row_nulls.is_null_at(10), "col_decimal should be null");
-        assert!(found_row_nulls.is_null_at(11), "col_date should be null");
-        assert!(found_row_nulls.is_null_at(12), "col_time should be null");
+        assert_eq!(
+            found_row_nulls.get_int(0).unwrap(),
+            pk_int_2,
+            "pk_int mismatch"
+        );
         assert!(
-            found_row_nulls.is_null_at(13),
+            found_row_nulls.is_null_at(1).unwrap(),
+            "col_boolean should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(2).unwrap(),
+            "col_tinyint should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(3).unwrap(),
+            "col_smallint should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(4).unwrap(),
+            "col_int should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(5).unwrap(),
+            "col_bigint should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(6).unwrap(),
+            "col_float should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(7).unwrap(),
+            "col_double should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(8).unwrap(),
+            "col_char should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(9).unwrap(),
+            "col_string should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(10).unwrap(),
+            "col_decimal should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(11).unwrap(),
+            "col_date should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(12).unwrap(),
+            "col_time should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(13).unwrap(),
             "col_timestamp should be null"
         );
         assert!(
-            found_row_nulls.is_null_at(14),
+            found_row_nulls.is_null_at(14).unwrap(),
             "col_timestamp_ltz should be null"
         );
-        assert!(found_row_nulls.is_null_at(15), "col_bytes should be null");
-        assert!(found_row_nulls.is_null_at(16), "col_binary should be null");
+        assert!(
+            found_row_nulls.is_null_at(15).unwrap(),
+            "col_bytes should be null"
+        );
+        assert!(
+            found_row_nulls.is_null_at(16).unwrap(),
+            "col_binary should be null"
+        );
 
         admin
             .drop_table(&table_path, false)

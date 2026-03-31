@@ -20,11 +20,11 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "fluss"
-description = "Python bindings for Fluss on fluss-rust with Pandas integration"
-authors = [{name = "Fluss Team"}]
+name = "pyfluss"
+description = "Apache Fluss (incubating) Python client"
+authors = [{name = "Apache Fluss", email = "dev@fluss.apache.org"}]
 license = {text = "Apache-2.0"}
-readme = "README.md"
+readme = "PYPI_README.md"
 requires-python = ">=3.9"
 classifiers = [
     "License :: OSI Approved :: Apache Software License",
@@ -42,6 +42,7 @@ dependencies = [
 ]
 
 [project.urls]
+Homepage = "https://clients.fluss.apache.org/user-guide/rust/installation/"
 Repository = "https://github.com/apache/fluss-rust"
 
 [project.optional-dependencies]
@@ -49,8 +50,10 @@ dev = [
     "mypy>=1.17.1",
     "pytest>=8.3.5",
     "pytest-asyncio>=0.25.3",
+    "pytest-xdist>=3.5.0",
     "ruff>=0.9.10",
     "maturin>=1.8.2",
+    "testcontainers>=4.0.0",
 ]
 docs = [
     "pdoc>=15.0.4",
@@ -88,6 +91,10 @@ docstring-code-format = true
 
 [tool.ruff.lint.isort]
 known-first-party = ["fluss"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
 
 [tool.mypy]
 python_version = "3.9"

@@ -16,9 +16,10 @@
 // under the License.
 
 use crate::client::metadata::Metadata;
+use crate::cluster::ServerNode;
 use crate::metadata::{
     DatabaseDescriptor, DatabaseInfo, JsonSerde, LakeSnapshot, PartitionInfo, PartitionSpec,
-    TableBucket, TableDescriptor, TableInfo, TablePath,
+    PhysicalTablePath, TableBucket, TableDescriptor, TableInfo, TablePath,
 };
 use crate::rpc::message::{
     CreateDatabaseRequest, CreatePartitionRequest, CreateTableRequest, DatabaseExistsRequest,
@@ -32,49 +33,48 @@ use crate::rpc::{RpcClient, ServerConnection};
 use crate::error::{Error, Result};
 use crate::proto::GetTableInfoResponse;
 use crate::{BucketId, PartitionId, TableId};
-use std::collections::HashMap;
-use std::slice::from_ref;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
 pub struct FlussAdmin {
-    admin_gateway: ServerConnection,
-    #[allow(dead_code)]
     metadata: Arc<Metadata>,
-    #[allow(dead_code)]
     rpc_client: Arc<RpcClient>,
 }
 
 impl FlussAdmin {
-    pub async fn new(connections: Arc<RpcClient>, metadata: Arc<Metadata>) -> Result<Self> {
-        let admin_con = connections
-            .get_connection(
-                metadata
-                    .get_cluster()
-                    .get_coordinator_server()
-                    .expect("Couldn't coordinator server"),
-            )
-            .await?;
-
-        Ok(FlussAdmin {
-            admin_gateway: admin_con,
+    pub fn new(connections: Arc<RpcClient>, metadata: Arc<Metadata>) -> Self {
+        FlussAdmin {
             metadata,
             rpc_client: connections,
-        })
+        }
+    }
+
+    async fn admin_gateway(&self) -> Result<ServerConnection> {
+        let cluster = self.metadata.get_cluster();
+        let coordinator =
+            cluster
+                .get_coordinator_server()
+                .ok_or_else(|| Error::UnexpectedError {
+                    message: "Coordinator server not found in cluster metadata".to_string(),
+                    source: None,
+                })?;
+        self.rpc_client.get_connection(coordinator).await
     }
 
     pub async fn create_database(
         &self,
         database_name: &str,
-        ignore_if_exists: bool,
         database_descriptor: Option<&DatabaseDescriptor>,
+        ignore_if_exists: bool,
     ) -> Result<()> {
         let _response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(CreateDatabaseRequest::new(
                 database_name,
-                ignore_if_exists,
                 database_descriptor,
+                ignore_if_exists,
             )?)
             .await?;
         Ok(())
@@ -87,7 +87,8 @@ impl FlussAdmin {
         ignore_if_exists: bool,
     ) -> Result<()> {
         let _response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(CreateTableRequest::new(
                 table_path,
                 table_descriptor,
@@ -97,19 +98,31 @@ impl FlussAdmin {
         Ok(())
     }
 
-    pub async fn drop_table(&self, table_path: &TablePath, ignore_if_exists: bool) -> Result<()> {
+    pub async fn drop_table(
+        &self,
+        table_path: &TablePath,
+        ignore_if_not_exists: bool,
+    ) -> Result<()> {
         let _response = self
-            .admin_gateway
-            .request(DropTableRequest::new(table_path, ignore_if_exists))
+            .admin_gateway()
+            .await?
+            .request(DropTableRequest::new(table_path, ignore_if_not_exists))
             .await?;
         Ok(())
     }
 
-    pub async fn get_table(&self, table_path: &TablePath) -> Result<TableInfo> {
+    pub async fn get_table_info(&self, table_path: &TablePath) -> Result<TableInfo> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(GetTableRequest::new(table_path))
             .await?;
+
+        // force update to avoid stale data in cache
+        self.metadata
+            .update_tables_metadata(&HashSet::from([table_path]), &HashSet::new(), vec![])
+            .await?;
+
         let GetTableInfoResponse {
             table_id,
             schema_id,
@@ -133,7 +146,8 @@ impl FlussAdmin {
     /// List all tables in the given database
     pub async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(ListTablesRequest::new(database_name))
             .await?;
         Ok(response.table_name)
@@ -151,7 +165,8 @@ impl FlussAdmin {
         partial_partition_spec: Option<&PartitionSpec>,
     ) -> Result<Vec<PartitionInfo>> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(ListPartitionInfosRequest::new(
                 table_path,
                 partial_partition_spec,
@@ -168,7 +183,8 @@ impl FlussAdmin {
         ignore_if_exists: bool,
     ) -> Result<()> {
         let _response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(CreatePartitionRequest::new(
                 table_path,
                 partition_spec,
@@ -186,7 +202,8 @@ impl FlussAdmin {
         ignore_if_not_exists: bool,
     ) -> Result<()> {
         let _response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(DropPartitionRequest::new(
                 table_path,
                 partition_spec,
@@ -199,7 +216,8 @@ impl FlussAdmin {
     /// Check if a table exists
     pub async fn table_exists(&self, table_path: &TablePath) -> Result<bool> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(TableExistsRequest::new(table_path))
             .await?;
         Ok(response.exists)
@@ -211,21 +229,24 @@ impl FlussAdmin {
         database_name: &str,
         ignore_if_not_exists: bool,
         cascade: bool,
-    ) {
+    ) -> Result<()> {
         let _response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(DropDatabaseRequest::new(
                 database_name,
                 ignore_if_not_exists,
                 cascade,
             ))
-            .await;
+            .await?;
+        Ok(())
     }
 
     /// List all databases
     pub async fn list_databases(&self) -> Result<Vec<String>> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(ListDatabasesRequest::new())
             .await?;
         Ok(response.database_name)
@@ -234,7 +255,8 @@ impl FlussAdmin {
     /// Check if a database exists
     pub async fn database_exists(&self, database_name: &str) -> Result<bool> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(DatabaseExistsRequest::new(database_name))
             .await?;
         Ok(response.exists)
@@ -243,7 +265,7 @@ impl FlussAdmin {
     /// Get database information
     pub async fn get_database_info(&self, database_name: &str) -> Result<DatabaseInfo> {
         let request = GetDatabaseInfoRequest::new(database_name);
-        let response = self.admin_gateway.request(request).await?;
+        let response = self.admin_gateway().await?.request(request).await?;
 
         // Convert proto response to DatabaseInfo
         let database_descriptor = DatabaseDescriptor::from_json_bytes(&response.database_json)?;
@@ -256,17 +278,29 @@ impl FlussAdmin {
         ))
     }
 
+    /// Get all alive server nodes in the cluster, including the coordinator
+    /// and all tablet servers. Refreshes cluster metadata before returning.
+    pub async fn get_server_nodes(&self) -> Result<Vec<ServerNode>> {
+        self.metadata.reinit_cluster().await?;
+        Ok(self.metadata.get_cluster().get_server_nodes())
+    }
+
     /// Get the latest lake snapshot for a table
     pub async fn get_latest_lake_snapshot(&self, table_path: &TablePath) -> Result<LakeSnapshot> {
         let response = self
-            .admin_gateway
+            .admin_gateway()
+            .await?
             .request(GetLatestLakeSnapshotRequest::new(table_path))
             .await?;
 
         // Convert proto response to LakeSnapshot
         let mut table_buckets_offset = HashMap::new();
         for bucket_snapshot in response.bucket_snapshots {
-            let table_bucket = TableBucket::new(response.table_id, bucket_snapshot.bucket_id);
+            let table_bucket = TableBucket::new_with_partition(
+                response.table_id,
+                bucket_snapshot.partition_id,
+                bucket_snapshot.bucket_id,
+            );
             if let Some(log_offset) = bucket_snapshot.log_offset {
                 table_buckets_offset.insert(table_bucket, log_offset);
             }
@@ -286,23 +320,71 @@ impl FlussAdmin {
         buckets_id: &[BucketId],
         offset_spec: OffsetSpec,
     ) -> Result<HashMap<i32, i64>> {
-        self.metadata
-            .check_and_update_table_metadata(from_ref(table_path))
-            .await?;
+        self.do_list_offsets(table_path, None, buckets_id, offset_spec)
+            .await
+    }
 
+    /// List offset for the specified buckets in a partition. This operation enables to find
+    /// the beginning offset, end offset as well as the offset matching a timestamp in buckets.
+    pub async fn list_partition_offsets(
+        &self,
+        table_path: &TablePath,
+        partition_name: &str,
+        buckets_id: &[BucketId],
+        offset_spec: OffsetSpec,
+    ) -> Result<HashMap<i32, i64>> {
+        self.do_list_offsets(table_path, Some(partition_name), buckets_id, offset_spec)
+            .await
+    }
+
+    async fn do_list_offsets(
+        &self,
+        table_path: &TablePath,
+        partition_name: Option<&str>,
+        buckets_id: &[BucketId],
+        offset_spec: OffsetSpec,
+    ) -> Result<HashMap<i32, i64>> {
         if buckets_id.is_empty() {
-            return Err(Error::UnexpectedError {
+            return Err(Error::IllegalArgument {
                 message: "Buckets are empty.".to_string(),
-                source: None,
             });
         }
 
+        // force to update table metadata like java side
+        self.metadata.update_table_metadata(table_path).await?;
+
         let cluster = self.metadata.get_cluster();
-        let table_id = cluster.get_table(table_path).table_id;
+        let table_id = cluster.get_table(table_path)?.table_id;
+
+        // Resolve partition_id from partition_name if provided
+        let partition_id = if let Some(name) = partition_name {
+            let physical_table_path = Arc::new(PhysicalTablePath::of_partitioned(
+                Arc::new(table_path.clone()),
+                Some(name.to_string()),
+            ));
+
+            // Update partition metadata like java side
+            self.metadata
+                .update_physical_table_metadata(std::slice::from_ref(&physical_table_path))
+                .await?;
+
+            let cluster = self.metadata.get_cluster();
+            Some(
+                cluster
+                    .get_partition_id(&physical_table_path)
+                    .ok_or_else(|| {
+                        Error::partition_not_exist(format!(
+                            "Partition '{name}' not found for table '{table_path}'"
+                        ))
+                    })?,
+            )
+        } else {
+            None
+        };
 
         // Prepare requests
         let requests_by_server =
-            self.prepare_list_offsets_requests(table_id, None, buckets_id, offset_spec)?;
+            self.prepare_list_offsets_requests(table_id, partition_id, buckets_id, offset_spec)?;
 
         // Send Requests
         let response_futures = self.send_list_offsets_request(requests_by_server).await?;
@@ -330,7 +412,7 @@ impl FlussAdmin {
         let mut node_for_bucket_list: HashMap<i32, Vec<BucketId>> = HashMap::new();
 
         for bucket_id in buckets {
-            let table_bucket = TableBucket::new(table_id, *bucket_id);
+            let table_bucket = TableBucket::new_with_partition(table_id, partition_id, *bucket_id);
             let leader = cluster.leader_for(&table_bucket).ok_or_else(|| {
                 // todo: consider retry?
                 Error::UnexpectedError {
@@ -367,11 +449,9 @@ impl FlussAdmin {
             let task = tokio::spawn(async move {
                 let cluster = metadata.get_cluster();
                 let tablet_server = cluster.get_tablet_server(leader_id).ok_or_else(|| {
-                    Error::LeaderNotAvailable {
-                        message: format!(
-                            "Tablet server {leader_id} is not found in metadata cache."
-                        ),
-                    }
+                    Error::leader_not_available(format!(
+                        "Tablet server {leader_id} is not found in metadata cache."
+                    ))
                 })?;
                 let connection = rpc_client.get_connection(tablet_server).await?;
                 let list_offsets_response = connection.request(request).await?;

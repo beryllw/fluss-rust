@@ -24,6 +24,40 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.dylib
+*.dSYM/
 *.egg-info/
 dist/
 build/
+.venv/
+uv.lock
+
+# CPP
+*CMakeFiles/
+.cache/
+
+# Node.js bindings
+bindings/node/node_modules
+bindings/node/package-lock.json
+bindings/node/npm-debug.log*
+bindings/node/yarn-debug.log*
+bindings/node/yarn-error.log*
+bindings/node/*.node
+
+# Website (Docusaurus)
+website/node_modules
+website/build
+website/.docusaurus
+website/.cache-loader
+website/.env.local
+website/.env.development.local
+website/.env.test.local
+website/.env.production.local
+website/npm-debug.log*
+website/yarn-debug.log*
+website/yarn-error.log*
+website/package-lock.json
+website/versioned_docs
+website/versioned_sidebars
+website/versions.json
+website/pnpm-lock.yaml

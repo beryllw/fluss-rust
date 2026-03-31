@@ -17,15 +17,20 @@
 
 mod accumulator;
 mod batch;
+mod idempotence;
 
 use crate::client::broadcast::{self as client_broadcast, BatchWriteResult, BroadcastOnceReceiver};
 use crate::error::Error;
-use crate::metadata::TablePath;
-use crate::row::GenericRow;
+use crate::metadata::{PhysicalTablePath, TableInfo};
+
+use crate::row::InternalRow;
 pub use accumulator::*;
 use arrow::array::RecordBatch;
 use bytes::Bytes;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 pub(crate) mod broadcast;
 mod bucket_assigner;
@@ -34,21 +39,43 @@ mod sender;
 mod write_format;
 mod writer_client;
 
+pub(crate) use idempotence::IdempotenceManager;
 pub use write_format::WriteFormat;
-pub use writer_client::WriterClient;
+pub(crate) use writer_client::WriterClient;
 
 #[allow(dead_code)]
 pub struct WriteRecord<'a> {
     record: Record<'a>,
-    table_path: Arc<TablePath>,
+    physical_table_path: Arc<PhysicalTablePath>,
     bucket_key: Option<Bytes>,
     schema_id: i32,
     write_format: WriteFormat,
+    table_info: Arc<TableInfo>,
 }
 
 impl<'a> WriteRecord<'a> {
     pub fn record(&self) -> &Record<'a> {
         &self.record
+    }
+
+    pub fn physical_table_path(&self) -> &Arc<PhysicalTablePath> {
+        &self.physical_table_path
+    }
+
+    /// Minimum batch capacity needed to fit this record, including batch header
+    /// overhead. Used to size memory reservations and KV write limits so that
+    /// oversized records don't panic on append.
+    pub fn estimated_record_size(&self) -> usize {
+        match &self.record {
+            Record::Kv(kv) => {
+                let record_size = crate::record::kv::KvRecord::size_of(
+                    &kv.key,
+                    kv.row_bytes.as_ref().map(|rb| rb.as_slice()),
+                );
+                crate::record::kv::RECORD_BATCH_HEADER_SIZE + record_size
+            }
+            Record::Log(_) => 0, // Arrow batches use record count, not byte size
+        }
     }
 }
 
@@ -58,7 +85,7 @@ pub enum Record<'a> {
 }
 
 pub enum LogWriteRecord<'a> {
-    Generic(GenericRow<'a>),
+    InternalRow(&'a dyn InternalRow),
     RecordBatch(Arc<RecordBatch>),
 }
 
@@ -102,10 +129,16 @@ impl<'a> KvWriteRecord<'a> {
 }
 
 impl<'a> WriteRecord<'a> {
-    pub fn for_append(table_path: Arc<TablePath>, schema_id: i32, row: GenericRow<'a>) -> Self {
+    pub fn for_append(
+        table_info: Arc<TableInfo>,
+        physical_table_path: Arc<PhysicalTablePath>,
+        schema_id: i32,
+        row: &'a dyn InternalRow,
+    ) -> Self {
         Self {
-            record: Record::Log(LogWriteRecord::Generic(row)),
-            table_path,
+            table_info,
+            record: Record::Log(LogWriteRecord::InternalRow(row)),
+            physical_table_path,
             bucket_key: None,
             schema_id,
             write_format: WriteFormat::ArrowLog,
@@ -113,21 +146,25 @@ impl<'a> WriteRecord<'a> {
     }
 
     pub fn for_append_record_batch(
-        table_path: Arc<TablePath>,
+        table_info: Arc<TableInfo>,
+        physical_table_path: Arc<PhysicalTablePath>,
         schema_id: i32,
         row: RecordBatch,
     ) -> Self {
         Self {
+            table_info,
             record: Record::Log(LogWriteRecord::RecordBatch(Arc::new(row))),
-            table_path,
+            physical_table_path,
             bucket_key: None,
             schema_id,
             write_format: WriteFormat::ArrowLog,
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn for_upsert(
-        table_path: Arc<TablePath>,
+        table_info: Arc<TableInfo>,
+        physical_table_path: Arc<PhysicalTablePath>,
         schema_id: i32,
         key: Bytes,
         bucket_key: Option<Bytes>,
@@ -136,8 +173,9 @@ impl<'a> WriteRecord<'a> {
         row_bytes: Option<RowBytes<'a>>,
     ) -> Self {
         Self {
+            table_info,
             record: Record::Kv(KvWriteRecord::new(key, target_columns, row_bytes)),
-            table_path,
+            physical_table_path,
             bucket_key,
             schema_id,
             write_format,
@@ -153,6 +191,11 @@ pub struct ResultHandle {
 impl ResultHandle {
     pub fn new(receiver: BroadcastOnceReceiver<BatchWriteResult>) -> Self {
         ResultHandle { receiver }
+    }
+
+    /// Force-complete with an error if not already completed.
+    pub(crate) fn fail(&self, error: client_broadcast::Error) {
+        self.receiver.fail(error);
     }
 
     pub async fn wait(&self) -> Result<BatchWriteResult, Error> {
@@ -179,5 +222,43 @@ impl ResultHandle {
                 source: None,
             },
         })
+    }
+}
+
+/// A future that represents a pending write operation.
+///
+/// This type implements [`Future`], allowing users to either:
+/// 1. Await immediately to block on acknowledgment: `writer.upsert(&row)?.await?`
+/// 2. Fire-and-forget with later flush: `writer.upsert(&row)?; writer.flush().await?`
+///
+/// This pattern is similar to rdkafka's `DeliveryFuture` and allows for efficient batching
+/// when users don't need immediate per-record acknowledgment.
+pub struct WriteResultFuture {
+    inner: Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>,
+}
+
+impl std::fmt::Debug for WriteResultFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteResultFuture").finish_non_exhaustive()
+    }
+}
+
+impl WriteResultFuture {
+    /// Create a new WriteResultFuture from a ResultHandle.
+    pub fn new(result_handle: ResultHandle) -> Self {
+        Self {
+            inner: Box::pin(async move {
+                let result = result_handle.wait().await?;
+                result_handle.result(result)
+            }),
+        }
+    }
+}
+
+impl Future for WriteResultFuture {
+    type Output = Result<(), Error>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.inner.as_mut().poll(cx)
     }
 }

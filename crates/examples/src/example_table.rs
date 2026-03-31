@@ -15,7 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod example_kv_table;
+mod example_partitioned_kv_table;
 
 use clap::Parser;
 use fluss::client::FlussConnection;
@@ -24,12 +29,11 @@ use fluss::error::Result;
 use fluss::metadata::{DataTypes, Schema, TableDescriptor, TablePath};
 use fluss::row::{GenericRow, InternalRow};
 use std::time::Duration;
-use tokio::try_join;
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
     let mut config = Config::parse();
-    config.bootstrap_server = Some("127.0.0.1:9123".to_string());
+    config.bootstrap_servers = "127.0.0.1:9123".to_string();
 
     let conn = FlussConnection::new(config).await?;
 
@@ -43,16 +47,16 @@ pub async fn main() -> Result<()> {
         )
         .build()?;
 
-    let table_path = TablePath::new("fluss".to_owned(), "rust_test_long".to_owned());
+    let table_path = TablePath::new("fluss", "rust_test_long");
 
-    let admin = conn.get_admin().await?;
+    let admin = conn.get_admin()?;
 
     admin
         .create_table(&table_path, &table_descriptor, true)
         .await?;
 
     // 2: get the table
-    let table_info = admin.get_table(&table_path).await?;
+    let table_info = admin.get_table_info(&table_path).await?;
     print!("Get created table:\n {table_info}\n");
 
     // write row
@@ -62,14 +66,15 @@ pub async fn main() -> Result<()> {
     row.set_field(2, 123_456_789_123i64);
 
     let table = conn.get_table(&table_path).await?;
-    let append_writer = table.new_append()?.create_writer();
-    let f1 = append_writer.append(row);
-    row = GenericRow::new(3);
+    let append_writer = table.new_append()?.create_writer()?;
+    // Fire-and-forget: queue writes then flush
+    append_writer.append(&row)?;
+    let mut row = GenericRow::new(3);
     row.set_field(0, 233333);
     row.set_field(1, "tt44");
     row.set_field(2, 987_654_321_987i64);
-    let f2 = append_writer.append(row);
-    try_join!(f1, f2, append_writer.flush())?;
+    append_writer.append(&row)?;
+    append_writer.flush().await?;
 
     // scan rows
     let log_scanner = table.new_scan().create_log_scanner()?;
@@ -82,9 +87,9 @@ pub async fn main() -> Result<()> {
             let row = record.row();
             println!(
                 "{{{}, {}, {}}}@{}",
-                row.get_int(0),
-                row.get_string(1),
-                row.get_long(2),
+                row.get_int(0)?,
+                row.get_string(1)?,
+                row.get_long(2)?,
                 record.offset()
             );
         }

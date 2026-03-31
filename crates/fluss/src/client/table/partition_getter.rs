@@ -17,11 +17,28 @@
 
 use crate::error::Error::IllegalArgument;
 use crate::error::Result;
-use crate::metadata::{DataType, ResolvedPartitionSpec, RowType};
+use crate::metadata::{DataType, PhysicalTablePath, ResolvedPartitionSpec, RowType, TablePath};
 use crate::row::InternalRow;
 use crate::row::field_getter::FieldGetter;
 use crate::util::partition;
 use std::sync::Arc;
+
+/// Get the physical table path for a row, handling partitioned vs non-partitioned tables.
+pub fn get_physical_path<R: InternalRow>(
+    table_path: &Arc<TablePath>,
+    partition_getter: Option<&PartitionGetter>,
+    row: &R,
+) -> Result<PhysicalTablePath> {
+    if let Some(getter) = partition_getter {
+        let partition = getter.get_partition(row)?;
+        Ok(PhysicalTablePath::of_partitioned(
+            Arc::clone(table_path),
+            Some(partition),
+        ))
+    } else {
+        Ok(PhysicalTablePath::of(Arc::clone(table_path)))
+    }
+}
 
 /// A getter to get partition name from a row.
 #[allow(dead_code)]
@@ -49,8 +66,7 @@ impl PartitionGetter {
             } else {
                 return Err(IllegalArgument {
                     message: format!(
-                        "The partition column {} is not in the row {}.",
-                        partition_key, row_type
+                        "The partition column {partition_key} is not in the row {row_type}."
                     ),
                 });
             };
@@ -71,7 +87,7 @@ impl PartitionGetter {
         let mut partition_values = Vec::with_capacity(self.partitions.len());
 
         for (data_type, field_getter) in &self.partitions {
-            let value = field_getter.get_field(row);
+            let value = field_getter.get_field(row)?;
             if value.is_null() {
                 return Err(IllegalArgument {
                     message: "Partition value shouldn't be null.".to_string(),
@@ -93,12 +109,8 @@ mod tests {
     #[test]
     fn test_partition_getter_single_key() {
         let row_type = RowType::new(vec![
-            DataField::new("id".to_string(), DataType::Int(IntType::new()), None),
-            DataField::new(
-                "region".to_string(),
-                DataType::String(StringType::new()),
-                None,
-            ),
+            DataField::new("id", DataType::Int(IntType::new()), None),
+            DataField::new("region", DataType::String(StringType::new()), None),
         ]);
 
         let getter = PartitionGetter::new(&row_type, Arc::from(["region".to_string()]))
@@ -112,17 +124,9 @@ mod tests {
     #[test]
     fn test_partition_getter_multiple_keys() {
         let row_type = RowType::new(vec![
-            DataField::new("id".to_string(), DataType::Int(IntType::new()), None),
-            DataField::new(
-                "date".to_string(),
-                DataType::String(StringType::new()),
-                None,
-            ),
-            DataField::new(
-                "region".to_string(),
-                DataType::String(StringType::new()),
-                None,
-            ),
+            DataField::new("id", DataType::Int(IntType::new()), None),
+            DataField::new("date", DataType::String(StringType::new()), None),
+            DataField::new("region", DataType::String(StringType::new()), None),
         ]);
 
         let getter = PartitionGetter::new(
@@ -143,7 +147,7 @@ mod tests {
     #[test]
     fn test_partition_getter_invalid_column() {
         let row_type = RowType::new(vec![DataField::new(
-            "id".to_string(),
+            "id",
             DataType::Int(IntType::new()),
             None,
         )]);
@@ -155,12 +159,8 @@ mod tests {
     #[test]
     fn test_partition_getter_null_value() {
         let row_type = RowType::new(vec![
-            DataField::new("id".to_string(), DataType::Int(IntType::new()), None),
-            DataField::new(
-                "region".to_string(),
-                DataType::String(StringType::new()),
-                None,
-            ),
+            DataField::new("id", DataType::Int(IntType::new()), None),
+            DataField::new("region", DataType::String(StringType::new()), None),
         ]);
 
         let getter = PartitionGetter::new(&row_type, Arc::from(["region".to_string()]))
@@ -174,17 +174,9 @@ mod tests {
     #[test]
     fn test_get_partition_spec() {
         let row_type = RowType::new(vec![
-            DataField::new("id".to_string(), DataType::Int(IntType::new()), None),
-            DataField::new(
-                "date".to_string(),
-                DataType::String(StringType::new()),
-                None,
-            ),
-            DataField::new(
-                "region".to_string(),
-                DataType::String(StringType::new()),
-                None,
-            ),
+            DataField::new("id", DataType::Int(IntType::new()), None),
+            DataField::new("date", DataType::String(StringType::new()), None),
+            DataField::new("region", DataType::String(StringType::new()), None),
         ]);
 
         let getter = PartitionGetter::new(

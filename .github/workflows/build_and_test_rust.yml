@@ -15,53 +15,40 @@
 # specific language governing permissions and limitations
 # under the License.
 
-name: CI
+name: Rust Build and Tests
 
 on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'website/**'
+      - '**/*.md'
   pull_request:
     branches:
       - main
+    paths-ignore:
+      - 'website/**'
+      - '**/*.md'
+      - 'bindings/python/**'
+      - 'bindings/cpp/**'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.6.0
-
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy
-        run: cargo clippy --all-targets --workspace -- -D warnings
-
-  build:
+  build-and-test-rust:
+    timeout-minutes: 60
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os:
           - ubuntu-latest
           - macos-latest
-        python: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
 
       - name: Install protoc
         run: |
@@ -78,46 +65,13 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: build-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('**/Cargo.lock') }}
+          key: rust-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build
-        run: cargo build --workspace --all-targets
-
-  test:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-        python: ["3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install protoc
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          elif [ "$RUNNER_OS" = "macOS" ]; then
-            brew install protobuf
-          fi
-
-      - name: Rust Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: test-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('**/Cargo.lock') }}
+        run: cargo build --workspace --all-targets --exclude fluss_python --exclude fluss-cpp
 
       - name: Unit Test
-        run: cargo test --all-targets --workspace
+        run: cargo test --all-targets --workspace --exclude fluss_python --exclude fluss-cpp
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full
@@ -125,7 +79,7 @@ jobs:
       - name: Integration Test (Linux only)
         if: runner.os == 'Linux'
         run: |
-          RUST_TEST_THREADS=1 cargo test --features integration_tests --all-targets --workspace -- --nocapture
+          cargo test --features integration_tests --all-targets --workspace --exclude fluss_python --exclude fluss-cpp
         env:
           RUST_LOG: DEBUG
           RUST_BACKTRACE: full

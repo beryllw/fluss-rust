@@ -17,18 +17,15 @@
 
 use crate::cluster::{BucketLocation, Cluster, ServerNode, ServerType};
 use crate::metadata::{
-    DataField, DataTypes, Schema, TableBucket, TableDescriptor, TableInfo, TablePath,
+    DataField, DataTypes, PhysicalTablePath, Schema, TableBucket, TableDescriptor, TableInfo,
+    TablePath,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) fn build_table_info(table_path: TablePath, table_id: i64, buckets: i32) -> TableInfo {
-    let row_type = DataTypes::row(vec![DataField::new(
-        "id".to_string(),
-        DataTypes::int(),
-        None,
-    )]);
-    let mut schema_builder = Schema::builder().with_row_type(&row_type);
+    let row_type = DataTypes::row(vec![DataField::new("id", DataTypes::int(), None)]);
+    let schema_builder = Schema::builder().with_row_type(&row_type);
     let schema = schema_builder.build().expect("schema build");
     let table_descriptor = TableDescriptor::builder()
         .schema(schema)
@@ -53,12 +50,15 @@ pub(crate) fn build_cluster(table_path: &TablePath, table_id: i64, buckets: i32)
         let bucket_location = BucketLocation::new(
             table_bucket.clone(),
             Some(server.clone()),
-            table_path.clone(),
+            Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone()))),
         );
         bucket_locations.push(bucket_location.clone());
         locations_by_bucket.insert(table_bucket, bucket_location);
     }
-    locations_by_path.insert(table_path.clone(), bucket_locations);
+    locations_by_path.insert(
+        Arc::new(PhysicalTablePath::of(Arc::new(table_path.clone()))),
+        bucket_locations,
+    );
 
     let mut table_id_by_path = HashMap::new();
     table_id_by_path.insert(table_path.clone(), table_id);
@@ -76,6 +76,7 @@ pub(crate) fn build_cluster(table_path: &TablePath, table_id: i64, buckets: i32)
         locations_by_bucket,
         table_id_by_path,
         table_info_by_path,
+        HashMap::new(),
     )
 }
 
