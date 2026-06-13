@@ -1,132 +1,132 @@
-# fluss-datafusion Phase 1 Design and Task Breakdown
+# fluss-datafusion Phase 1 设计与任务拆解
 
-## Audience
+## 适用读者
 
-- Maintainers implementing `fluss-datafusion` inside `fluss-rust`
-- Future `fluss-gateway` integration work that will consume this crate
+- 在 `fluss-rust` 内实现 `fluss-datafusion` 的维护者
+- 未来要消费该 crate 的 `fluss-gateway` 集成工作
 
-## Goal
+## 目标
 
-Add a new stateless Rust library crate that exposes Fluss data to DataFusion through catalog, schema, table, and execution-plan integrations.
+新增一个无状态的 Rust library crate,通过 catalog、schema、table、execution-plan 集成,把 Fluss 数据暴露给 DataFusion。
 
-Phase 1 is intentionally narrow:
+Phase 1 的范围刻意收窄:
 
-- make `fluss-gateway` SQL read path possible
-- keep the crate reusable outside gateway
-- reuse the existing Fluss Rust client instead of inventing a gateway-specific backend abstraction
+- 让 `fluss-gateway` 的 SQL 读取路径成为可能
+- 保持该 crate 在 gateway 之外仍可复用
+- 复用现有的 Fluss Rust client,而不是发明一个 gateway 专属的 backend 抽象
 
-## Scope
+## 范围(Scope)
 
-Phase 1 must support:
+Phase 1 必须支持:
 
-1. database and table discovery
-2. KV table SQL pushdown for complete primary-key equality predicates
-3. log table bounded scan with `LIMIT` required
-4. Fluss-to-Arrow schema and row conversion reuse
-5. DataFusion integration through:
+1. database 与 table 发现
+2. KV table 的完整 primary-key 等值谓词 SQL pushdown
+3. log table 的有界扫描,且必须带 `LIMIT`
+4. 复用 Fluss-to-Arrow 的 schema 与 row 转换
+5. 通过以下方式完成 DataFusion 集成:
    - `CatalogProvider`
    - `SchemaProvider`
    - `TableProvider`
-   - custom `ExecutionPlan`
-6. integration tests against a real Fluss test cluster
+   - 自定义 `ExecutionPlan`
+6. 针对真实 Fluss test cluster 的 integration tests
 
-## Non-goals
+## 非目标(Non-goals)
 
-Phase 1 does not include:
+Phase 1 不包含:
 
-- PostgreSQL compatibility objects such as `pg_catalog`
-- session, user, auth, or multi-cluster awareness
-- SQL DML writes
-- direct read/write REST APIs
-- MySQL or PostgreSQL protocol compatibility
+- PostgreSQL 兼容对象,例如 `pg_catalog`
+- session、user、auth 或多 cluster 感知
+- SQL DML 写入
+- 直连读写的 REST API
+- MySQL 或 PostgreSQL 协议兼容
 - prefix scan pushdown
-- batch lookup optimization
-- offset pseudo columns
-- offset predicate pushdown
-- complex filter, join, aggregate, or sort pushdown
+- batch lookup 优化
+- offset 伪列(pseudo columns)
+- offset 谓词 pushdown
+- 复杂的 filter、join、aggregate 或 sort pushdown
 
-## Placement Decision
+## 放置位置决策
 
-`fluss-datafusion` should live at:
+`fluss-datafusion` 应位于:
 
 ```text
 crates/fluss-datafusion/
 ```
 
-It should not live at:
+不应位于:
 
 ```text
 integration/fluss-datafusion/
 ```
 
-Reasoning:
+理由:
 
-1. Current workspace convention is that reusable Rust crates live under `crates/`.
-2. Current `integration` usage in this repository is test-only, for example `crates/fluss/tests/integration/*`.
-3. `fluss-datafusion` is a first-class reusable library crate, not a test harness.
-4. Keeping it separate from `crates/fluss` prevents DataFusion dependencies and planning logic from leaking into the core client crate.
+1. 当前 workspace 约定是:可复用的 Rust crate 放在 `crates/` 下。
+2. 本仓库中 `integration` 当前仅用于测试,例如 `crates/fluss/tests/integration/*`。
+3. `fluss-datafusion` 是一等公民、可复用的 library crate,而非 test harness。
+4. 与 `crates/fluss` 分离,可避免 DataFusion 依赖与 planning 逻辑泄漏进核心 client crate。
 
-Relevant repository references:
+相关仓库参考:
 
 - `Cargo.toml:29-31`
 - `DEVELOPMENT.md:75-95`
 - `README.md:63-69`
 
-## Existing Building Blocks to Reuse
+## 可复用的现有构件
 
-The repository already has most of the lower-level pieces needed by Phase 1.
+仓库已具备 Phase 1 所需的大部分底层能力。
 
-### Metadata APIs
+### Metadata API
 
-Use the existing admin APIs in `crates/fluss/src/client/admin.rs`:
+使用 `crates/fluss/src/client/admin.rs` 中现有的 admin API:
 
 - `FlussAdmin::list_databases`
 - `FlussAdmin::list_tables`
 - `FlussAdmin::get_table_info`
 - `FlussAdmin::get_table_schema`
 
-These cover Phase 1 metadata discovery without adding new Fluss RPC abstractions.
+这些已覆盖 Phase 1 的 metadata 发现需求,无需新增 Fluss RPC 抽象。
 
-### KV point lookup APIs
+### KV point lookup API
 
-Use the existing table lookup path in `crates/fluss/src/client/table/lookup.rs`:
+使用 `crates/fluss/src/client/table/lookup.rs` 中现有的 table lookup 路径:
 
 - `TableLookup::create_lookuper`
 - `Lookuper::lookup`
 - `LookupResult::to_record_batch`
 
-This is the natural execution backend for complete primary-key equality pushdown.
+这是完整 primary-key 等值 pushdown 的天然 execution backend。
 
-### Log bounded read APIs
+### Log 有界读取 API
 
-There are two existing bounded read directions:
+现有的有界读取有两个方向:
 
 1. `crates/fluss/src/client/table/batch_scanner.rs`
-   - useful for one-shot bounded reads
-   - currently does not expose explicit `start_offset`
+   - 适合一次性的有界读取
+   - 当前未暴露显式的 `start_offset`
 2. `crates/fluss/src/client/table/reader.rs`
    - `RecordBatchLogReader::new_until_offsets`
-   - better fit when explicit stop-offset semantics are needed
+   - 当需要显式 stop-offset 语义时更合适
 
-Phase 1 log execution should prefer the path that preserves the narrowest, clearest SQL contract.
+Phase 1 的 log execution 应优先选择能保持最窄、最清晰 SQL 契约的路径。
 
-### Arrow conversion helpers
+### Arrow 转换 helper
 
-Reuse the existing helpers in `crates/fluss/src/record/arrow.rs`:
+复用 `crates/fluss/src/record/arrow.rs` 中现有的 helper:
 
 - `to_arrow_schema`
 - `from_arrow_field`
 - `RowAppendRecordBatchBuilder`
 
-Do not reimplement Fluss-to-Arrow mapping from scratch.
+不要从零重新实现 Fluss-to-Arrow 映射。
 
-### Test infrastructure
+### 测试基础设施
 
-Reuse the support crate:
+复用支持 crate:
 
 - `crates/fluss-test-cluster`
 
-Follow the patterns from existing integration tests:
+遵循现有 integration tests 的模式:
 
 - `crates/fluss/tests/test_fluss.rs`
 - `crates/fluss/tests/integration/utils.rs`
@@ -134,9 +134,9 @@ Follow the patterns from existing integration tests:
 - `crates/fluss/tests/integration/log_table.rs`
 - `crates/fluss/tests/integration/record_batch_log_reader.rs`
 
-Note that `crates/fluss/tests/integration/utils.rs` is not a reusable library. New tests in `crates/fluss-datafusion` must create their own local `tests/integration/utils.rs`, likely by porting the minimal helper patterns while depending on `fluss-test-cluster`.
+注意:`crates/fluss/tests/integration/utils.rs` 并非可复用的 library。`crates/fluss-datafusion` 中的新测试必须自建本地 `tests/integration/utils.rs`,通常做法是移植最小 helper 模式,同时依赖 `fluss-test-cluster`。
 
-## Proposed Crate Layout
+## 建议的 crate 布局
 
 ```text
 Cargo.toml
@@ -192,23 +192,23 @@ crates/
         explain.rs
 ```
 
-## Public API Shape
+## 公共 API 形状
 
-Phase 1 public API should stay small.
+Phase 1 的公共 API 应保持精简。
 
 ### `src/lib.rs`
 
-Export only the public entry points:
+仅导出公共入口:
 
 - `FlussDatafusion`
 - `FlussDatafusionOptions`
 - `RegisterCatalogOptions`
 - `FlussDatafusionError`
-- crate-local `Result<T>` alias if needed
+- 需要时再加 crate 内的 `Result<T>` alias
 
 ### `src/config.rs`
 
-Define:
+定义:
 
 ```rust
 pub struct FlussDatafusionOptions {
@@ -219,11 +219,11 @@ pub struct FlussDatafusionOptions {
 pub struct RegisterCatalogOptions {}
 ```
 
-Keep options minimal in Phase 1. Do not introduce session-specific knobs here.
+Phase 1 中 options 保持最小化,不要在此引入 session 专属的开关。
 
 ### `src/install.rs`
 
-Define the main entry point:
+定义主入口:
 
 ```rust
 pub struct FlussDatafusion {
@@ -245,154 +245,154 @@ impl FlussDatafusion {
 }
 ```
 
-Phase 1 should not expose gateway-only abstractions.
+Phase 1 不应暴露 gateway 专属的抽象。
 
-## Internal Module Responsibilities
+## 内部模块职责
 
 ### `src/metadata/cache.rs`
 
-Responsibility:
+职责:
 
-- shared cache for databases, tables, and table metadata
-- cache entries reused across sessions and `SessionContext`s
-- no gateway session state
+- 为 databases、tables 与 table metadata 提供共享 cache
+- cache 条目可跨 session 与 `SessionContext` 复用
+- 不持有 gateway 的 session 状态
 
-Expected cached objects:
+期望被缓存的对象:
 
-- database names
-- table names per database
-- `TableInfo` per table
-- latest schema info per table when needed
+- database 名称
+- 每个 database 下的 table 名称
+- 每张表的 `TableInfo`
+- 需要时,每张表最新的 schema 信息
 
 ### `src/metadata/loader.rs`
 
-Responsibility:
+职责:
 
-- async loading using `FlussAdmin`
-- bridge from DataFusion sync-facing trait methods to cached data
-- enforce lazy loading instead of preloading the full cluster
+- 使用 `FlussAdmin` 进行异步加载
+- 把 DataFusion 同步风格的 trait 方法桥接到缓存数据
+- 强制 lazy loading,而非预加载整个 cluster
 
-Key design rule:
+关键设计规则:
 
-- sync DataFusion trait entry points should read from the shared cache
-- async refresh paths should live behind the cache loader
-- avoid per-query full metadata scans
+- DataFusion 同步 trait 入口应从共享 cache 读取
+- 异步刷新路径应置于 cache loader 之后
+- 避免每次查询都做全量 metadata 扫描
 
 ### `src/catalog/provider.rs`
 
-Responsibility:
+职责:
 
-- implement the top-level DataFusion `CatalogProvider`
-- expose Fluss databases as schemas
+- 实现顶层 DataFusion `CatalogProvider`
+- 把 Fluss databases 暴露为 schemas
 
 ### `src/catalog/schema.rs`
 
-Responsibility:
+职责:
 
-- implement the DataFusion `SchemaProvider`
-- expose Fluss tables inside one database
-- construct either KV or log `TableProvider`
+- 实现 DataFusion `SchemaProvider`
+- 暴露某个 database 内的 Fluss tables
+- 构造 KV 或 log 的 `TableProvider`
 
 ### `src/catalog/register.rs`
 
-Responsibility:
+职责:
 
-- create the catalog provider graph
-- register it into a `SessionContext`
-- keep registration logic out of `lib.rs`
+- 构建 catalog provider 图
+- 将其注册进 `SessionContext`
+- 让注册逻辑保持在 `lib.rs` 之外
 
 ### `src/table/predicate.rs`
 
-Responsibility:
+职责:
 
-- inspect DataFusion filter expressions
-- detect complete primary-key equality predicates for KV tables
-- classify unsupported patterns clearly
+- 检查 DataFusion filter 表达式
+- 为 KV tables 识别完整 primary-key 等值谓词
+- 清晰地归类不支持的模式
 
-Phase 1 accepted KV pattern:
+Phase 1 接受的 KV 模式:
 
-- `pk1 = value AND pk2 = value ...` for the full primary key
+- 针对完整 primary key 的 `pk1 = value AND pk2 = value ...`
 
-Phase 1 rejected KV patterns:
+Phase 1 拒绝的 KV 模式:
 
-- partial primary key filters
+- 部分 primary key 过滤
 - `IN (...)`
-- non-primary-key filters
-- prefix patterns
-- range scans
+- 非 primary-key 过滤
+- prefix 模式
+- range scan
 
 ### `src/table/kv.rs`
 
-Responsibility:
+职责:
 
-- implement KV `TableProvider`
-- advertise supported filter pushdown
-- build a lookup execution plan when filters fully match the primary key
+- 实现 KV `TableProvider`
+- 声明所支持的 filter pushdown
+- 当 filter 完全匹配 primary key 时,构建 lookup execution plan
 
-Important rule:
+重要规则:
 
-- when the query does not match the supported KV pattern, do not silently fall back to a full scan
-- return a clear unsupported-query error instead
+- 当查询不匹配所支持的 KV 模式时,不要静默退化为 full scan
+- 应返回清晰的 unsupported-query 错误
 
 ### `src/table/log.rs`
 
-Responsibility:
+职责:
 
-- implement log `TableProvider`
-- require `LIMIT`
-- build the bounded log execution plan
+- 实现 log `TableProvider`
+- 强制要求 `LIMIT`
+- 构建有界的 log execution plan
 
-Important rule:
+重要规则:
 
-- log tables without `LIMIT` must fail with `LimitRequired`
+- 没有 `LIMIT` 的 log table 必须以 `LimitRequired` 失败
 
 ### `src/execution/lookup.rs`
 
-Responsibility:
+职责:
 
-- implement the DataFusion `ExecutionPlan` for KV point lookup
-- execute through `Lookuper::lookup`
-- emit a `SendableRecordBatchStream`
+- 为 KV point lookup 实现 DataFusion `ExecutionPlan`
+- 通过 `Lookuper::lookup` 执行
+- 产出 `SendableRecordBatchStream`
 
 ### `src/execution/log_scan.rs`
 
-Responsibility:
+职责:
 
-- implement the DataFusion `ExecutionPlan` for bounded log reads
-- reuse existing Fluss scan/reader building blocks
-- emit a `SendableRecordBatchStream`
+- 为有界 log 读取实现 DataFusion `ExecutionPlan`
+- 复用现有的 Fluss scan/reader 构件
+- 产出 `SendableRecordBatchStream`
 
 ### `src/execution/stream.rs`
 
-Responsibility:
+职责:
 
-- adapt lookup or scan outputs into DataFusion streams
-- keep drop behavior simple and cooperative
+- 将 lookup 或 scan 的输出适配为 DataFusion streams
+- 保持 drop 行为简单且具备协作式(cooperative)取消
 
 ### `src/types/schema.rs`
 
-Responsibility:
+职责:
 
-- centralize schema conversion glue that is specific to DataFusion integration
-- reuse `fluss::record::arrow::to_arrow_schema` whenever possible
+- 集中处理 DataFusion 集成特有的 schema 转换胶水代码
+- 尽量复用 `fluss::record::arrow::to_arrow_schema`
 
 ### `src/types/scalar.rs`
 
-Responsibility:
+职责:
 
-- convert DataFusion `ScalarValue` into the Fluss row/key representation needed by lookup execution
-- validate types strictly and fail loudly on unsupported conversions
+- 将 DataFusion `ScalarValue` 转换为 lookup execution 所需的 Fluss row/key 表示
+- 严格校验类型,遇到不支持的转换时显式失败
 
 ### `src/types/record_batch.rs`
 
-Responsibility:
+职责:
 
-- adapt existing Fluss batch results into DataFusion-friendly batch outputs
-- avoid duplicating low-level Arrow assembly logic already present in `fluss`
+- 将现有的 Fluss batch 结果适配为对 DataFusion 友好的 batch 输出
+- 避免重复 `fluss` 中已有的底层 Arrow 组装逻辑
 
 ### `src/error.rs`
 
-Define a crate-specific error model, for example:
+定义 crate 专属的错误模型,例如:
 
 ```rust
 pub enum FlussDatafusionError {
@@ -408,124 +408,124 @@ pub enum FlussDatafusionError {
 }
 ```
 
-The crate must not encode PostgreSQL- or gateway-specific errors.
+该 crate 不得编码 PostgreSQL 或 gateway 专属的错误。
 
-## Phase 1 Query Semantics
+## Phase 1 查询语义
 
 ## KV tables
 
-Phase 1 KV support is intentionally strict.
+Phase 1 的 KV 支持刻意严格。
 
-Supported:
+支持:
 
-- full primary-key equality predicates only
+- 仅完整 primary-key 等值谓词
 
-Unsupported:
+不支持:
 
-- partial-key scans
-- prefix scans
-- range scans
-- non-key filter pushdown
-- hidden fallback full scans
+- 部分 key scan
+- prefix scan
+- range scan
+- 非 key 的 filter pushdown
+- 隐藏的退化 full scan
 
-Recommendation:
+建议:
 
-- fail clearly for unsupported KV SQL instead of pretending to support more than is truly implemented
+- 对不支持的 KV SQL 直接清晰失败,而非假装支持超出实际实现的能力
 
 ## Log tables
 
-Phase 1 log support must be conservative.
+Phase 1 的 log 支持必须保守。
 
-Locked decisions for Phase 1:
+Phase 1 已锁定的决策:
 
-1. `LIMIT` is mandatory.
-2. Projection pushdown is supported.
-3. Offset pseudo columns are not exposed.
-4. Offset predicates are not supported.
-5. Bucket-local order follows existing Fluss log read semantics.
-6. Cross-bucket global row order is unspecified unless a future version implements stronger ordering semantics.
+1. `LIMIT` 为强制项。
+2. 支持 projection pushdown。
+3. 不暴露 offset 伪列。
+4. 不支持 offset 谓词。
+5. bucket 内顺序沿用现有的 Fluss log 读取语义。
+6. 除非未来版本实现更强的 ordering 语义,否则跨 bucket 的全局 row 顺序不作保证。
 
-Recommended initial behavior:
+建议的初始行为:
 
-- read from earliest available offsets
-- bound the read by the SQL `LIMIT`
-- keep the contract narrow and document that `ORDER BY` pushdown is out of scope
+- 从最早可用的 offset 开始读取
+- 由 SQL `LIMIT` 限定读取量
+- 保持契约狭窄,并明确文档说明 `ORDER BY` pushdown 不在范围内
 
-This keeps the crate aligned with existing Fluss client capabilities and avoids overpromising SQL semantics that are not yet implemented.
+这样可使 crate 与现有 Fluss client 能力保持一致,避免对尚未实现的 SQL 语义过度承诺。
 
-## Dependency Plan
+## 依赖计划
 
-### Root `Cargo.toml`
+### 根 `Cargo.toml`
 
-Update the workspace root file:
+更新 workspace 根文件:
 
-- add `crates/fluss-datafusion` to `[workspace].members`
-- add `datafusion` to `[workspace.dependencies]`
-- add any directly needed supporting crates there if the workspace wants to share versions
+- 在 `[workspace].members` 中加入 `crates/fluss-datafusion`
+- 在 `[workspace.dependencies]` 中加入 `datafusion`
+- 若 workspace 希望统一版本,可在此加入其他直接需要的支持 crate
 
 ### `crates/fluss-datafusion/Cargo.toml`
 
-Expected dependencies:
+预期依赖:
 
 - `fluss = { workspace = true }`
 - `arrow = { workspace = true }`
 - `tokio = { workspace = true }`
-- `serde` and `serde_json` only if needed
+- 仅在需要时引入 `serde` 与 `serde_json`
 - `datafusion`
-- `async-trait` only if truly needed
-- small utility crates only when justified
+- 仅在确有必要时引入 `async-trait`
+- 仅在合理时引入小型 utility crate
 
-Guideline:
+准则:
 
-- keep the new crate dependency surface narrow
-- do not pull gateway or PostgreSQL compatibility crates into this crate
+- 保持新 crate 的依赖面狭窄
+- 不要把 gateway 或 PostgreSQL 兼容 crate 拉进本 crate
 
-## Testing Strategy
+## 测试策略
 
-### Unit tests
+### 单元测试(Unit tests)
 
-Colocate focused unit tests with the modules they validate.
+把聚焦的单元测试与其所验证的模块放在一起。
 
-Required coverage:
+必需覆盖:
 
-- predicate recognition
-- `ScalarValue` conversion
-- schema mapping glue
-- pushdown decision behavior
-- error mapping behavior
+- predicate 识别
+- `ScalarValue` 转换
+- schema 映射胶水代码
+- pushdown 决策行为
+- 错误映射行为
 
-### Integration tests
+### 集成测试(Integration tests)
 
-Create:
+创建:
 
 - `crates/fluss-datafusion/tests/test_fluss_datafusion.rs`
 - `crates/fluss-datafusion/tests/integration/*`
 
-Suggested pattern:
+建议模式:
 
-- mirror `crates/fluss/tests/test_fluss.rs`
-- gate cluster-backed integration tests behind an `integration_tests` feature
-- build a local `tests/integration/utils.rs` on top of `fluss-test-cluster`
+- 参照 `crates/fluss/tests/test_fluss.rs`
+- 用 `integration_tests` feature 对依赖 cluster 的集成测试进行 gate
+- 在 `fluss-test-cluster` 之上构建本地 `tests/integration/utils.rs`
 
-Integration cases required in Phase 1:
+Phase 1 必需的集成用例:
 
 1. `catalog.rs`
-   - registering a catalog exposes databases and tables
+   - 注册 catalog 后能暴露 databases 与 tables
 2. `kv_lookup.rs`
-   - SQL with complete primary-key equality returns the expected row
-   - composite primary-key equality also works
-   - unsupported predicates fail clearly
+   - 带完整 primary-key 等值的 SQL 返回期望 row
+   - 复合 primary-key 等值同样可用
+   - 不支持的谓词清晰失败
 3. `log_scan.rs`
-   - log table queries require `LIMIT`
-   - bounded log scan returns rows
-   - projection pushdown works
+   - log table 查询要求 `LIMIT`
+   - 有界 log scan 返回 rows
+   - projection pushdown 可用
 4. `explain.rs`
-   - `EXPLAIN` shows the custom execution plan name
-   - unsupported plans are not misrepresented as pushed down
+   - `EXPLAIN` 显示自定义 execution plan 名称
+   - 不支持的 plan 不会被误报为已 pushdown
 
-### Validation commands
+### 验证命令
 
-At minimum, Phase 1 work should pass:
+Phase 1 工作至少应通过:
 
 ```bash
 cargo check --workspace
@@ -533,17 +533,19 @@ cargo test -p fluss-datafusion
 cargo test -p fluss-datafusion --features integration_tests
 ```
 
-If integration tests are slow or environment-sensitive, keep the feature gate explicit.
+若集成测试较慢或对环境敏感,保持 feature gate 显式。
 
-## File-Level Implementation Tasks
+## 文件级实现任务
 
-## Task 1: workspace and crate skeleton
+> 任务进度不记录在本文件中。各 Task 的状态见独立的临时文档 `docs/fluss-datafusion-phase1-status.md`,Phase 1 全部完成后删除该文档。
 
-Goal:
+## Task 1: workspace 与 crate 骨架
 
-- introduce the new crate cleanly into the workspace
+目标:
 
-Files:
+- 将新 crate 干净地引入 workspace
+
+文件:
 
 - `Cargo.toml`
 - `crates/fluss-datafusion/Cargo.toml`
@@ -552,24 +554,24 @@ Files:
 - `crates/fluss-datafusion/src/error.rs`
 - `crates/fluss-datafusion/src/install.rs`
 
-Deliverables:
+交付物:
 
-- workspace member added
-- dependency line added
-- crate builds
-- public API shape compiles even if internals are stubbed
+- 加入 workspace member
+- 加入依赖行
+- crate 可构建
+- 即使内部为桩(stub),公共 API 形状也能编译
 
-Validation:
+验证:
 
 - `cargo check -p fluss-datafusion`
 
-## Task 2: metadata cache and registration path
+## Task 2: metadata cache 与注册路径
 
-Goal:
+目标:
 
-- make `register_catalog()` create a real Fluss catalog tree backed by shared metadata
+- 让 `register_catalog()` 创建一棵由共享 metadata 支撑的真实 Fluss catalog 树
 
-Files:
+文件:
 
 - `crates/fluss-datafusion/src/metadata/mod.rs`
 - `crates/fluss-datafusion/src/metadata/cache.rs`
@@ -579,23 +581,23 @@ Files:
 - `crates/fluss-datafusion/src/catalog/schema.rs`
 - `crates/fluss-datafusion/src/catalog/register.rs`
 
-Deliverables:
+交付物:
 
-- catalog registration works against a `SessionContext`
-- database and table listing use shared metadata state
-- no per-session full metadata warmup
+- catalog 注册可对 `SessionContext` 生效
+- database 与 table 列举使用共享 metadata 状态
+- 不做 per-session 的全量 metadata 预热
 
-Validation:
+验证:
 
-- integration test for catalog registration and listing
+- catalog 注册与列举的集成测试
 
-## Task 3: KV predicate analysis and lookup execution
+## Task 3: KV 谓词分析与 lookup 执行
 
-Goal:
+目标:
 
-- support the narrow KV pushdown path for complete primary-key equality
+- 支持针对完整 primary-key 等值的狭窄 KV pushdown 路径
 
-Files:
+文件:
 
 - `crates/fluss-datafusion/src/table/mod.rs`
 - `crates/fluss-datafusion/src/table/predicate.rs`
@@ -607,50 +609,50 @@ Files:
 - `crates/fluss-datafusion/src/types/scalar.rs`
 - `crates/fluss-datafusion/src/types/record_batch.rs`
 
-Deliverables:
+交付物:
 
-- full primary-key equality is recognized
-- lookup execution runs through existing Fluss lookup APIs
-- unsupported KV SQL returns a clear error
+- 能识别完整 primary-key 等值
+- lookup 执行走现有 Fluss lookup API
+- 不支持的 KV SQL 返回清晰错误
 
-Validation:
+验证:
 
-- unit tests for predicate matching and scalar conversion
-- integration tests for single-key and composite-key SQL lookups
-- `EXPLAIN` shows the custom lookup plan
+- predicate 匹配与 scalar 转换的单元测试
+- 单 key 与复合 key SQL lookup 的集成测试
+- `EXPLAIN` 显示自定义 lookup plan
 
-## Task 4: log bounded scan execution
+## Task 4: log 有界扫描执行
 
-Goal:
+目标:
 
-- support the narrow log read path with `LIMIT` required
+- 支持要求 `LIMIT` 的狭窄 log 读取路径
 
-Files:
+文件:
 
 - `crates/fluss-datafusion/src/table/log.rs`
 - `crates/fluss-datafusion/src/execution/log_scan.rs`
 - `crates/fluss-datafusion/src/types/schema.rs`
 - `crates/fluss-datafusion/src/types/record_batch.rs`
 
-Deliverables:
+交付物:
 
-- log `TableProvider` requires `LIMIT`
-- bounded execution emits `RecordBatch` stream output
-- projection pushdown works
+- log `TableProvider` 要求 `LIMIT`
+- 有界执行产出 `RecordBatch` stream 输出
+- projection pushdown 可用
 
-Validation:
+验证:
 
-- integration tests for log query with `LIMIT`
-- integration tests for missing-`LIMIT` error
-- `EXPLAIN` shows the custom log scan plan
+- 带 `LIMIT` 的 log 查询集成测试
+- 缺失 `LIMIT` 报错的集成测试
+- `EXPLAIN` 显示自定义 log scan plan
 
-## Task 5: crate-local integration test harness
+## Task 5: crate 本地集成测试 harness
 
-Goal:
+目标:
 
-- make the new crate independently testable with a real cluster
+- 让新 crate 能独立地针对真实 cluster 测试
 
-Files:
+文件:
 
 - `crates/fluss-datafusion/tests/test_fluss_datafusion.rs`
 - `crates/fluss-datafusion/tests/integration/utils.rs`
@@ -659,52 +661,52 @@ Files:
 - `crates/fluss-datafusion/tests/integration/log_scan.rs`
 - `crates/fluss-datafusion/tests/integration/explain.rs`
 
-Deliverables:
+交付物:
 
-- feature-gated integration test entrypoint
-- local helper utilities built on `fluss-test-cluster`
-- end-to-end test coverage for the supported Phase 1 SQL paths
+- 受 feature gate 的集成测试入口
+- 构建在 `fluss-test-cluster` 之上的本地 helper 工具
+- 对 Phase 1 所支持 SQL 路径的端到端测试覆盖
 
-Validation:
+验证:
 
 - `cargo test -p fluss-datafusion --features integration_tests`
 
-## Recommended Execution Order for Sub-agents
+## 推荐的 sub-agent 执行顺序
 
-Use sequential sub-agent work in this order:
+按以下顺序串行推进 sub-agent 工作:
 
-1. Task 1: workspace and crate skeleton
-2. Task 2: metadata cache and registration path
-3. Task 3: KV predicate analysis and lookup execution
-4. Task 4: log bounded scan execution
-5. Task 5: crate-local integration test harness
+1. Task 1: workspace 与 crate 骨架
+2. Task 2: metadata cache 与注册路径
+3. Task 3: KV 谓词分析与 lookup 执行
+4. Task 4: log 有界扫描执行
+5. Task 5: crate 本地集成测试 harness
 
-Why this order:
+为何采用此顺序:
 
-- Task 2 depends on the crate existing
-- Task 3 and Task 4 depend on catalog and table plumbing
-- Task 5 is easiest to finalize once real behaviors exist, even if test scaffolding can begin earlier
+- Task 2 依赖 crate 已存在
+- Task 3 与 Task 4 依赖 catalog 与 table 的管道
+- 一旦真实行为存在,Task 5 最容易收尾(尽管测试脚手架可更早开始)
 
-## Out-of-repo Follow-up
+## 仓库外的后续工作
 
-This document only covers `fluss-rust` work.
+本文档只覆盖 `fluss-rust` 内的工作。
 
-After Phase 1 lands here, `fluss-gateway` follow-up should:
+Phase 1 在此落地后,`fluss-gateway` 的后续工作应:
 
-1. create one shared `FlussDatafusion` per cluster/proxy connection
-2. call `register_catalog(&ctx, "fluss", ...)` when a SQL session builds a fresh `SessionContext`
-3. layer gateway-specific SQL environment setup on top of the real Fluss catalog
-4. keep `pg_catalog`, session variables, auth, timeout, and cancel semantics in gateway, not here
+1. 为每个 cluster/proxy 连接创建一个共享的 `FlussDatafusion`
+2. 当某个 SQL session 构建新的 `SessionContext` 时,调用 `register_catalog(&ctx, "fluss", ...)`
+3. 在真实 Fluss catalog 之上叠加 gateway 专属的 SQL 环境设置
+4. 把 `pg_catalog`、session 变量、auth、timeout 与 cancel 语义保留在 gateway,而非此处
 
-## Summary
+## 小结
 
-Phase 1 should add a new reusable crate at `crates/fluss-datafusion/`, not under `integration/`.
+Phase 1 应在 `crates/fluss-datafusion/` 新增一个可复用 crate,而非放在 `integration/` 下。
 
-The implementation should stay narrow:
+实现应保持狭窄:
 
-- shared metadata-backed catalog registration
-- KV full-primary-key equality pushdown
-- log bounded scan with `LIMIT` required
-- real-cluster integration tests
+- 由共享 metadata 支撑的 catalog 注册
+- KV 完整 primary-key 等值 pushdown
+- 要求 `LIMIT` 的 log 有界扫描
+- 真实 cluster 的集成测试
 
-This keeps the crate aligned with the existing `fluss` client architecture and gives later `fluss-gateway` work a stable installer-style integration point.
+这样可使该 crate 与现有 `fluss` client 架构保持一致,并为日后 `fluss-gateway` 的工作提供稳定的 installer 式集成点。
