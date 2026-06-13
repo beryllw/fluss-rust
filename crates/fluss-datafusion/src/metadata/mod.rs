@@ -15,20 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration test modules for fluss-datafusion.
+//! Shared metadata loading and cache behaviour.
 //!
-//! - `utils`: shared helpers + fixture paths (always compiled).
-//! - `replay`: cluster-free fake replay tests (`test-fake`).
-//! - `catalog`: cluster-free `register_catalog` + metadata-cache tests (`test-fake`).
-//! - `capture`: real-cluster fixture capture (`integration_tests`).
+//! `cache` owns the lock-protected snapshot; `loader` fronts the [`FlussSource`]
+//! seam with that cache. Both are session-agnostic and shared via the installer.
 
-pub mod utils;
+pub(crate) mod cache;
+pub(crate) mod loader;
 
-#[cfg(feature = "test-fake")]
-pub mod replay;
-
-#[cfg(feature = "test-fake")]
-pub mod catalog;
-
-#[cfg(feature = "integration_tests")]
-pub mod capture;
+pub(crate) use cache::MetadataCache;
+pub(crate) use loader::MetadataLoader;

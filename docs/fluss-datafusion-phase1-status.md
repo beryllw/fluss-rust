@@ -7,7 +7,7 @@
 |---|---|
 | Task 1: workspace 与 crate 骨架 | 已完成 |
 | Task 2: `FlussSource` seam + fake 测试 harness | 已完成 |
-| Task 3: metadata cache 与注册路径 | 未开始 |
+| Task 3: metadata cache 与注册路径 | 已完成 |
 | Task 4: KV 谓词分析与 lookup 执行 | 未开始 |
 | Task 5: log 有界扫描执行 | 未开始 |
 | Task 6: Docker 端到端集成测试 | 未开始 |
@@ -31,3 +31,13 @@
 - `TableInfo` 不支持 serde,故 seam 返回 crate 自有的精简 `FlussTableMeta`(schema + primary_keys + num_buckets 等),可经 fixtures round-trip。
 - `new()` 内部构造 real source;`new_with_source(...)` 作为 `#[cfg(feature="test-fake")] pub` 测试注入入口,不进真实公共 API。
 - 独立子 agent 验收通过:`cargo check --workspace` 干净;`cargo test -p fluss-datafusion --features test-fake` 8/8 通过且不依赖 Docker;tamper test(篡改 fixture 中捕获的 int32 值 `2 -> 7`)触发预期断言失败,证明 replay 测试非空洞,随后已精确还原(SHA-256 一致)。
+
+## Task 3: metadata cache 与注册路径
+
+- 状态:已完成
+- 新增 `src/metadata/{mod,cache,loader}.rs`:`MetadataLoader` 仅依赖 `SharedFlussSource`(不直接持有 `FlussConnection`/`FlussAdmin`);`MetadataCache` 为 `RwLock` 保护的快照(db/table 列举 + 每表 `TableEntry{meta, arrow_schema}`),按条目 `Instant` 做 TTL;锁 guard 读取/克隆后即释放,绝不跨 `.await` 持有。
+- 新增 `src/catalog/{mod,provider,schema,register}.rs`:`FlussCatalogProvider`(同步 `schema_names`/`schema`)把 Fluss database 映射为 schema;`FlussSchemaProvider` 在异步 `table()` 中懒加载每表 meta + Arrow schema;`build_catalog_provider` 组装并由 `register_catalog` 调 `ctx.register_catalog(...)` 生效。
+- Arrow schema 经 `fluss::record::to_arrow_schema(meta.schema.row_type())` 转换,不重复实现 Fluss->Arrow 映射。
+- 占位 `TableProvider`(`FlussTablePlaceholder`)只暴露正确的 Arrow `schema()`;`scan()` 返回 `UnsupportedQueryPattern`(按 `has_primary_key()` 区分 KV/log 文案),保守失败、绝不静默退化为 full scan;真实 scan 留待 Task 4/5。未新增 `src/table/*`、`src/execution/*`。
+- `install.rs` 的 `Inner` 持有共享 `Arc<MetadataLoader>`(`new` 与 `new_with_source` 共用),使 cache 跨 `SessionContext` 复用;移除了过时的 `source()` accessor 与 dead `Inner.source` 字段(loader 持有唯一 source handle)。
+- 独立子 agent 验收通过:`cargo check -p fluss-datafusion`(默认构建,零 warning)、`cargo check --workspace`、`cargo test -p fluss-datafusion --features test-fake` 11/11 通过(8 replay + 3 catalog)且不依赖 Docker。perturbation test:临时让 loader 列举路径跳过 cache 强制重取,`shared_metadata_is_reused_across_contexts` 如预期失败(second `register_catalog` 重打 source),随后精确还原,证明共享 cache 测试非空洞。

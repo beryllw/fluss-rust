@@ -22,8 +22,10 @@ use fluss::client::FlussConnection;
 
 use crate::backend::SharedFlussSource;
 use crate::backend::real::RealFlussSource;
+use crate::catalog::build_catalog_provider;
 use crate::config::{FlussDatafusionOptions, RegisterCatalogOptions};
-use crate::error::{FlussDatafusionError, Result};
+use crate::error::Result;
+use crate::metadata::{MetadataCache, MetadataLoader};
 
 /// Shared, stateless installer for Fluss DataFusion integration.
 ///
@@ -35,10 +37,12 @@ pub struct FlussDatafusion {
 }
 
 struct Inner {
-    /// The single internal access seam. `new()` wraps a real connection; tests
-    /// inject a fake. The rest of the crate depends only on this trait object.
-    source: SharedFlussSource,
     options: FlussDatafusionOptions,
+    /// Shared, session-agnostic metadata loader (fronts the source with a cache).
+    /// One instance per installer, reused across every `SessionContext`. The loader
+    /// owns the single `FlussSource` handle; the rest of the crate reaches Fluss
+    /// only through it.
+    loader: Arc<MetadataLoader>,
 }
 
 impl FlussDatafusion {
@@ -51,9 +55,7 @@ impl FlussDatafusion {
         options: FlussDatafusionOptions,
     ) -> Result<Self> {
         let source: SharedFlussSource = Arc::new(RealFlussSource::new(connection));
-        Ok(Self {
-            inner: Arc::new(Inner { source, options }),
-        })
+        Ok(Self::from_source(source, options))
     }
 
     /// Test-only constructor that injects an arbitrary [`FlussSource`].
@@ -63,16 +65,15 @@ impl FlussDatafusion {
     /// public API.
     #[cfg(feature = "test-fake")]
     pub fn new_with_source(source: SharedFlussSource, options: FlussDatafusionOptions) -> Self {
-        Self {
-            inner: Arc::new(Inner { source, options }),
-        }
+        Self::from_source(source, options)
     }
 
-    /// Internal accessor for the shared source, used by catalog/execution wiring
-    /// in later tasks.
-    #[allow(dead_code)]
-    pub(crate) fn source(&self) -> &SharedFlussSource {
-        &self.inner.source
+    fn from_source(source: SharedFlussSource, options: FlussDatafusionOptions) -> Self {
+        let cache = Arc::new(MetadataCache::new(options.metadata_cache_ttl));
+        let loader = Arc::new(MetadataLoader::new(source, cache));
+        Self {
+            inner: Arc::new(Inner { options, loader }),
+        }
     }
 
     /// Internal accessor for installer options.
@@ -83,16 +84,17 @@ impl FlussDatafusion {
 
     /// Registers the Fluss catalog tree into a session context.
     ///
-    /// Not implemented yet: catalog/schema/table wiring lands in Task 3+.
+    /// Builds a `CatalogProvider` backed by the shared metadata cache and installs
+    /// it via `ctx.register_catalog`. Repeated calls (including on a fresh context)
+    /// reuse the cached database/table listing and do not re-hit the source.
     pub async fn register_catalog(
         &self,
         ctx: &SessionContext,
         catalog_name: &str,
-        options: RegisterCatalogOptions,
+        _options: RegisterCatalogOptions,
     ) -> Result<()> {
-        let _ = (ctx, catalog_name, options);
-        Err(FlussDatafusionError::internal(
-            "register_catalog is not implemented yet",
-        ))
+        let provider = build_catalog_provider(self.inner.loader.clone()).await?;
+        ctx.register_catalog(catalog_name, provider);
+        Ok(())
     }
 }

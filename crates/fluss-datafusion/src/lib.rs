@@ -16,9 +16,11 @@
 // under the License.
 
 mod backend;
+mod catalog;
 mod config;
 mod error;
 mod install;
+mod metadata;
 
 pub use config::{FlussDatafusionOptions, RegisterCatalogOptions};
 pub use error::{FlussDatafusionError, Result};

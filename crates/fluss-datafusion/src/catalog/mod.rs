@@ -15,20 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration test modules for fluss-datafusion.
+//! DataFusion catalog layer over Fluss metadata.
 //!
-//! - `utils`: shared helpers + fixture paths (always compiled).
-//! - `replay`: cluster-free fake replay tests (`test-fake`).
-//! - `catalog`: cluster-free `register_catalog` + metadata-cache tests (`test-fake`).
-//! - `capture`: real-cluster fixture capture (`integration_tests`).
+//! `provider` is the `CatalogProvider`, `schema` the per-database
+//! `SchemaProvider` (+ a minimal placeholder `TableProvider`), and `register`
+//! builds the tree from the shared metadata snapshot.
 
-pub mod utils;
+pub(crate) mod provider;
+pub(crate) mod register;
+pub(crate) mod schema;
 
-#[cfg(feature = "test-fake")]
-pub mod replay;
-
-#[cfg(feature = "test-fake")]
-pub mod catalog;
-
-#[cfg(feature = "integration_tests")]
-pub mod capture;
+pub(crate) use register::build_catalog_provider;
