@@ -563,13 +563,6 @@ Validation:
 
 - `cargo check -p fluss-datafusion`
 
-Status:
-
-- Completed. Added `crates/fluss-datafusion` as a workspace member with a compiling public API skeleton (`FlussDatafusion`, `FlussDatafusionOptions`, `RegisterCatalogOptions`, `FlussDatafusionError`).
-- Pinned `datafusion = 51.0.0` (aligns with workspace `arrow 57`) and bumped workspace `rust-version` to `1.88` to satisfy DataFusion's MSRV.
-- `register_catalog()` is intentionally a failing stub until Task 2 wires real catalog registration.
-- Verified with `cargo check -p fluss-datafusion` and `cargo check --workspace`. No Task 1 tests added; substantive behavior arrives in Task 2/5.
-
 ## Task 2: metadata cache and registration path
 
 Goal:
