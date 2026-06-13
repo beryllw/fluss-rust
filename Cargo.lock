@@ -1938,8 +1938,15 @@ dependencies = [
 name = "fluss-datafusion"
 version = "0.2.0"
 dependencies = [
+ "arrow",
+ "async-trait",
  "datafusion",
  "fluss-rs",
+ "fluss-test-cluster",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

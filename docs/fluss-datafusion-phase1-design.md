@@ -476,8 +476,8 @@ Phase 1 已锁定的决策:
 
 建议的初始行为:
 
-- 从最早可用的 offset 开始读取
-- 由 SQL `LIMIT` 限定读取量
+- 由 SQL `LIMIT` 限定读取量;scan 起点为最早可用 offset,但底层 Fluss `LimitBatchScanner` 仅保留末尾的 `limit` 行(last-N),而非从最早 offset 起的 first-N
+- Phase 1 仅支持单 bucket 的有界 scan;遇到多 bucket 表以 `UnsupportedQueryPattern` 清晰失败,避免静默丢行(多 bucket 有界执行留待 Task 5)
 - 保持契约狭窄,并明确文档说明 `ORDER BY` pushdown 不在范围内
 
 这样可使 crate 与现有 Fluss client 能力保持一致,避免对尚未实现的 SQL 语义过度承诺。

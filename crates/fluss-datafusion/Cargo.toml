@@ -31,3 +31,22 @@ description = "DataFusion integration for Apache Fluss"
 [dependencies]
 fluss = { workspace = true }
 datafusion = { workspace = true }
+arrow = { workspace = true }
+tokio = { workspace = true }
+async-trait = "0.1"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[features]
+# Cluster-free fast tests: an in-memory `FlussSource` that replays committed
+# fixtures. Exposes `FlussDatafusion::new_with_source` and the fake/loader types.
+test-fake = []
+# Docker-backed integration tests against a real Fluss cluster (e.g. capturing
+# fixtures). Requires a running container runtime.
+integration_tests = []
+
+[dev-dependencies]
+fluss-test-cluster = { path = "../fluss-test-cluster" }
+tokio = { workspace = true }
+arrow = { workspace = true }
+futures = "0.3"
