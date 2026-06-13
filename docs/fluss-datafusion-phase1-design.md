@@ -153,6 +153,11 @@ crates/
       error.rs
       install.rs
 
+      backend/
+        mod.rs
+        real.rs
+        fake.rs        # 仅测试: feature = "test-fake"
+
       metadata/
         mod.rs
         cache.rs
@@ -184,9 +189,11 @@ crates/
 
     tests/
       test_fluss_datafusion.rs
+      fixtures/                  # 从真实集群抓取的快照(committed)
       integration/
-        utils.rs
-        catalog.rs
+        utils.rs                 # 建表/写数据 + 构造 fake 或 real backend
+        capture.rs               # gate: integration_tests, 抓快照写入 fixtures
+        catalog.rs               # SQL 断言: 默认 fake, integration_tests 切 real
         kv_lookup.rs
         log_scan.rs
         explain.rs
@@ -247,7 +254,29 @@ impl FlussDatafusion {
 
 Phase 1 不应暴露 gateway 专属的抽象。
 
+内部实现说明:`new()` 接收具体的 `Arc<FlussConnection>`,但 crate 内部不直接依赖它。`new()` 会把连接包装成内部的 `Arc<dyn FlussSource>`(见 `src/backend/`),所有 metadata / lookup / log scan 调用都走这个 seam。crate 另外提供一个 `pub(crate)` 测试构造入口(例如 `new_with_source(source)`),用于注入 fake,而不把它暴露为公共 API。详见测试策略中的 fake 小节。
+
 ## 内部模块职责
+
+### `src/backend/`(内部访问 seam)
+
+职责:
+
+- 定义 crate 内部唯一依赖的 Fluss 访问 trait `FlussSource`(`pub(crate)`,非公共 API)
+- `real.rs`:基于 `FlussConnection` / `FlussAdmin` / `Lookuper` / scanner 的生产实现
+- `fake.rs`:仅测试用的内存实现,从快照 fixtures replay(见测试策略)
+
+`FlussSource` 只覆盖 Phase 1 真正用到的操作:
+
+- metadata:`list_databases` / `list_tables` / `get_table_info` / `get_table_schema`
+- KV:对完整 primary key 的 `lookup(key) -> RecordBatch`
+- log:有界 scan,产出 `RecordBatch` 流
+
+关键规则:
+
+- `metadata/loader.rs` 与 `execution/*` 不直接持有 `FlussConnection` / `FlussAdmin` / `Lookuper`,只依赖 `FlussSource`
+- 该 trait 是内部测试 seam,不是公共 gateway backend 抽象;不要把 session / protocol / auth 概念塞进它
+- 该 seam(完整 surface)在 Task 2 引入:`real.rs` 包 fluss client,`fake.rs` 从快照 replay;Task 3/4/5 在其上做 DataFusion 集成
 
 ### `src/metadata/cache.rs`
 
@@ -523,6 +552,38 @@ Phase 1 必需的集成用例:
    - `EXPLAIN` 显示自定义 execution plan 名称
    - 不支持的 plan 不会被误报为已 pushdown
 
+### 基于 fake 的快速集成测试(免集群)
+
+Docker 集成测试是真值,但慢且依赖环境。为让 catalog 接线、谓词 pushdown、schema 转换、错误映射这类纯逻辑在没有 Docker 时也能快速验证,引入一条 fake 路径:
+
+- crate 内部统一依赖 `FlussSource` seam(见 `src/backend/`),生产实现包 `FlussConnection`,fake 实现走内存数据。
+- fake 的数据来自真实集群快照(record/replay),而不是手写假数据,这样 fake 与真实 Fluss 的 schema、编码、行内容不易漂移。
+
+数据流:
+
+```text
+real cluster --capture(Docker)--> tests/fixtures (committed) --replay(no cluster)--> fake FlussSource --> DataFusion
+```
+
+- capture:`tests/integration/capture.rs`,受 `integration_tests` gate,连真实集群,记录 Phase 1 用到的响应(list_databases / list_tables / get_table_info / get_table_schema、KV `lookup` 的 key -> RecordBatch、log 有界 scan 的 RecordBatch 序列)。batch 用 Arrow IPC 序列化,metadata 用 serde,统一落到 `tests/fixtures/` 并 commit。
+- replay:`src/backend/fake.rs`(feature `test-fake`)从 fixtures 加载并按请求 replay,不开任何 socket;`tests/integration/*` 的 SQL 测试经 `utils.rs` 的 helper 选择 backend,默认用 fake 跑 `register_catalog` + `ctx.sql(...)`。
+
+fake 路径覆盖:
+
+- catalog / schema / table 列举
+- KV 完整 primary-key 谓词命中 lookup,不支持谓词清晰失败
+- log 必须带 `LIMIT`、有界 scan 产出 rows、projection pushdown
+- schema 转换与错误映射
+- `EXPLAIN` 显示自定义 plan 名称
+
+fake 路径不覆盖(仍由 Docker 集成测试兜底):
+
+- 真实 RPC / 网络 / leader 路由 / 重试语义
+- 真实并发与一致性行为
+- fixtures 过期与真实 cluster 的偏差(靠重跑 capture 刷新)
+
+边界约束(对齐 CLAUDE.md):`FlussSource` 与 fake 都是内部测试 seam,保持 `pub(crate)` / feature-gated,不进公共 API,也不做成 gateway 形状的 backend 抽象。
+
 ### 验证命令
 
 Phase 1 工作至少应通过:
@@ -530,7 +591,8 @@ Phase 1 工作至少应通过:
 ```bash
 cargo check --workspace
 cargo test -p fluss-datafusion
-cargo test -p fluss-datafusion --features integration_tests
+cargo test -p fluss-datafusion --features test-fake          # 免集群, replay fixtures
+cargo test -p fluss-datafusion --features integration_tests  # 需 Docker, 真实集群
 ```
 
 若集成测试较慢或对环境敏感,保持 feature gate 显式。
@@ -565,7 +627,46 @@ cargo test -p fluss-datafusion --features integration_tests
 
 - `cargo check -p fluss-datafusion`
 
-## Task 2: metadata cache 与注册路径
+## Task 2: `FlussSource` seam + fake 测试 harness(测试前置)
+
+目标:
+
+- 先立起测试基础设施,让 Task 3/4/5 都能 test-first(RED-GREEN)开发
+- 引入内部 `FlussSource` seam,并提供一个真实数据驱动的 fake 作为免集群快速测试入口
+
+为何前置:
+
+- 测试用来加速开发、提高交付质量,不排在最后
+- seam + fake 一旦就位,catalog / KV / log 都可先写 fake-backed 测试再实现
+- capture 走底层 fluss client(已存在),不依赖 fluss-datafusion 的 real source,因此可尽早抓到真实快照
+
+文件:
+
+- `crates/fluss-datafusion/src/backend/mod.rs`         # `FlussSource` trait(`pub(crate)`, 完整 surface)
+- `crates/fluss-datafusion/src/backend/real.rs`        # 基于 fluss client 的薄数据访问适配
+- `crates/fluss-datafusion/src/backend/fake.rs`        # feature `test-fake`, 从 fixtures replay
+- `crates/fluss-datafusion/tests/integration/utils.rs` # 建表/写数据 + 构造 fake 或 real backend 的 helper
+- `crates/fluss-datafusion/tests/integration/capture.rs` # gate `integration_tests`, 连真实集群抓快照
+- `crates/fluss-datafusion/tests/fixtures/*`           # committed 快照
+
+交付物:
+
+- 完整定义 `FlussSource`(metadata + KV `lookup` + log 有界 scan 的原子操作),`pub(crate)`, 非公共 API
+- `real.rs`:用 `FlussConnection` / `FlussAdmin` / `Lookuper` / scanner 包装上述操作,返回 `RecordBatch`(复用 fluss 现有 Arrow helper)
+- `capture.rs`:用 `fluss-test-cluster` 建好已知测试表并写入数据,记录 Phase 1 用到的响应写入 `tests/fixtures/`
+  - `list_databases` / `list_tables` / `get_table_info` / `get_table_schema`
+  - KV `lookup`:key -> `RecordBatch`
+  - log 有界 scan:`RecordBatch` 序列
+  - batch 用 Arrow IPC 序列化,metadata 用 serde
+- `fake.rs`:从 fixtures 加载并按 key / 表名 replay,不开任何 socket,实现完整 `FlussSource`
+- `new()` 内部构造 real source;提供 `pub(crate)` 测试注入入口(例如 `new_with_source(source)`)供测试注入 fake
+
+验证:
+
+- `cargo test -p fluss-datafusion --features integration_tests -- capture`  # 抓取/刷新 fixtures(需 Docker)
+- `cargo test -p fluss-datafusion --features test-fake`                       # fake 可注入并 replay(免集群)
+
+## Task 3: metadata cache 与注册路径
 
 目标:
 
@@ -583,15 +684,17 @@ cargo test -p fluss-datafusion --features integration_tests
 
 交付物:
 
+- `metadata/loader.rs` 依赖 `FlussSource` 而非直接持有 `FlussConnection`
 - catalog 注册可对 `SessionContext` 生效
 - database 与 table 列举使用共享 metadata 状态
 - 不做 per-session 的全量 metadata 预热
 
-验证:
+验证(test-first, 默认走 Task 2 的 fake):
 
-- catalog 注册与列举的集成测试
+- `register_catalog` + 列举 databases/tables 的测试
+- 共享 metadata 在 dirty / 新 `SessionContext` 间复用的测试
 
-## Task 3: KV 谓词分析与 lookup 执行
+## Task 4: KV 谓词分析与 lookup 执行
 
 目标:
 
@@ -612,16 +715,17 @@ cargo test -p fluss-datafusion --features integration_tests
 交付物:
 
 - 能识别完整 primary-key 等值
-- lookup 执行走现有 Fluss lookup API
+- lookup 执行经 `FlussSource::lookup` 走现有 Fluss lookup API
 - 不支持的 KV SQL 返回清晰错误
 
-验证:
+验证(test-first, 默认走 Task 2 的 fake):
 
 - predicate 匹配与 scalar 转换的单元测试
-- 单 key 与复合 key SQL lookup 的集成测试
+- 单 key 与复合 key SQL lookup 的测试
+- 不支持谓词清晰失败的测试
 - `EXPLAIN` 显示自定义 lookup plan
 
-## Task 4: log 有界扫描执行
+## Task 5: log 有界扫描执行
 
 目标:
 
@@ -637,35 +741,37 @@ cargo test -p fluss-datafusion --features integration_tests
 交付物:
 
 - log `TableProvider` 要求 `LIMIT`
-- 有界执行产出 `RecordBatch` stream 输出
+- 有界执行经 `FlussSource` 的 scan 产出 `RecordBatch` stream 输出
 - projection pushdown 可用
 
-验证:
+验证(test-first, 默认走 Task 2 的 fake):
 
-- 带 `LIMIT` 的 log 查询集成测试
-- 缺失 `LIMIT` 报错的集成测试
+- 带 `LIMIT` 的 log 查询测试
+- 缺失 `LIMIT` 报错的测试
+- projection pushdown 的测试
 - `EXPLAIN` 显示自定义 log scan plan
 
-## Task 5: crate 本地集成测试 harness
+## Task 6: Docker 端到端集成测试(真值兜底)
 
 目标:
 
-- 让新 crate 能独立地针对真实 cluster 测试
+- 在真实 cluster 上端到端验证完整 real 路径,作为 fake 测试的真值兜底
 
 文件:
 
 - `crates/fluss-datafusion/tests/test_fluss_datafusion.rs`
-- `crates/fluss-datafusion/tests/integration/utils.rs`
 - `crates/fluss-datafusion/tests/integration/catalog.rs`
 - `crates/fluss-datafusion/tests/integration/kv_lookup.rs`
 - `crates/fluss-datafusion/tests/integration/log_scan.rs`
 - `crates/fluss-datafusion/tests/integration/explain.rs`
+- (复用 Task 2 的 `tests/integration/utils.rs`)
 
 交付物:
 
-- 受 feature gate 的集成测试入口
-- 构建在 `fluss-test-cluster` 之上的本地 helper 工具
-- 对 Phase 1 所支持 SQL 路径的端到端测试覆盖
+- 受 `integration_tests` gate 的入口:把 Task 3/4/5 的 SQL 测试切到 real backend,在真实 cluster 上跑通
+- 覆盖 Phase 1 SQL 路径:catalog 列举、KV point lookup、log 有界 scan、`EXPLAIN`
+- 拥有 fake 覆盖不到的真值断言:真实 RPC / 网络 / leader 路由 / 并发语义
+- 校验 fixtures 与真实 cluster 不漂移(必要时重跑 capture 刷新)
 
 验证:
 
@@ -676,16 +782,18 @@ cargo test -p fluss-datafusion --features integration_tests
 按以下顺序串行推进 sub-agent 工作:
 
 1. Task 1: workspace 与 crate 骨架
-2. Task 2: metadata cache 与注册路径
-3. Task 3: KV 谓词分析与 lookup 执行
-4. Task 4: log 有界扫描执行
-5. Task 5: crate 本地集成测试 harness
+2. Task 2: `FlussSource` seam + fake 测试 harness(测试前置)
+3. Task 3: metadata cache 与注册路径
+4. Task 4: KV 谓词分析与 lookup 执行
+5. Task 5: log 有界扫描执行
+6. Task 6: Docker 端到端集成测试(真值兜底)
 
 为何采用此顺序:
 
-- Task 2 依赖 crate 已存在
-- Task 3 与 Task 4 依赖 catalog 与 table 的管道
-- 一旦真实行为存在,Task 5 最容易收尾(尽管测试脚手架可更早开始)
+- 测试前置:Task 2 先立起 seam + fake + 真实数据 capture,让 Task 3/4/5 都能 test-first 开发
+- Task 2 的 capture 走底层 fluss client,不依赖后续 real source,可尽早抓到真实快照
+- Task 3 / 4 / 5 依赖骨架(Task 1)与 fake harness(Task 2),边写 fake-backed 测试边实现
+- Task 6 收尾:在真实 cluster 上验证 real 路径,补齐 fake 覆盖不到的 RPC / 网络 / 并发语义
 
 ## 仓库外的后续工作
 
