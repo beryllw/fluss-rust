@@ -22,71 +22,19 @@
 //!
 //! Available only under `test-fake`. Opens zero sockets.
 
-#![cfg(feature = "test-fake")]
+use arrow::array::{Array, StringArray};
 
-use std::time::Duration;
-
-use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
-use datafusion::execution::context::SessionContext;
-
-use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
-
-use crate::integration::utils::{fake_source, fixtures_present, names};
-
-/// Skips when fixtures are not present (mirrors `kv_lookup.rs`/`replay.rs`).
-macro_rules! require_fixtures {
-    () => {
-        if !fixtures_present() {
-            eprintln!(
-                "skipping: no committed fixtures at {} (run capture with --features integration_tests)",
-                crate::integration::utils::fixture_path().display()
-            );
-            return;
-        }
-    };
-}
-
-fn options() -> FlussDatafusionOptions {
-    FlussDatafusionOptions {
-        metadata_cache_ttl: Duration::from_secs(300),
-        table_cache_capacity: 64,
-    }
-}
-
-const CATALOG: &str = "fluss";
-
-/// Builds a context with the Fluss catalog registered through the fake.
-async fn ctx_with_catalog() -> SessionContext {
-    let fd = FlussDatafusion::new_with_source(fake_source(), options());
-    let ctx = SessionContext::new();
-    fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
-        .await
-        .expect("register_catalog");
-    ctx
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
-}
-
-/// Flattens the `i32` values of column `col` across all batches, in order.
-fn collect_i32(batches: &[RecordBatch], col: usize) -> Vec<i32> {
-    batches
-        .iter()
-        .flat_map(|b| {
-            b.column(col)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("expected int32 column")
-                .values()
-                .to_vec()
-        })
-        .collect()
-}
+use crate::integration::utils::fixtures_ready;
+use crate::integration::utils::helpers::{
+    CATALOG, collect_i32, ctx_with_catalog, expect_query_error, total_rows,
+};
+use crate::integration::utils::names;
 
 #[tokio::test]
 async fn bounded_scan_with_limit_returns_rows() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx
@@ -108,7 +56,9 @@ async fn bounded_scan_with_limit_returns_rows() {
 
 #[tokio::test]
 async fn projection_pushdown_keeps_only_projected_column() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx
@@ -133,22 +83,11 @@ async fn projection_pushdown_keeps_only_projected_column() {
     assert_eq!(collect_i32(&batches, 0), vec![3, 4, 5, 6]);
 }
 
-/// Runs a query expected to be rejected and returns the rendered error.
-async fn expect_query_error(ctx: &SessionContext, sql: &str) -> String {
-    // Failure may surface at planning (`sql`) or at execution (`collect`);
-    // accept either so the conservative-failure contract is fully covered.
-    match ctx.sql(sql).await {
-        Err(e) => e.to_string(),
-        Ok(df) => match df.collect().await {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected query to fail but it succeeded: {sql}"),
-        },
-    }
-}
-
 #[tokio::test]
 async fn missing_limit_fails_clearly() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
     let err = expect_query_error(
         &ctx,
@@ -167,7 +106,9 @@ async fn missing_limit_fails_clearly() {
 
 #[tokio::test]
 async fn explain_shows_custom_log_scan_plan() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx

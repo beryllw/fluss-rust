@@ -28,7 +28,7 @@ use arrow::datatypes::SchemaRef;
 
 use crate::backend::{FlussTableMeta, SharedFlussSource, TableRef};
 use crate::error::Result;
-use crate::metadata::cache::{MetadataCache, TableEntry};
+use crate::metadata::cache::{DatabaseListing, MetadataCache, TableEntry};
 
 /// Loads and caches Fluss metadata behind the [`FlussSource`] seam.
 pub(crate) struct MetadataLoader {
@@ -61,7 +61,7 @@ impl MetadataLoader {
     /// Returns the database -> table-name listing, fetching from the source only
     /// when the shared cache has no fresh snapshot. This is the single full-cluster
     /// read; it is shared across all `SessionContext`s.
-    pub(crate) async fn databases(&self) -> Result<Vec<(String, Vec<String>)>> {
+    pub(crate) async fn databases(&self) -> Result<DatabaseListing> {
         if let Some(cached) = self.cache.databases() {
             return Ok(cached);
         }

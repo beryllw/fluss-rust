@@ -21,49 +21,18 @@
 //!
 //! Available only under `test-fake`. Opens zero sockets.
 
-#![cfg(feature = "test-fake")]
-
 use arrow::array::{Int32Array, Int64Array};
 
 use fluss_datafusion::testing::{KeyValue, TableRef};
 
-use crate::integration::utils::{fake_source, fixtures_present, names};
-
-/// Skips a replay test (with a clear message) when fixtures are not present.
-///
-/// Fixtures are produced by the `integration_tests` capture path against a real
-/// cluster. Without them there is nothing to replay; failing loudly here would
-/// punish environments that simply have not run capture yet.
-macro_rules! require_fixtures {
-    () => {
-        if !fixtures_present() {
-            eprintln!(
-                "skipping: no committed fixtures at {} (run capture with --features integration_tests)",
-                crate::integration::utils::fixture_path().display()
-            );
-            return;
-        }
-    };
-}
-
-/// Flattens the `i32` values of column `col` across all batches, in order.
-fn collect_i32(batches: &[arrow::array::RecordBatch], col: usize) -> Vec<i32> {
-    batches
-        .iter()
-        .flat_map(|b| {
-            b.column(col)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("expected int32 column")
-                .values()
-                .to_vec()
-        })
-        .collect()
-}
+use crate::integration::utils::helpers::collect_i32;
+use crate::integration::utils::{fake_source, fixtures_ready, names};
 
 #[tokio::test]
 async fn lists_databases_and_tables() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let databases = source.list_databases().await.expect("list_databases");
@@ -87,7 +56,9 @@ async fn lists_databases_and_tables() {
 
 #[tokio::test]
 async fn unknown_database_and_table_fail_clearly() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let err = source.list_tables("does_not_exist").await.unwrap_err();
@@ -112,7 +83,9 @@ async fn unknown_database_and_table_fail_clearly() {
 
 #[tokio::test]
 async fn table_meta_reflects_primary_key() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let kv = source
@@ -143,7 +116,9 @@ async fn table_meta_reflects_primary_key() {
 
 #[tokio::test]
 async fn kv_lookup_present_key_returns_row() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let batch = source
@@ -165,7 +140,9 @@ async fn kv_lookup_present_key_returns_row() {
 
 #[tokio::test]
 async fn kv_lookup_absent_key_returns_empty_batch() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let batch = source
@@ -181,7 +158,9 @@ async fn kv_lookup_absent_key_returns_empty_batch() {
 
 #[tokio::test]
 async fn kv_composite_lookup_returns_row() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let batch = source
@@ -203,7 +182,9 @@ async fn kv_composite_lookup_returns_row() {
 
 #[tokio::test]
 async fn log_bounded_scan_returns_rows() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let batches = source
@@ -220,7 +201,9 @@ async fn log_bounded_scan_returns_rows() {
 
 #[tokio::test]
 async fn log_projected_scan_keeps_only_projected_columns() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let source = fake_source();
 
     let batches = source

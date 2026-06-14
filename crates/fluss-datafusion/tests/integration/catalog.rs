@@ -21,8 +21,6 @@
 //!
 //! Available only under `test-fake`. Opens zero sockets.
 
-#![cfg(feature = "test-fake")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -35,20 +33,8 @@ use datafusion::prelude::SessionConfig;
 use fluss_datafusion::testing::{FlussSource, FlussTableMeta, LookupKey, TableRef};
 use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
 
-use crate::integration::utils::{fake_source, fixtures_present, names};
-
-/// Skips when fixtures are not present (mirrors `replay.rs`).
-macro_rules! require_fixtures {
-    () => {
-        if !fixtures_present() {
-            eprintln!(
-                "skipping: no committed fixtures at {} (run capture with --features integration_tests)",
-                crate::integration::utils::fixture_path().display()
-            );
-            return;
-        }
-    };
-}
+use crate::integration::utils::helpers::{CATALOG, options};
+use crate::integration::utils::{fake_source, fixtures_ready, names};
 
 /// Counts `list_databases` / `list_tables` calls so tests can prove the shared
 /// cache actually prevents re-fetching from the source on a second
@@ -59,7 +45,7 @@ struct CountingSource {
 }
 
 impl CountingSource {
-    fn new(inner: Arc<dyn FlussSource>) -> (Arc<dyn FlussSource>, Arc<AtomicUsize>) {
+    fn wrap(inner: Arc<dyn FlussSource>) -> (Arc<dyn FlussSource>, Arc<AtomicUsize>) {
         let list_calls = Arc::new(AtomicUsize::new(0));
         let src: Arc<dyn FlussSource> = Arc::new(Self {
             inner,
@@ -103,18 +89,11 @@ impl FlussSource for CountingSource {
     }
 }
 
-fn options() -> FlussDatafusionOptions {
-    FlussDatafusionOptions {
-        metadata_cache_ttl: Duration::from_secs(300),
-        table_cache_capacity: 64,
-    }
-}
-
-const CATALOG: &str = "fluss";
-
 #[tokio::test]
 async fn register_catalog_exposes_databases_and_tables() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let fd = FlussDatafusion::new_with_source(fake_source(), options());
     // information_schema is opt-in; enable it so the SQL listing assertion works.
     let ctx = SessionContext::new_with_config(
@@ -173,8 +152,10 @@ async fn register_catalog_exposes_databases_and_tables() {
 
 #[tokio::test]
 async fn shared_metadata_is_reused_across_contexts() {
-    require_fixtures!();
-    let (source, list_calls) = CountingSource::new(fake_source());
+    if !fixtures_ready() {
+        return;
+    }
+    let (source, list_calls) = CountingSource::wrap(fake_source());
     let fd = FlussDatafusion::new_with_source(source, options());
 
     // First context: dirty (already has some objects registered / a query run).
@@ -224,8 +205,43 @@ async fn shared_metadata_is_reused_across_contexts() {
 }
 
 #[tokio::test]
+async fn expired_metadata_is_refetched() {
+    if !fixtures_ready() {
+        return;
+    }
+    let (source, list_calls) = CountingSource::wrap(fake_source());
+    // Zero TTL: every cached listing is stale the instant it is stored, so the
+    // second register_catalog must re-hit the source rather than reuse the cache.
+    let fd = FlussDatafusion::new_with_source(
+        source,
+        FlussDatafusionOptions {
+            metadata_cache_ttl: Duration::ZERO,
+        },
+    );
+
+    let ctx_a = SessionContext::new();
+    fd.register_catalog(&ctx_a, CATALOG, RegisterCatalogOptions::default())
+        .await
+        .expect("register a");
+    let after_first = list_calls.load(Ordering::SeqCst);
+    assert!(after_first > 0, "first register must hit the source");
+
+    let ctx_b = SessionContext::new();
+    fd.register_catalog(&ctx_b, CATALOG, RegisterCatalogOptions::default())
+        .await
+        .expect("register b");
+    let after_second = list_calls.load(Ordering::SeqCst);
+    assert!(
+        after_second > after_first,
+        "expired cache must re-fetch listings (first={after_first}, second={after_second})"
+    );
+}
+
+#[tokio::test]
 async fn table_provider_exposes_arrow_schema() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let fd = FlussDatafusion::new_with_source(fake_source(), options());
     let ctx = SessionContext::new();
     fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())

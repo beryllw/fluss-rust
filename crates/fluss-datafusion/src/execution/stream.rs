@@ -63,3 +63,48 @@ where
         .try_flatten();
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use arrow::datatypes::Schema;
+    use futures::StreamExt;
+
+    use super::*;
+
+    /// Drops a marker when the in-flight future is dropped, so the test can prove
+    /// cancellation actually tears the future down.
+    struct DropFlag(Arc<AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_cancels_in_flight_future() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(dropped.clone());
+        let schema = Arc::new(Schema::empty());
+
+        let future = async move {
+            // Hold the flag inside the future, then park forever: only dropping
+            // the stream can run the flag's destructor.
+            let _flag = flag;
+            futures::future::pending::<()>().await;
+            Ok(RecordBatch::new_empty(Arc::new(Schema::empty())))
+        };
+        let mut stream = single_batch_stream(schema, future);
+
+        // Poll once so the future is actually started (and parked), then drop.
+        let _ = futures::poll!(stream.next());
+        assert!(!dropped.load(Ordering::SeqCst), "future still in flight");
+        drop(stream);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the stream must drop the in-flight future"
+        );
+    }
+}

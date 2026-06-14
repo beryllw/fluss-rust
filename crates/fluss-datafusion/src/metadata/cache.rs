@@ -49,6 +49,9 @@ impl<T> Stamped<T> {
     }
 }
 
+/// Database -> ordered table-name listing: the single full-cluster snapshot.
+pub(crate) type DatabaseListing = Vec<(String, Vec<String>)>;
+
 /// Per-table cached metadata: the crate-owned meta plus its derived Arrow schema.
 #[derive(Clone)]
 pub(crate) struct TableEntry {
@@ -68,7 +71,7 @@ pub(crate) struct MetadataCache {
 #[derive(Default)]
 struct Inner {
     /// Cached database -> ordered table-name listing.
-    databases: Option<Stamped<Vec<(String, Vec<String>)>>>,
+    databases: Option<Stamped<DatabaseListing>>,
     /// Cached per-table metadata, keyed by `database.table`.
     tables: HashMap<String, Stamped<TableEntry>>,
 }
@@ -82,7 +85,7 @@ impl MetadataCache {
     }
 
     /// Returns the cached database/table listing if present and within TTL.
-    pub(crate) fn databases(&self) -> Option<Vec<(String, Vec<String>)>> {
+    pub(crate) fn databases(&self) -> Option<DatabaseListing> {
         let guard = self.inner.read().expect("metadata cache poisoned");
         guard
             .databases
@@ -91,7 +94,7 @@ impl MetadataCache {
             .map(|s| s.value.clone())
     }
 
-    pub(crate) fn store_databases(&self, listing: Vec<(String, Vec<String>)>) {
+    pub(crate) fn store_databases(&self, listing: DatabaseListing) {
         let mut guard = self.inner.write().expect("metadata cache poisoned");
         guard.databases = Some(Stamped::new(listing));
     }
@@ -109,5 +112,30 @@ impl MetadataCache {
     pub(crate) fn store_table(&self, key: String, entry: TableEntry) {
         let mut guard = self.inner.write().expect("metadata cache poisoned");
         guard.tables.insert(key, Stamped::new(entry));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listing() -> DatabaseListing {
+        vec![("db".to_string(), vec!["t".to_string()])]
+    }
+
+    #[test]
+    fn fresh_listing_is_returned() {
+        let cache = MetadataCache::new(Duration::from_secs(300));
+        cache.store_databases(listing());
+        assert_eq!(cache.databases(), Some(listing()));
+    }
+
+    #[test]
+    fn expired_listing_is_treated_as_absent() {
+        // A zero TTL makes every entry stale the instant it is stored, so the
+        // `fresh` filter must drop it and force the caller to re-fetch.
+        let cache = MetadataCache::new(Duration::ZERO);
+        cache.store_databases(listing());
+        assert_eq!(cache.databases(), None);
     }
 }

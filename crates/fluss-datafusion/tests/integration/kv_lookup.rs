@@ -22,56 +22,19 @@
 //!
 //! Available only under `test-fake`. Opens zero sockets.
 
-#![cfg(feature = "test-fake")]
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 
-use std::time::Duration;
-
-use arrow::array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
-use datafusion::execution::context::SessionContext;
-
-use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
-
-use crate::integration::utils::{fake_source, fixtures_present, names};
-
-/// Skips when fixtures are not present (mirrors `catalog.rs`/`replay.rs`).
-macro_rules! require_fixtures {
-    () => {
-        if !fixtures_present() {
-            eprintln!(
-                "skipping: no committed fixtures at {} (run capture with --features integration_tests)",
-                crate::integration::utils::fixture_path().display()
-            );
-            return;
-        }
-    };
-}
-
-fn options() -> FlussDatafusionOptions {
-    FlussDatafusionOptions {
-        metadata_cache_ttl: Duration::from_secs(300),
-        table_cache_capacity: 64,
-    }
-}
-
-const CATALOG: &str = "fluss";
-
-/// Builds a context with the Fluss catalog registered through the fake.
-async fn ctx_with_catalog() -> SessionContext {
-    let fd = FlussDatafusion::new_with_source(fake_source(), options());
-    let ctx = SessionContext::new();
-    fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
-        .await
-        .expect("register_catalog");
-    ctx
-}
-
-fn total_rows(batches: &[RecordBatch]) -> usize {
-    batches.iter().map(|b| b.num_rows()).sum()
-}
+use crate::integration::utils::fixtures_ready;
+use crate::integration::utils::helpers::{
+    CATALOG, ctx_with_catalog, expect_query_error, total_rows,
+};
+use crate::integration::utils::names;
 
 #[tokio::test]
 async fn single_pk_equality_returns_matching_row() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx
@@ -110,7 +73,9 @@ async fn single_pk_equality_returns_matching_row() {
 
 #[tokio::test]
 async fn single_pk_absent_key_returns_no_rows() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx
@@ -130,7 +95,9 @@ async fn single_pk_absent_key_returns_no_rows() {
 
 #[tokio::test]
 async fn composite_pk_equality_returns_matching_row() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx
@@ -154,22 +121,11 @@ async fn composite_pk_equality_returns_matching_row() {
     assert_eq!(scores.value(0), 200);
 }
 
-/// Runs a query expected to be rejected and returns the rendered error.
-async fn expect_query_error(ctx: &SessionContext, sql: &str) -> String {
-    // Failure may surface at planning (`sql`) or at execution (`collect`);
-    // accept either so the conservative-failure contract is fully covered.
-    match ctx.sql(sql).await {
-        Err(e) => e.to_string(),
-        Ok(df) => match df.collect().await {
-            Err(e) => e.to_string(),
-            Ok(_) => panic!("expected query to fail but it succeeded: {sql}"),
-        },
-    }
-}
-
 #[tokio::test]
 async fn non_primary_key_predicate_fails_clearly() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
     let err = expect_query_error(
         &ctx,
@@ -188,7 +144,9 @@ async fn non_primary_key_predicate_fails_clearly() {
 
 #[tokio::test]
 async fn partial_composite_key_fails_clearly() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
     let err = expect_query_error(
         &ctx,
@@ -207,7 +165,9 @@ async fn partial_composite_key_fails_clearly() {
 
 #[tokio::test]
 async fn full_scan_without_filter_fails_clearly() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
     let err = expect_query_error(
         &ctx,
@@ -226,7 +186,9 @@ async fn full_scan_without_filter_fails_clearly() {
 
 #[tokio::test]
 async fn in_list_predicate_fails_clearly() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
     let err = expect_query_error(
         &ctx,
@@ -245,7 +207,9 @@ async fn in_list_predicate_fails_clearly() {
 
 #[tokio::test]
 async fn explain_shows_custom_lookup_plan() {
-    require_fixtures!();
+    if !fixtures_ready() {
+        return;
+    }
     let ctx = ctx_with_catalog().await;
 
     let batches = ctx

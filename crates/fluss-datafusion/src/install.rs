@@ -37,7 +37,6 @@ pub struct FlussDatafusion {
 }
 
 struct Inner {
-    options: FlussDatafusionOptions,
     /// Shared, session-agnostic metadata loader (fronts the source with a cache).
     /// One instance per installer, reused across every `SessionContext`. The loader
     /// owns the single `FlussSource` handle; the rest of the crate reaches Fluss
@@ -72,14 +71,8 @@ impl FlussDatafusion {
         let cache = Arc::new(MetadataCache::new(options.metadata_cache_ttl));
         let loader = Arc::new(MetadataLoader::new(source, cache));
         Self {
-            inner: Arc::new(Inner { options, loader }),
+            inner: Arc::new(Inner { loader }),
         }
-    }
-
-    /// Internal accessor for installer options.
-    #[allow(dead_code)]
-    pub(crate) fn options(&self) -> &FlussDatafusionOptions {
-        &self.inner.options
     }
 
     /// Registers the Fluss catalog tree into a session context.

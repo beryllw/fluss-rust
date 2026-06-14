@@ -38,20 +38,12 @@ pub enum FlussDatafusionError {
     SchemaMismatch(String),
     /// A `ScalarValue` could not be converted to a Fluss row/key value.
     TypeConversion(String),
-    /// Shared metadata loading failed.
-    MetadataLoad(String),
     /// An error surfaced from the underlying Fluss client.
     FlussClient(String),
     /// A test fixture could not be loaded or replayed.
     Fixture(String),
     /// An invariant inside the crate was violated.
     Internal(String),
-}
-
-impl FlussDatafusionError {
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal(message.into())
-    }
 }
 
 impl Display for FlussDatafusionError {
@@ -63,7 +55,6 @@ impl Display for FlussDatafusionError {
             Self::LimitRequired(msg) => write!(f, "LIMIT required: {msg}"),
             Self::SchemaMismatch(msg) => write!(f, "schema mismatch: {msg}"),
             Self::TypeConversion(msg) => write!(f, "type conversion error: {msg}"),
-            Self::MetadataLoad(msg) => write!(f, "metadata load error: {msg}"),
             Self::FlussClient(msg) => write!(f, "fluss client error: {msg}"),
             Self::Fixture(msg) => write!(f, "fixture error: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),

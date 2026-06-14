@@ -55,6 +55,27 @@ impl RealFlussSource {
     }
 }
 
+/// Rejects a multi-bucket bounded log scan.
+///
+/// Phase 1 bounded scan reads a single bucket; reading only bucket 0 on a
+/// multi-bucket table would silently drop the other buckets' rows, so fail
+/// loudly instead. Multi-bucket bounded execution lands in a later task.
+fn ensure_single_bucket(table: &TableRef, num_buckets: i32) -> Result<()> {
+    if num_buckets != 1 {
+        return Err(FlussDatafusionError::UnsupportedQueryPattern(format!(
+            "bounded log scan for {table} requires a single bucket, found {num_buckets}"
+        )));
+    }
+    Ok(())
+}
+
+/// Narrows a scan `limit` to the `i32` the fluss scanner API expects.
+fn limit_to_i32(limit: usize) -> Result<i32> {
+    i32::try_from(limit).map_err(|_| {
+        FlussDatafusionError::Internal(format!("log scan limit {limit} exceeds i32 range"))
+    })
+}
+
 /// Builds a `GenericRow` lookup key from the primary-key value list.
 ///
 /// The row has one field per primary-key column, in primary-key order, which is
@@ -115,18 +136,8 @@ impl FlussSource for RealFlussSource {
         let table_id = table_info.get_table_id();
         let num_buckets = table_info.get_num_buckets();
 
-        // Phase 1 bounded log scan reads a single bucket. Reading only bucket 0
-        // on a multi-bucket table would silently drop the other buckets' rows,
-        // so fail loudly instead. Multi-bucket bounded execution lands in Task 5.
-        if num_buckets != 1 {
-            return Err(FlussDatafusionError::UnsupportedQueryPattern(format!(
-                "bounded log scan for {table} requires a single bucket, found {num_buckets}"
-            )));
-        }
-
-        let limit_i32 = i32::try_from(limit).map_err(|_| {
-            FlussDatafusionError::Internal(format!("log scan limit {limit} exceeds i32 range"))
-        })?;
+        ensure_single_bucket(table, num_buckets)?;
+        let limit_i32 = limit_to_i32(limit)?;
 
         let mut scan = table_handle.new_scan();
         if let Some(indices) = projection {
@@ -138,5 +149,39 @@ impl FlussSource for RealFlussSource {
 
         let batches = scanner.collect_all_batches().await?;
         Ok(batches.into_iter().map(|b| b.into_batch()).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table() -> TableRef {
+        TableRef::new("db", "t")
+    }
+
+    #[test]
+    fn single_bucket_is_accepted() {
+        assert!(ensure_single_bucket(&table(), 1).is_ok());
+    }
+
+    #[test]
+    fn multi_bucket_is_rejected_not_silently_partial() {
+        let err = ensure_single_bucket(&table(), 3).unwrap_err();
+        assert!(matches!(
+            err,
+            FlussDatafusionError::UnsupportedQueryPattern(_)
+        ));
+    }
+
+    #[test]
+    fn limit_within_i32_passes_through() {
+        assert_eq!(limit_to_i32(4).unwrap(), 4);
+    }
+
+    #[test]
+    fn limit_beyond_i32_is_rejected() {
+        let err = limit_to_i32(usize::MAX).unwrap_err();
+        assert!(matches!(err, FlussDatafusionError::Internal(_)));
     }
 }

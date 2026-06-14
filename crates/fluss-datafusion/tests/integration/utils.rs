@@ -69,3 +69,84 @@ pub fn fake_source() -> std::sync::Arc<dyn fluss_datafusion::testing::FlussSourc
 pub fn fixtures_present() -> bool {
     fixture_path().exists()
 }
+
+/// Returns `true` when fixtures are present; otherwise logs a skip message and
+/// returns `false` so a test can early-return.
+///
+/// Fixtures are produced by the `integration_tests` capture path against a real
+/// cluster. Without them there is nothing to replay; failing loudly here would
+/// punish environments that simply have not run capture yet.
+#[cfg(feature = "test-fake")]
+pub fn fixtures_ready() -> bool {
+    if fixtures_present() {
+        return true;
+    }
+    eprintln!(
+        "skipping: no committed fixtures at {} (run capture with --features integration_tests)",
+        fixture_path().display()
+    );
+    false
+}
+
+/// Shared SQL-path helpers for the cluster-free (`test-fake`) integration tests.
+#[cfg(feature = "test-fake")]
+pub mod helpers {
+    use arrow::array::{Array, Int32Array, RecordBatch};
+    use datafusion::execution::context::SessionContext;
+
+    use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
+
+    use super::fake_source;
+
+    /// Catalog name every SQL test registers the Fluss catalog under.
+    pub const CATALOG: &str = "fluss";
+
+    /// Default installer options for the fast tests.
+    pub fn options() -> FlussDatafusionOptions {
+        FlussDatafusionOptions::default()
+    }
+
+    /// Builds a context with the Fluss catalog registered through the fake.
+    pub async fn ctx_with_catalog() -> SessionContext {
+        let fd = FlussDatafusion::new_with_source(fake_source(), options());
+        let ctx = SessionContext::new();
+        fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
+            .await
+            .expect("register_catalog");
+        ctx
+    }
+
+    /// Total row count across all batches.
+    pub fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    /// Flattens the `i32` values of column `col` across all batches, in order.
+    pub fn collect_i32(batches: &[RecordBatch], col: usize) -> Vec<i32> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                b.column(col)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("expected int32 column")
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    /// Runs a query expected to be rejected and returns the rendered error.
+    ///
+    /// Failure may surface at planning (`sql`) or at execution (`collect`); accept
+    /// either so the conservative-failure contract is fully covered.
+    pub async fn expect_query_error(ctx: &SessionContext, sql: &str) -> String {
+        match ctx.sql(sql).await {
+            Err(e) => e.to_string(),
+            Ok(df) => match df.collect().await {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("expected query to fail but it succeeded: {sql}"),
+            },
+        }
+    }
+}

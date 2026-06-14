@@ -20,7 +20,14 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct FlussDatafusionOptions {
     pub metadata_cache_ttl: Duration,
-    pub table_cache_capacity: usize,
+}
+
+impl Default for FlussDatafusionOptions {
+    fn default() -> Self {
+        Self {
+            metadata_cache_ttl: Duration::from_secs(300),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
