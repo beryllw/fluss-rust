@@ -26,7 +26,7 @@ use arrow::array::{Array, Int32Array, Int64Array, StringArray};
 
 use crate::integration::utils::fixtures_ready;
 use crate::integration::utils::helpers::{
-    CATALOG, ctx_with_catalog, expect_query_error, total_rows,
+    CATALOG, ctx_with_catalog, expect_query_error, render_explain, total_rows,
 };
 use crate::integration::utils::names;
 
@@ -224,20 +224,7 @@ async fn explain_shows_custom_lookup_plan() {
         .await
         .expect("collect");
 
-    let mut rendered = String::new();
-    for b in &batches {
-        for col in b.columns() {
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        rendered.push_str(arr.value(i));
-                        rendered.push('\n');
-                    }
-                }
-            }
-        }
-    }
-
+    let rendered = render_explain(&batches);
     assert!(
         rendered.contains("FlussKvLookupExec"),
         "EXPLAIN should show the custom lookup plan, got:\n{rendered}"

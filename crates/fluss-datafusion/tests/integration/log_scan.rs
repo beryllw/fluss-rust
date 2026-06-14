@@ -22,11 +22,9 @@
 //!
 //! Available only under `test-fake`. Opens zero sockets.
 
-use arrow::array::{Array, StringArray};
-
 use crate::integration::utils::fixtures_ready;
 use crate::integration::utils::helpers::{
-    CATALOG, collect_i32, ctx_with_catalog, expect_query_error, total_rows,
+    CATALOG, collect_i32, ctx_with_catalog, expect_query_error, render_explain, total_rows,
 };
 use crate::integration::utils::names;
 
@@ -123,20 +121,7 @@ async fn explain_shows_custom_log_scan_plan() {
         .await
         .expect("collect");
 
-    let mut rendered = String::new();
-    for b in &batches {
-        for col in b.columns() {
-            if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..arr.len() {
-                    if arr.is_valid(i) {
-                        rendered.push_str(arr.value(i));
-                        rendered.push('\n');
-                    }
-                }
-            }
-        }
-    }
-
+    let rendered = render_explain(&batches);
     assert!(
         rendered.contains("FlussLogScanExec"),
         "EXPLAIN should show the custom log-scan plan, got:\n{rendered}"

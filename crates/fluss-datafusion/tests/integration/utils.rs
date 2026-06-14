@@ -88,26 +88,35 @@ pub fn fixtures_ready() -> bool {
     false
 }
 
-/// Shared SQL-path helpers for the cluster-free (`test-fake`) integration tests.
-#[cfg(feature = "test-fake")]
+/// Shared SQL-path helpers for the integration tests.
+///
+/// Backend-agnostic helpers (row counting, column extraction, error capture,
+/// `EXPLAIN` rendering) are available to both the cluster-free (`test-fake`) and
+/// real-cluster (`integration_tests`) suites. The fake-only `ctx_with_catalog`
+/// stays gated to `test-fake`; the real suite builds its context from a live
+/// connection instead.
+#[cfg(any(feature = "test-fake", feature = "integration_tests"))]
 pub mod helpers {
-    use arrow::array::{Array, Int32Array, RecordBatch};
+    use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use datafusion::execution::context::SessionContext;
 
-    use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
-
-    use super::fake_source;
+    use fluss_datafusion::FlussDatafusionOptions;
 
     /// Catalog name every SQL test registers the Fluss catalog under.
     pub const CATALOG: &str = "fluss";
 
-    /// Default installer options for the fast tests.
+    /// Default installer options for the tests.
     pub fn options() -> FlussDatafusionOptions {
         FlussDatafusionOptions::default()
     }
 
     /// Builds a context with the Fluss catalog registered through the fake.
+    #[cfg(feature = "test-fake")]
     pub async fn ctx_with_catalog() -> SessionContext {
+        use fluss_datafusion::{FlussDatafusion, RegisterCatalogOptions};
+
+        use super::fake_source;
+
         let fd = FlussDatafusion::new_with_source(fake_source(), options());
         let ctx = SessionContext::new();
         fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
@@ -134,6 +143,27 @@ pub mod helpers {
                     .to_vec()
             })
             .collect()
+    }
+
+    /// Concatenates every string-column cell across all batches, one per line.
+    ///
+    /// `EXPLAIN` renders its plan into string columns; flattening them this way
+    /// gives a single haystack a test can assert a custom plan name appears in.
+    pub fn render_explain(batches: &[RecordBatch]) -> String {
+        let mut rendered = String::new();
+        for b in batches {
+            for col in b.columns() {
+                if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
+                    for i in 0..arr.len() {
+                        if arr.is_valid(i) {
+                            rendered.push_str(arr.value(i));
+                            rendered.push('\n');
+                        }
+                    }
+                }
+            }
+        }
+        rendered
     }
 
     /// Runs a query expected to be rejected and returns the rendered error.
