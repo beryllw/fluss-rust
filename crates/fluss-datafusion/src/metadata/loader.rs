@@ -49,6 +49,15 @@ impl MetadataLoader {
         Self { source, cache }
     }
 
+    /// Returns a clone of the shared [`FlussSource`] handle.
+    ///
+    /// KV/log `TableProvider`s need the execution channel to run lookups/scans.
+    /// Exposing only the source (not the connection) keeps execution dependent on
+    /// the seam alone, per the crate's dependency rule.
+    pub(crate) fn source(&self) -> SharedFlussSource {
+        self.source.clone()
+    }
+
     /// Returns the database -> table-name listing, fetching from the source only
     /// when the shared cache has no fresh snapshot. This is the single full-cluster
     /// read; it is shared across all `SessionContext`s.

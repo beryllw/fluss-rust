@@ -15,23 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration test modules for fluss-datafusion.
+//! Custom DataFusion `ExecutionPlan`s over the [`FlussSource`] seam.
 //!
-//! - `utils`: shared helpers + fixture paths (always compiled).
-//! - `replay`: cluster-free fake replay tests (`test-fake`).
-//! - `catalog`: cluster-free `register_catalog` + metadata-cache tests (`test-fake`).
-//! - `capture`: real-cluster fixture capture (`integration_tests`).
+//! `lookup` is the KV point-lookup plan; `stream` adapts a single async lookup
+//! into a `SendableRecordBatchStream`. Both reach Fluss only through the source.
 
-pub mod utils;
-
-#[cfg(feature = "test-fake")]
-pub mod replay;
-
-#[cfg(feature = "test-fake")]
-pub mod catalog;
-
-#[cfg(feature = "test-fake")]
-pub mod kv_lookup;
-
-#[cfg(feature = "integration_tests")]
-pub mod capture;
+pub(crate) mod lookup;
+pub(crate) mod stream;

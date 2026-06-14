@@ -15,23 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration test modules for fluss-datafusion.
+//! Fluss <-> DataFusion type bridging.
 //!
-//! - `utils`: shared helpers + fixture paths (always compiled).
-//! - `replay`: cluster-free fake replay tests (`test-fake`).
-//! - `catalog`: cluster-free `register_catalog` + metadata-cache tests (`test-fake`).
-//! - `capture`: real-cluster fixture capture (`integration_tests`).
+//! `scalar` converts DataFusion `ScalarValue`s into crate-local [`KeyValue`]s for
+//! lookup keys; `record_batch` adapts a source batch into DataFusion-friendly
+//! output (projection only). Schema mapping stays in `fluss`'s own Arrow helpers.
 
-pub mod utils;
-
-#[cfg(feature = "test-fake")]
-pub mod replay;
-
-#[cfg(feature = "test-fake")]
-pub mod catalog;
-
-#[cfg(feature = "test-fake")]
-pub mod kv_lookup;
-
-#[cfg(feature = "integration_tests")]
-pub mod capture;
+pub(crate) mod record_batch;
+pub(crate) mod scalar;

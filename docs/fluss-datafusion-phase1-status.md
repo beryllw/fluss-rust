@@ -8,7 +8,7 @@
 | Task 1: workspace 与 crate 骨架 | 已完成 |
 | Task 2: `FlussSource` seam + fake 测试 harness | 已完成 |
 | Task 3: metadata cache 与注册路径 | 已完成 |
-| Task 4: KV 谓词分析与 lookup 执行 | 未开始 |
+| Task 4: KV 谓词分析与 lookup 执行 | 已完成 |
 | Task 5: log 有界扫描执行 | 未开始 |
 | Task 6: Docker 端到端集成测试 | 未开始 |
 
@@ -41,3 +41,14 @@
 - 占位 `TableProvider`(`FlussTablePlaceholder`)只暴露正确的 Arrow `schema()`;`scan()` 返回 `UnsupportedQueryPattern`(按 `has_primary_key()` 区分 KV/log 文案),保守失败、绝不静默退化为 full scan;真实 scan 留待 Task 4/5。未新增 `src/table/*`、`src/execution/*`。
 - `install.rs` 的 `Inner` 持有共享 `Arc<MetadataLoader>`(`new` 与 `new_with_source` 共用),使 cache 跨 `SessionContext` 复用;移除了过时的 `source()` accessor 与 dead `Inner.source` 字段(loader 持有唯一 source handle)。
 - 独立子 agent 验收通过:`cargo check -p fluss-datafusion`(默认构建,零 warning)、`cargo check --workspace`、`cargo test -p fluss-datafusion --features test-fake` 11/11 通过(8 replay + 3 catalog)且不依赖 Docker。perturbation test:临时让 loader 列举路径跳过 cache 强制重取,`shared_metadata_is_reused_across_contexts` 如预期失败(second `register_catalog` 重打 source),随后精确还原,证明共享 cache 测试非空洞。
+
+## Task 4: KV 谓词分析与 lookup 执行
+
+- 状态:已完成
+- 新增 `src/types/{mod,scalar,record_batch}.rs`:`scalar_to_key_value` 严格把 `ScalarValue`(`Boolean`/`Int8/16/32/64`/`Utf8`)转 `KeyValue`,NULL 与其它类型显式返回 `TypeConversion`;`project_batch` 集中处理按 projection 裁列(`None` 透传),不重复 Arrow 组装。
+- 新增 `src/table/{mod,predicate,kv}.rs`:`analyze_kv_filters` 把 DataFusion 拆开的顶层 AND conjuncts 识别为完整 primary-key 等值,按 PK 顺序产出 `LookupKey`;明确拒绝部分 PK、非 PK 列、`IN`、范围、列对列、重复/缺失 PK、空 filter,一律 `UnsupportedQueryPattern`。`FlussKvTableProvider` 的 `supports_filters_pushdown` 仅对 PK 等值 filter 标 `Exact`(被消费、不再生成 `FilterExec`),其余 `Unsupported`;`scan()` 用 predicate 分析,命中则构建 lookup plan(正确传 projection 到输出 schema),否则把 `UnsupportedQueryPattern` 直接上抛——绝不静默退化为 full scan。
+- 新增 `src/execution/{mod,lookup,stream}.rs`:`FlussKvLookupExec` 为单分区 leaf `ExecutionPlan`,持有 `SharedFlussSource`/`TableRef`/`LookupKey`/projected schema,`execute()` 经 `single_batch_stream`(`futures::stream::once` + `RecordBatchStreamAdapter`,drop 即协作式取消)异步调 `source.lookup` 产出 0/1 行;实现 `DisplayAs`,`EXPLAIN` 显示可识别的 `FlussKvLookupExec`。
+- 改 `src/catalog/schema.rs`:`table()` 按 `meta.has_primary_key()` 分流——KV 表注入 source+meta+arrow_schema+table_ref 返回真实 `FlussKvTableProvider`;log 表仍保持保守失败的占位(Task 5)。新增 `MetadataLoader::source()`(返回 clone)作为 KV provider 获取执行通道的最小扩展,execution 仅依赖 `FlussSource`,不触碰 `FlussConnection`/`Lookuper`。
+- 关键决策:失败边界统一走 crate 本地 `UnsupportedQueryPattern`,经现有 `From<FlussDatafusionError> for DataFusionError` 在 plan 或 collect 阶段清晰冒泡;`supports_filters_pushdown` 与 `scan` 的判定共用同一 predicate 模块,避免 pushdown 标记与执行可行性漂移。
+- 验证结果:`cargo check -p fluss-datafusion`(默认构建,零 warning)通过;`cargo check --workspace` 通过;`cargo test -p fluss-datafusion --features test-fake` 全绿——18 个单元测试(predicate 13 + scalar 3 + record_batch 2) + 19 个集成测试(11 原有 + 8 新增 KV)。新增 8 个 KV 集成测试:单/复合 PK 命中、缺失 key 0 行、非 PK / 部分 PK / 无 filter / `IN` 四类不支持谓词清晰失败、`EXPLAIN` 含 `FlussKvLookupExec`。
+- 注:`cargo clippy` 在本机较新工具链(1.93.0)下因上游 `crates/fluss` 既有代码触发 `collapsible_if`/`type_complexity` 等 lint 而失败,与 Task 4 无关(未改动 `crates/fluss`);Task 4 新增文件本身零 clippy 发现。

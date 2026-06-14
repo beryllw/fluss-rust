@@ -35,6 +35,7 @@ use datafusion::prelude::Expr;
 use crate::backend::{FlussTableMeta, TableRef};
 use crate::error::FlussDatafusionError;
 use crate::metadata::MetadataLoader;
+use crate::table::kv::FlussKvTableProvider;
 
 /// One Fluss database surfaced as a DataFusion schema.
 #[derive(Debug)]
@@ -75,8 +76,21 @@ impl SchemaProvider for FlussSchemaProvider {
         }
         let table_ref = TableRef::new(self.database.clone(), name.to_string());
         let entry = self.loader.table_entry(&table_ref).await?;
-        let provider = FlussTablePlaceholder::new(table_ref, &entry.meta, entry.arrow_schema);
-        Ok(Some(Arc::new(provider)))
+        if entry.meta.has_primary_key() {
+            // KV table: a real point-lookup provider (Task 4).
+            let provider = FlussKvTableProvider::new(
+                self.loader.source(),
+                table_ref,
+                entry.arrow_schema,
+                entry.meta.primary_keys.clone(),
+            );
+            Ok(Some(Arc::new(provider)))
+        } else {
+            // Log table: still a conservative placeholder until Task 5 lands the
+            // bounded-scan provider. `scan()` fails rather than guess.
+            let provider = FlussTablePlaceholder::new(table_ref, &entry.meta, entry.arrow_schema);
+            Ok(Some(Arc::new(provider)))
+        }
     }
 
     fn table_exist(&self, name: &str) -> bool {
@@ -84,26 +98,20 @@ impl SchemaProvider for FlussSchemaProvider {
     }
 }
 
-/// Minimal `TableProvider` exposing only the correct Arrow `schema()`.
+/// Minimal log-table `TableProvider` exposing only the correct Arrow `schema()`.
 ///
-/// Task 3 scope: listing + planning. The KV point-lookup `scan()` (Task 4) and the
-/// log bounded-scan `scan()` (Task 5) are NOT implemented here; `scan()` fails
-/// conservatively so an unsupported pattern never degrades into a silent full scan.
-/// The `is_kv` split mirrors the eventual KV-vs-log provider selection.
+/// KV tables now use [`FlussKvTableProvider`] (Task 4). The log bounded-scan
+/// `scan()` (Task 5) is still unimplemented here; `scan()` fails conservatively so
+/// an unsupported pattern never degrades into a silent full scan.
 #[derive(Debug)]
 struct FlussTablePlaceholder {
     table_ref: TableRef,
     schema: SchemaRef,
-    is_kv: bool,
 }
 
 impl FlussTablePlaceholder {
-    fn new(table_ref: TableRef, meta: &FlussTableMeta, schema: SchemaRef) -> Self {
-        Self {
-            table_ref,
-            schema,
-            is_kv: meta.has_primary_key(),
-        }
+    fn new(table_ref: TableRef, _meta: &FlussTableMeta, schema: SchemaRef) -> Self {
+        Self { table_ref, schema }
     }
 }
 
@@ -128,10 +136,9 @@ impl TableProvider for FlussTablePlaceholder {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        let kind = if self.is_kv { "KV" } else { "log" };
         Err(DataFusionError::from(
             FlussDatafusionError::UnsupportedQueryPattern(format!(
-                "{kind} table scan for {} is not implemented yet (Task 4/5)",
+                "log table scan for {} is not implemented yet (Task 5)",
                 self.table_ref
             )),
         ))

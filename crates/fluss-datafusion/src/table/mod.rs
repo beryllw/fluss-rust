@@ -15,23 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Integration test modules for fluss-datafusion.
+//! `TableProvider` logic and predicate recognition.
 //!
-//! - `utils`: shared helpers + fixture paths (always compiled).
-//! - `replay`: cluster-free fake replay tests (`test-fake`).
-//! - `catalog`: cluster-free `register_catalog` + metadata-cache tests (`test-fake`).
-//! - `capture`: real-cluster fixture capture (`integration_tests`).
+//! `predicate` recognizes the narrow KV pushdown shape; `kv` is the KV
+//! `TableProvider` that turns a recognized full-primary-key equality into a
+//! point-lookup plan and fails conservatively otherwise. The log `TableProvider`
+//! lands in Task 5.
 
-pub mod utils;
-
-#[cfg(feature = "test-fake")]
-pub mod replay;
-
-#[cfg(feature = "test-fake")]
-pub mod catalog;
-
-#[cfg(feature = "test-fake")]
-pub mod kv_lookup;
-
-#[cfg(feature = "integration_tests")]
-pub mod capture;
+pub(crate) mod kv;
+pub(crate) mod predicate;

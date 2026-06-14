@@ -19,8 +19,11 @@ mod backend;
 mod catalog;
 mod config;
 mod error;
+mod execution;
 mod install;
 mod metadata;
+mod table;
+mod types;
 
 pub use config::{FlussDatafusionOptions, RegisterCatalogOptions};
 pub use error::{FlussDatafusionError, Result};
