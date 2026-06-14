@@ -19,8 +19,10 @@
 //!
 //! `predicate` recognizes the narrow KV pushdown shape; `kv` is the KV
 //! `TableProvider` that turns a recognized full-primary-key equality into a
-//! point-lookup plan and fails conservatively otherwise. The log `TableProvider`
-//! lands in Task 5.
+//! point-lookup plan and fails conservatively otherwise. `log` is the log
+//! `TableProvider` that turns a required `LIMIT` into a bounded scan and fails
+//! conservatively when the `LIMIT` is absent.
 
 pub(crate) mod kv;
+pub(crate) mod log;
 pub(crate) mod predicate;

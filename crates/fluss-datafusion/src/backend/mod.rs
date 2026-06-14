@@ -27,14 +27,6 @@
 //! - [`fake::FakeFlussSource`] (feature `test-fake`) replays committed fixtures
 //!   captured from a real cluster, opening zero sockets.
 
-// Task 3 wires the metadata/discovery half of the seam
-// (`list_databases`/`list_tables`/`get_table_meta`) into the default build via the
-// catalog. The data half (`lookup`/`log_scan`, plus `KeyValue`/`LookupKey`) is only
-// reached under `test-fake` until Task 4/5 land the KV/log scans. Scope the allow to
-// non-`test-fake` builds so those data-path items don't warn yet; tighten when
-// Task 4/5 use them in the default build.
-#![cfg_attr(not(feature = "test-fake"), allow(dead_code))]
-
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;

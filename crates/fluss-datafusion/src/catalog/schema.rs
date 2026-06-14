@@ -24,18 +24,14 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::catalog::{Session, SchemaProvider, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
-use datafusion::logical_expr::TableType;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::Expr;
+use datafusion::catalog::{SchemaProvider, TableProvider};
+use datafusion::error::Result as DfResult;
 
-use crate::backend::{FlussTableMeta, TableRef};
-use crate::error::FlussDatafusionError;
+use crate::backend::TableRef;
 use crate::metadata::MetadataLoader;
 use crate::table::kv::FlussKvTableProvider;
+use crate::table::log::FlussLogTableProvider;
 
 /// One Fluss database surfaced as a DataFusion schema.
 #[derive(Debug)]
@@ -86,61 +82,17 @@ impl SchemaProvider for FlussSchemaProvider {
             );
             Ok(Some(Arc::new(provider)))
         } else {
-            // Log table: still a conservative placeholder until Task 5 lands the
-            // bounded-scan provider. `scan()` fails rather than guess.
-            let provider = FlussTablePlaceholder::new(table_ref, &entry.meta, entry.arrow_schema);
+            // Log table: a required-`LIMIT` bounded-scan provider (Task 5).
+            let provider = FlussLogTableProvider::new(
+                self.loader.source(),
+                table_ref,
+                entry.arrow_schema,
+            );
             Ok(Some(Arc::new(provider)))
         }
     }
 
     fn table_exist(&self, name: &str) -> bool {
         self.table_names.iter().any(|t| t == name)
-    }
-}
-
-/// Minimal log-table `TableProvider` exposing only the correct Arrow `schema()`.
-///
-/// KV tables now use [`FlussKvTableProvider`] (Task 4). The log bounded-scan
-/// `scan()` (Task 5) is still unimplemented here; `scan()` fails conservatively so
-/// an unsupported pattern never degrades into a silent full scan.
-#[derive(Debug)]
-struct FlussTablePlaceholder {
-    table_ref: TableRef,
-    schema: SchemaRef,
-}
-
-impl FlussTablePlaceholder {
-    fn new(table_ref: TableRef, _meta: &FlussTableMeta, schema: SchemaRef) -> Self {
-        Self { table_ref, schema }
-    }
-}
-
-#[async_trait]
-impl TableProvider for FlussTablePlaceholder {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.schema.clone()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        _projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
-    ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        Err(DataFusionError::from(
-            FlussDatafusionError::UnsupportedQueryPattern(format!(
-                "log table scan for {} is not implemented yet (Task 5)",
-                self.table_ref
-            )),
-        ))
     }
 }

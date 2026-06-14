@@ -28,6 +28,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::error::Result as DfResult;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use futures::stream::TryStreamExt;
 
 /// Builds a single-batch stream from an async future that yields one batch.
 ///
@@ -40,5 +41,25 @@ where
     F: Future<Output = DfResult<RecordBatch>> + Send + 'static,
 {
     let stream = futures::stream::once(future);
+    Box::pin(RecordBatchStreamAdapter::new(schema, stream))
+}
+
+/// Builds a stream from an async future that yields a `Vec` of batches.
+///
+/// Like [`single_batch_stream`], dropping the returned stream drops the in-flight
+/// future (cooperative cancellation). The resolved `Vec` is flattened into a
+/// stream of `Ok(batch)` items; a future error surfaces as a single `Err`.
+///
+/// `schema` is the stream's declared schema; it must match the produced batches.
+pub(crate) fn bounded_batches_stream<F>(
+    schema: SchemaRef,
+    future: F,
+) -> SendableRecordBatchStream
+where
+    F: Future<Output = DfResult<Vec<RecordBatch>>> + Send + 'static,
+{
+    let stream = futures::stream::once(future)
+        .map_ok(|batches| futures::stream::iter(batches.into_iter().map(DfResult::Ok)))
+        .try_flatten();
     Box::pin(RecordBatchStreamAdapter::new(schema, stream))
 }

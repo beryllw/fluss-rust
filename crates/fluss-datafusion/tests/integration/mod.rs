@@ -20,6 +20,8 @@
 //! - `utils`: shared helpers + fixture paths (always compiled).
 //! - `replay`: cluster-free fake replay tests (`test-fake`).
 //! - `catalog`: cluster-free `register_catalog` + metadata-cache tests (`test-fake`).
+//! - `kv_lookup`: cluster-free KV point-lookup SQL tests (`test-fake`).
+//! - `log_scan`: cluster-free log bounded-scan SQL tests (`test-fake`).
 //! - `capture`: real-cluster fixture capture (`integration_tests`).
 
 pub mod utils;
@@ -32,6 +34,9 @@ pub mod catalog;
 
 #[cfg(feature = "test-fake")]
 pub mod kv_lookup;
+
+#[cfg(feature = "test-fake")]
+pub mod log_scan;
 
 #[cfg(feature = "integration_tests")]
 pub mod capture;

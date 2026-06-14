@@ -9,7 +9,7 @@
 | Task 2: `FlussSource` seam + fake 测试 harness | 已完成 |
 | Task 3: metadata cache 与注册路径 | 已完成 |
 | Task 4: KV 谓词分析与 lookup 执行 | 已完成 |
-| Task 5: log 有界扫描执行 | 未开始 |
+| Task 5: log 有界扫描执行 | 已完成 |
 | Task 6: Docker 端到端集成测试 | 未开始 |
 
 ## Task 1: workspace 与 crate 骨架
@@ -52,3 +52,13 @@
 - 关键决策:失败边界统一走 crate 本地 `UnsupportedQueryPattern`,经现有 `From<FlussDatafusionError> for DataFusionError` 在 plan 或 collect 阶段清晰冒泡;`supports_filters_pushdown` 与 `scan` 的判定共用同一 predicate 模块,避免 pushdown 标记与执行可行性漂移。
 - 验证结果:`cargo check -p fluss-datafusion`(默认构建,零 warning)通过;`cargo check --workspace` 通过;`cargo test -p fluss-datafusion --features test-fake` 全绿——18 个单元测试(predicate 13 + scalar 3 + record_batch 2) + 19 个集成测试(11 原有 + 8 新增 KV)。新增 8 个 KV 集成测试:单/复合 PK 命中、缺失 key 0 行、非 PK / 部分 PK / 无 filter / `IN` 四类不支持谓词清晰失败、`EXPLAIN` 含 `FlussKvLookupExec`。
 - 注:`cargo clippy` 在本机较新工具链(1.93.0)下因上游 `crates/fluss` 既有代码触发 `collapsible_if`/`type_complexity` 等 lint 而失败,与 Task 4 无关(未改动 `crates/fluss`);Task 4 新增文件本身零 clippy 发现。
+
+## Task 5: log 有界扫描执行
+
+- 状态:已完成
+- 新增 `src/table/log.rs`:`FlussLogTableProvider` 把 log(append-only)表暴露为有界扫描。`scan()` 在 `limit` 为 `None` 时清晰返回 `LimitRequired`(经 `From<FlussDatafusionError>` 冒泡),绝不退化为 full scan;`supports_filters_pushdown` 一律 `Unsupported`(Phase 1 log 不做 filter pushdown,残余 filter 由上层 `FilterExec` 处理);projection 下推到 `FlussSource::log_scan`。
+- 新增 `src/execution/log_scan.rs`:`FlussLogScanExec` 为单分区 leaf `ExecutionPlan`,`execute()` 经新增的 `bounded_batches_stream`(`src/execution/stream.rs`,Vec 版的协作式取消流)异步调 `source.log_scan(projection, limit)` 产出多个 batch;`EXPLAIN` 显示可识别的 `FlussLogScanExec`。
+- 关键正确性(与 KV 的不对称):`log_scan` 在 real/fake 两侧都已按 projection 投影,故 log 执行路径**不再二次投影**(对比 KV 的 lookup 返回全列后再 `project_batch`);plan 声明的 `projected_schema` 与已投影 batch 一致。
+- projection 归一化:DataFusion 对 `SELECT *` 传入 `Some([0,1,..])` 而非 `None`,`scan()` 用有序 identity 检查(`indices.iter().copied().eq(0..full_count)`)把完整 identity projection 收敛为 `None`,以命中"全列"语义;非 identity(如重排或真子集)保持原样。
+- 改 `src/catalog/schema.rs`:log 分支由保守占位改为返回真实 `FlussLogTableProvider`;删除 `FlussTablePlaceholder` 及其 impl 与随之失效的 import。移除 `src/backend/mod.rs` 顶部的 `#![cfg_attr(not(feature="test-fake"), allow(dead_code))]`——默认构建现已消费 `log_scan`,无该 allow 仍零 warning。未新增 `src/types/schema.rs`(无去重收益,按 CLAUDE.md 保持最小范围)。
+- 独立子 agent 验收通过:`cargo check -p fluss-datafusion`(默认构建,零 warning)、`cargo check --workspace` 通过;`cargo test -p fluss-datafusion --features test-fake` 全绿——18 单元测试 + 23 集成测试(原 19 + 新增 4 log SQL 测试)。新增 4 个 log 测试:带 `LIMIT` 命中(断言 last-N ids `[3,4,5,6]`)、projection pushdown(单列 `id`、`[3,4,5,6]`)、缺失 `LIMIT` 报 `LIMIT required`、`EXPLAIN` 含 `FlussLogScanExec`。perturbation:把 last-N 断言临时改为 `[1,2,3,4]` 触发预期失败,证明测试非空洞,随后精确还原。

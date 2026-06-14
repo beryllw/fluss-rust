@@ -17,8 +17,10 @@
 
 //! Custom DataFusion `ExecutionPlan`s over the [`FlussSource`] seam.
 //!
-//! `lookup` is the KV point-lookup plan; `stream` adapts a single async lookup
-//! into a `SendableRecordBatchStream`. Both reach Fluss only through the source.
+//! `lookup` is the KV point-lookup plan; `log_scan` is the bounded log-scan plan;
+//! `stream` adapts async futures into a `SendableRecordBatchStream`. All reach
+//! Fluss only through the source.
 
+pub(crate) mod log_scan;
 pub(crate) mod lookup;
 pub(crate) mod stream;
