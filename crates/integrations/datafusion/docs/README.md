@@ -36,12 +36,10 @@ use datafusion::execution::context::SessionContext;
 use fluss::client::FlussConnection;
 use fluss::config::Config;
 
-use fluss_datafusion::{
-    FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions, Result,
-};
+use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1) 连接 Fluss。
     let mut config = Config::default();
     config.bootstrap_servers = "127.0.0.1:9123".to_string();
