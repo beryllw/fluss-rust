@@ -57,16 +57,6 @@ impl FlussDatafusion {
         Ok(Self::from_source(source, options))
     }
 
-    /// Test-only constructor that injects an arbitrary [`FlussSource`].
-    ///
-    /// Available only under the `test-fake` feature so a fixture-backed fake can
-    /// drive the full catalog/execution path with no cluster. Not part of the
-    /// public API.
-    #[cfg(feature = "test-fake")]
-    pub fn new_with_source(source: SharedFlussSource, options: FlussDatafusionOptions) -> Self {
-        Self::from_source(source, options)
-    }
-
     fn from_source(source: SharedFlussSource, options: FlussDatafusionOptions) -> Self {
         let cache = Arc::new(MetadataCache::new(options.metadata_cache_ttl));
         let loader = Arc::new(MetadataLoader::new(source, cache));

@@ -15,12 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared real-cluster setup for the `integration_tests` paths.
+//! Shared real-cluster setup for the `integration_tests` path.
 //!
 //! Brings up a one-off Fluss cluster and creates/populates the known Phase 1
-//! tables. Both the capture path (records fixtures) and the end-to-end path
-//! (drives SQL through the real backend) build on the exact same DDL/DML here,
-//! so the two never disagree about what the tables look like.
+//! tables. The end-to-end path drives SQL through the real backend on top of the
+//! DDL/DML defined here.
 //!
 //! Gated by `integration_tests` (needs a container runtime).
 
@@ -33,8 +32,6 @@ use fluss::metadata::{DataTypes, Schema, TableInfo, TableDescriptor, TablePath};
 use fluss::row::GenericRow;
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 
-use fluss_datafusion::testing::{FlussTableMeta, TableRef};
-
 use crate::integration::utils::names;
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,8 +39,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Brings up a one-off plaintext cluster and waits for it to serve metadata.
 ///
 /// `name` namespaces the containers; `port` is the coordinator's host port. Two
-/// clusters in the same test binary (capture + e2e) must use distinct names and
-/// ports so they do not collide when the harness runs tests concurrently.
+/// clusters in the same test binary must use distinct names and ports so they do
+/// not collide when the harness runs tests concurrently.
 pub async fn start_cluster(name: &str, port: u16) -> FlussTestingCluster {
     let cluster = FlussTestingClusterBuilder::new(name)
         .with_port(port)
@@ -69,18 +66,6 @@ async fn wait_for_ready(cluster: &FlussTestingCluster) {
             panic!("cluster did not become ready in {READY_TIMEOUT:?}");
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// Builds the crate-owned [`FlussTableMeta`] from fluss's `TableInfo`.
-pub fn meta_from_info(table: &TableRef, info: &TableInfo) -> FlussTableMeta {
-    FlussTableMeta {
-        table_ref: table.clone(),
-        table_id: info.get_table_id(),
-        schema_id: info.get_schema_id(),
-        schema: info.get_schema().clone(),
-        primary_keys: info.get_primary_keys().clone(),
-        num_buckets: info.get_num_buckets(),
     }
 }
 

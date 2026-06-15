@@ -84,8 +84,6 @@ crates/integrations/datafusion/
     backend/
       mod.rs           # FlussSource trait（pub(crate)）+ 共享别名
       real.rs          # 生产实现，包 FlussConnection
-      fake.rs          # 仅测试: feature "test-fake"，从 fixtures replay
-      fixtures.rs      # fixture 序列化格式
     metadata/
       mod.rs
       cache.rs         # 共享、RwLock 保护、按条目 TTL
@@ -111,16 +109,10 @@ crates/integrations/datafusion/
       record_batch.rs  # projection 裁列
   tests/
     test_fluss_datafusion.rs
-    fixtures/          # 从真实集群抓取的快照（committed）
     integration/
       mod.rs
-      utils.rs         # 共享 helper + fixture 路径
-      replay.rs        # test-fake: cluster-free replay
-      catalog.rs       # test-fake: register_catalog + 元数据缓存
-      kv_lookup.rs     # test-fake: KV 点查 SQL
-      log_scan.rs      # test-fake: log 有界扫描 SQL
+      utils.rs         # 共享表名常量 + SQL-path helper
       setup.rs         # integration_tests: 真实集群 bootstrap + 建表/灌数
-      capture.rs       # integration_tests: 录制 fixtures
       e2e.rs           # integration_tests: 真实后端端到端 SQL
 ```
 
@@ -158,8 +150,8 @@ impl FlussDatafusion {
 ```
 
 `new()` 接收具体的 `Arc<FlussConnection>`，但内部立即把它包成 `Arc<dyn FlussSource>`，此后
-crate 不再依赖 `FlussConnection`。另有 `new_with_source(...)` 作为 `#[cfg(feature = "test-fake")]`
-的测试注入入口，不进真实公共 API。
+crate 不再依赖 `FlussConnection`。`FlussSource` 是纯 `pub(crate)` 的内部 seam，不暴露任何测试
+注入入口；集成测试一律走 `new()` 这条生产路径，对接真实集群。
 
 ## 内部模块职责
 
@@ -167,13 +159,10 @@ crate 不再依赖 `FlussConnection`。另有 `new_with_source(...)` 作为 `#[c
 
 - `FlussSource` trait（`pub(crate)`）只覆盖 Phase 1 真正用到的原子操作：metadata 列举/获取、
   KV 完整 primary-key `lookup(key) -> RecordBatch`、log 有界 `scan -> Vec<RecordBatch>`。
-- `real.rs`：生产实现，包 `FlussConnection` / `FlussAdmin` / lookuper / scanner，复用 fluss
+- `real.rs`：唯一实现，包 `FlussConnection` / `FlussAdmin` / lookuper / scanner，复用 fluss
   现有 Arrow helper（如 `LookupResult::to_record_batch`），不重复实现 Arrow 组装。
-- `fake.rs`（feature `test-fake`）：纯内存 replay，从 `tests/fixtures/phase1.json` 加载，不开
-  任何 socket。
-- `fixtures.rs`：fixture 序列化格式（metadata 用 serde，batch 用 Arrow IPC）。`TableInfo` 不
-  支持 serde，故 seam 返回 crate 自有的精简 `FlussTableMeta`（schema + primary_keys +
-  num_buckets 等），可经 fixtures round-trip。
+- seam 返回 crate 自有的精简 `FlussTableMeta`（schema + primary_keys + num_buckets 等），把上层
+  与 `fluss::metadata::TableInfo` 解耦，只携带 catalog 接线、谓词分析、执行真正需要的字段。
 
 ### `metadata/`
 
@@ -215,7 +204,7 @@ crate 不再依赖 `FlussConnection`。另有 `new_with_source(...)` 作为 `#[c
   `source.log_scan(projection, limit)`；`EXPLAIN` 显示 `FlussLogScanExec`。
 - `stream.rs`：把 lookup / scan 输出适配为 DataFusion stream（`futures::stream::once` /
   Vec 版），drop 即协作式取消。
-- 不对称点：`log_scan` 在 real/fake 两侧都已按 projection 投影，故 log 路径**不再二次投影**；
+- 不对称点：`log_scan` 在 `FlussSource` 一侧已按 projection 投影，故 log 路径**不再二次投影**；
   KV 的 lookup 返回全列后由 `types/record_batch.rs` 的 `project_batch` 裁列。
 
 ### `types/`
@@ -258,43 +247,38 @@ pub enum FlussDatafusionError {
     SchemaMismatch(String),
     TypeConversion(String),
     FlussClient(String),
-    Fixture(String),
     Internal(String),
 }
 ```
 
 经 `From<FlussDatafusionError> for DataFusionError`（`External`）在 plan 或 collect 阶段清晰
-冒泡。`From` 实现把 fluss / arrow / io / serde_json 错误分别映射为 `FlussClient` / `SchemaMismatch` /
-`Fixture`。该类型刻意**不**编码任何 PostgreSQL / gateway 概念。
+冒泡。`From` 实现把 fluss / arrow 错误分别映射为 `FlussClient` / `SchemaMismatch`。该类型刻意**不**
+编码任何 PostgreSQL / gateway 概念。
 
 ## 测试策略
 
-三层设计，共用同一份建表/灌数逻辑（`setup.rs`），保证彼此对「表长什么样」不产生分歧：
-
-```
-real cluster --capture(容器)--> tests/fixtures (committed) --replay(免集群)--> fake FlussSource --> DataFusion
-```
+单一真实集群分层：没有 fake/fixture 镜像层，避免「免集群断言」与「真实断言」两份相互漂移。
+分两层：
 
 | 层 | feature | 容器 | 作用 |
 |---|---|---|---|
-| 单元测试 | 默认 | 否 | schema 映射、`ScalarValue` 转 key、谓词识别、pushdown 决策、错误映射 |
-| fake replay | `test-fake` | 否 | 用 in-memory fake 回放 fixture，跑通完整 catalog/执行路径（快速绿灯门禁） |
-| capture | `integration_tests` | 是 | 从真实集群录制 fixture |
-| e2e | `integration_tests` | 是 | 真实 SQL 走真实后端（`FlussDatafusion::new` -> `RealFlussSource`） |
+| 单元测试 | 默认 | 否 | schema 映射、`ScalarValue` 转 key、谓词识别、pushdown 决策、错误映射，以及 metadata cache 的 TTL / 命中复用逻辑 |
+| 集成测试（e2e） | `integration_tests` | 是 | 真实 SQL 走真实后端（`FlussDatafusion::new` -> `RealFlussSource`），覆盖 catalog 列举、KV 点查（单/复合 PK、缺键、非 PK / 部分 PK / `IN` / 无过滤等不支持形态）、log 有界扫描与 projection、`EXPLAIN` 自定义 plan，以及 `TableProvider` 暴露的 Arrow schema |
 
-e2e 的断言镜像 fake 套件的 `kv_lookup` / `log_scan` / `catalog` 契约，使真实后端被同一组期望约束。
+集成测试在单个测试函数里对一个集群顺序断言：拉起 Fluss 集群成本高，而这些断言均为只读、彼此独立，
+故共用一个集群以降低开销（`setup.rs` 提供共享建表/灌数）。每调用一次的 cache 命中/失效是白盒
+机制，由 `metadata::cache` 的单元测试覆盖，无需再对真实后端重复验证。
 
 验证命令：
 
 ```bash
 cargo check --workspace
 cargo test -p fluss-datafusion                               # 单元
-cargo test -p fluss-datafusion --features test-fake          # 免集群, replay fixtures
 cargo test -p fluss-datafusion --features integration_tests  # 需容器, 真实集群
 ```
 
-边界约束（对齐 CLAUDE.md）：`FlussSource` 与 fake 都是内部测试 seam，保持 `pub(crate)` /
-feature-gated，不进公共 API，也不做成 gateway 形状的 backend 抽象。
+边界约束（对齐 CLAUDE.md）：`FlussSource` 是内部 seam，保持 `pub(crate)`，不进公共 API，也不
+做成 gateway 形状的 backend 抽象。
 
 ## 与 fluss-gateway 的衔接
 

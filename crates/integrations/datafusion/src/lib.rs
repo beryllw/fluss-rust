@@ -91,23 +91,3 @@ mod types;
 pub use config::{FlussDatafusionOptions, RegisterCatalogOptions};
 pub use error::{FlussDatafusionError, Result};
 pub use install::FlussDatafusion;
-
-// Test-only seam surface. Integration tests live in separate crates and cannot
-// reach `pub(crate)` items, so the fake source, fixture format, and the source
-// type alias are re-exported publicly ONLY under the `test-fake` feature. This
-// keeps the seam out of the real public API while letting `tests/` inject a fake.
-#[cfg(feature = "test-fake")]
-pub mod testing {
-    pub use crate::backend::fake::FakeFlussSource;
-    pub use crate::backend::fixtures;
-    pub use crate::backend::{FlussSource, FlussTableMeta, KeyValue, LookupKey, TableRef};
-}
-
-// The capture path (integration_tests) writes the same fixture format the fake
-// replays. Expose the fixture format and crate-owned metadata/key types so the
-// capture test (a separate crate) can build and serialize a `FixtureSet`.
-#[cfg(all(feature = "integration_tests", not(feature = "test-fake")))]
-pub mod testing {
-    pub use crate::backend::fixtures;
-    pub use crate::backend::{FlussTableMeta, KeyValue, LookupKey, TableRef};
-}

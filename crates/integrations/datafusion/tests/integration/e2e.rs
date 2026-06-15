@@ -18,17 +18,16 @@
 //! End-to-end path: drives real `ctx.sql(...)` through the production public API
 //! (`FlussDatafusion::new` -> `RealFlussSource`) against a live Fluss cluster.
 //!
-//! This is the one path the cluster-free `test-fake` suite structurally cannot
-//! cover: the replay tests inject a fake source, and `capture` talks to the
-//! low-level client directly. Here the real backend, the sync/async metadata
-//! bridge, and the custom execution plans all run against actual Fluss.
+//! This is the single integration suite: the real backend, the sync/async
+//! metadata bridge, the catalog tree, and the custom execution plans all run
+//! against actual Fluss. There is no cluster-free mirror — the per-call
+//! cache/TTL mechanics are covered by `metadata::cache` unit tests, and the
+//! pushdown contract is verified here against the real server.
 //!
 //! Gated by `integration_tests` (needs a container runtime). Run with:
 //!   cargo test -p fluss-datafusion --features integration_tests -- e2e
 //!
-//! Assertions mirror the fake-backed `kv_lookup` / `log_scan` / `catalog` suites
-//! so the real backend is held to the same contract the fixtures encode. The
-//! whole flow runs in a single test against one cluster: bringing up a Fluss
+//! The whole flow runs in a single test against one cluster: bringing up a Fluss
 //! cluster is expensive, and the assertions are read-only and independent.
 
 #![cfg(feature = "integration_tests")]
@@ -36,7 +35,9 @@
 use std::sync::Arc;
 
 use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::datatypes::DataType;
 use datafusion::execution::context::SessionContext;
+use datafusion::prelude::SessionConfig;
 
 use fluss_datafusion::{FlussDatafusion, RegisterCatalogOptions};
 
@@ -46,8 +47,8 @@ use crate::integration::utils::helpers::{
 };
 use crate::integration::utils::names;
 
-/// Distinct from `capture`'s `df-capture`/9123 so both real-cluster tests can run
-/// concurrently in the same `integration_tests` binary without colliding.
+/// Dedicated name/port for the real-cluster e2e suite so it can run without
+/// colliding with any other cluster in the same `integration_tests` binary.
 const CLUSTER_NAME: &str = "df-e2e";
 const CLUSTER_PORT: u16 = 9133;
 
@@ -64,16 +65,25 @@ async fn end_to_end_sql_through_real_backend() {
     let fd = FlussDatafusion::new(connection.clone(), options())
         .await
         .expect("FlussDatafusion::new over real connection");
-    let ctx = SessionContext::new();
+    // information_schema is opt-in; enable it so the SQL catalog-listing assertion
+    // can query `information_schema.tables`.
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_information_schema(true));
     fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
         .await
         .expect("register_catalog");
 
     catalog_lists_phase1_tables(&ctx);
+    catalog_lists_tables_via_information_schema(&ctx).await;
+    table_provider_exposes_arrow_schema(&ctx).await;
+    catalog_unknown_database_and_table(&ctx);
     kv_single_pk_equality_returns_row(&ctx).await;
     kv_absent_key_returns_no_rows(&ctx).await;
     kv_composite_pk_equality_returns_row(&ctx).await;
     kv_non_primary_key_predicate_fails(&ctx).await;
+    kv_partial_composite_key_fails(&ctx).await;
+    kv_full_scan_without_filter_fails(&ctx).await;
+    kv_in_list_predicate_fails(&ctx).await;
     log_bounded_scan_with_limit_returns_rows(&ctx).await;
     log_projection_keeps_only_projected_column(&ctx).await;
     log_missing_limit_fails(&ctx).await;
@@ -97,6 +107,91 @@ fn catalog_lists_phase1_tables(ctx: &SessionContext) {
             "expected table {expected} in {tables:?}"
         );
     }
+}
+
+/// Lists the Phase 1 tables via `information_schema.tables`, exercising the async
+/// `table()` path through SQL rather than the direct catalog-tree walk above.
+async fn catalog_lists_tables_via_information_schema(ctx: &SessionContext) {
+    let batches = ctx
+        .sql(&format!(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_catalog = '{CATALOG}' AND table_schema = '{}' \
+             ORDER BY table_name",
+            names::DATABASE
+        ))
+        .await
+        .expect("sql plan")
+        .collect()
+        .await
+        .expect("collect");
+
+    let mut found: Vec<String> = Vec::new();
+    for b in &batches {
+        let col = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("table_name string column");
+        for i in 0..col.len() {
+            found.push(col.value(i).to_string());
+        }
+    }
+    for expected in [names::KV_SIMPLE, names::KV_COMPOSITE, names::LOG_BASIC] {
+        assert!(
+            found.iter().any(|t| t == expected),
+            "information_schema missing {expected}: {found:?}"
+        );
+    }
+}
+
+/// Proves the `TableProvider` exposes the table's Arrow schema (column presence +
+/// Fluss `int` -> Arrow `Int32` mapping).
+async fn table_provider_exposes_arrow_schema(ctx: &SessionContext) {
+    let schema = ctx
+        .catalog(CATALOG)
+        .expect("catalog")
+        .schema(names::DATABASE)
+        .expect("schema");
+    let table = schema
+        .table(names::KV_SIMPLE)
+        .await
+        .expect("table lookup ok")
+        .expect("kv_simple present");
+
+    let arrow_schema = table.schema();
+    let field_names: Vec<&str> = arrow_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    assert!(
+        field_names.contains(&"id"),
+        "expected id column, got {field_names:?}"
+    );
+    let id_field = arrow_schema.field_with_name("id").expect("id field");
+    assert_eq!(
+        id_field.data_type(),
+        &DataType::Int32,
+        "id should map to Int32"
+    );
+}
+
+/// Unknown database and unknown table are absent from the catalog tree, mirroring
+/// the source-level `DatabaseNotFound` / `TableNotFound` contract at the catalog
+/// surface a SQL user actually sees.
+fn catalog_unknown_database_and_table(ctx: &SessionContext) {
+    let catalog = ctx.catalog(CATALOG).expect("catalog registered");
+    assert!(
+        catalog.schema("does_not_exist").is_none(),
+        "unknown database must not appear as a schema"
+    );
+    let schema = catalog
+        .schema(names::DATABASE)
+        .expect("database schema present");
+    assert!(
+        !schema.table_names().iter().any(|t| t == "no_such_table"),
+        "unknown table must not appear in the table listing"
+    );
 }
 
 async fn kv_single_pk_equality_returns_row(ctx: &SessionContext) {
@@ -181,6 +276,54 @@ async fn kv_non_primary_key_predicate_fails(ctx: &SessionContext) {
         ctx,
         &format!(
             "SELECT * FROM {CATALOG}.{}.{} WHERE name = 'x'",
+            names::DATABASE,
+            names::KV_SIMPLE
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
+}
+
+async fn kv_partial_composite_key_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{} WHERE region = 'us'",
+            names::DATABASE,
+            names::KV_COMPOSITE
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
+}
+
+async fn kv_full_scan_without_filter_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{}",
+            names::DATABASE,
+            names::KV_SIMPLE
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
+}
+
+async fn kv_in_list_predicate_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{} WHERE id IN (1, 2)",
             names::DATABASE,
             names::KV_SIMPLE
         ),

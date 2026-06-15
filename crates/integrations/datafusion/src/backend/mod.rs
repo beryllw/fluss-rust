@@ -22,33 +22,22 @@
 //! `pub(crate)` test seam, deliberately NOT a public gateway-shaped backend
 //! abstraction: it carries no session, protocol, or auth concepts.
 //!
-//! Two implementations exist:
+//! One implementation exists:
 //! - [`real::RealFlussSource`] wraps the production fluss client.
-//! - [`fake::FakeFlussSource`] (feature `test-fake`) replays committed fixtures
-//!   captured from a real cluster, opening zero sockets.
 
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
-use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
 pub(crate) mod real;
 
-// Fixture format is shared by the capture path (integration_tests) and the
-// replay path (test-fake). Compiled whenever either is active.
-#[cfg(any(feature = "test-fake", feature = "integration_tests"))]
-pub mod fixtures;
-
-#[cfg(feature = "test-fake")]
-pub mod fake;
-
 /// Identifies a Fluss table by `database.table`.
 ///
-/// Crate-local so callers and fixtures share one representation without pulling
-/// in `fluss::metadata::TablePath` everywhere.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Crate-local so callers share one representation without pulling in
+/// `fluss::metadata::TablePath` everywhere.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableRef {
     pub database: String,
     pub table: String,
@@ -77,16 +66,21 @@ impl From<&TableRef> for fluss::metadata::TablePath {
 
 /// Minimal table metadata the crate needs in Phase 1.
 ///
-/// This is intentionally a small, serde-able, crate-owned struct rather than
-/// `fluss::metadata::TableInfo` (which is not `Serialize`). It carries exactly
-/// what catalog wiring, predicate analysis, and execution need, and it round
-/// trips cleanly through fixtures.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// This is intentionally a small, crate-owned struct rather than
+/// `fluss::metadata::TableInfo`. It carries exactly what catalog wiring,
+/// predicate analysis, and execution need.
+///
+/// `table_id`, `schema_id`, `table_ref`, and `num_buckets` are captured from the
+/// source but not yet read by Phase 1 execution (the bounded scan reads
+/// `num_buckets` straight off `TableInfo`). They are retained for the multi-bucket
+/// scan and partition-pruning work that consumes them.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct FlussTableMeta {
     pub table_ref: TableRef,
     pub table_id: i64,
     pub schema_id: i32,
-    /// The Fluss `Schema` (column types + primary key). Serde-able via fluss.
+    /// The Fluss `Schema` (column types + primary key).
     pub schema: fluss::metadata::Schema,
     pub primary_keys: Vec<String>,
     pub num_buckets: i32,
@@ -102,9 +96,9 @@ impl FlussTableMeta {
 ///
 /// Phase 1 only needs the value types reachable from a primary-key equality
 /// predicate. Construction of the actual `GenericRow` key from these values is
-/// owned by [`real`] (and replayed by [`fake`]); higher layers (Task 4) build
-/// these from DataFusion `ScalarValue`s.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// owned by [`real`]; higher layers (Task 4) build these from DataFusion
+/// `ScalarValue`s.
+#[derive(Debug, Clone, PartialEq)]
 pub enum KeyValue {
     Boolean(bool),
     Int8(i8),
@@ -121,7 +115,7 @@ pub type LookupKey = Vec<KeyValue>;
 /// The single internal seam for all Fluss access used by Phase 1.
 ///
 /// `#[async_trait]` lets the crate hold an `Arc<dyn FlussSource>` and dispatch
-/// async metadata/lookup/scan calls dynamically (real vs fake).
+/// async metadata/lookup/scan calls dynamically.
 #[async_trait::async_trait]
 pub trait FlussSource: Send + Sync {
     /// Lists all database names in the cluster.

@@ -17,22 +17,14 @@
 
 //! Shared helpers for fluss-datafusion integration tests.
 //!
-//! Two backends, one contract:
-//! - fake: replays committed fixtures (no cluster). Default for fast tests.
-//! - real: capture path only, gated by `integration_tests` (needs Docker).
-//!
-//! The same fixture data drives both the capture (write) and replay (read)
-//! sides, so the fake never drifts from real Fluss.
+//! There is a single integration backend: a real Fluss cluster, gated by
+//! `integration_tests` (needs a container runtime). These helpers cover the
+//! shared table identifiers and SQL-path utilities used by that suite.
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
-
-/// The single committed fixture file the fake replays.
-pub const FIXTURE_FILE: &str = "phase1.json";
-
-/// Known capture identifiers. Keep capture and replay assertions in sync via
-/// these constants instead of stringly-typed names.
+/// Known table identifiers shared by the real-cluster setup and assertions, so
+/// DDL and queries stay in sync instead of being stringly-typed.
 pub mod names {
     pub const DATABASE: &str = "fluss";
     /// KV table with a single-column primary key.
@@ -43,59 +35,11 @@ pub mod names {
     pub const LOG_BASIC: &str = "df_log_basic";
 }
 
-/// Absolute path to the committed fixtures directory.
-pub fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-}
-
-/// Absolute path to the committed Phase 1 fixture file.
-pub fn fixture_path() -> PathBuf {
-    fixtures_dir().join(FIXTURE_FILE)
-}
-
-/// Builds a fixture-backed fake source. Cluster-free; opens zero sockets.
-#[cfg(feature = "test-fake")]
-pub fn fake_source() -> std::sync::Arc<dyn fluss_datafusion::testing::FlussSource> {
-    let path = fixture_path();
-    let fake = fluss_datafusion::testing::FakeFlussSource::from_fixture_file(&path)
-        .unwrap_or_else(|e| panic!("failed to load fixture {}: {e}", path.display()));
-    std::sync::Arc::new(fake)
-}
-
-/// True when committed fixtures exist (so replay tests can run).
-#[cfg(feature = "test-fake")]
-pub fn fixtures_present() -> bool {
-    fixture_path().exists()
-}
-
-/// Returns `true` when fixtures are present; otherwise logs a skip message and
-/// returns `false` so a test can early-return.
+/// Shared SQL-path helpers for the real-cluster integration suite.
 ///
-/// Fixtures are produced by the `integration_tests` capture path against a real
-/// cluster. Without them there is nothing to replay; failing loudly here would
-/// punish environments that simply have not run capture yet.
-#[cfg(feature = "test-fake")]
-pub fn fixtures_ready() -> bool {
-    if fixtures_present() {
-        return true;
-    }
-    eprintln!(
-        "skipping: no committed fixtures at {} (run capture with --features integration_tests)",
-        fixture_path().display()
-    );
-    false
-}
-
-/// Shared SQL-path helpers for the integration tests.
-///
-/// Backend-agnostic helpers (row counting, column extraction, error capture,
-/// `EXPLAIN` rendering) are available to both the cluster-free (`test-fake`) and
-/// real-cluster (`integration_tests`) suites. The fake-only `ctx_with_catalog`
-/// stays gated to `test-fake`; the real suite builds its context from a live
-/// connection instead.
-#[cfg(any(feature = "test-fake", feature = "integration_tests"))]
+/// Backend-agnostic helpers: row counting, column extraction, error capture, and
+/// `EXPLAIN` rendering.
+#[cfg(feature = "integration_tests")]
 pub mod helpers {
     use arrow::array::{Array, Int32Array, RecordBatch, StringArray};
     use datafusion::execution::context::SessionContext;
@@ -108,21 +52,6 @@ pub mod helpers {
     /// Default installer options for the tests.
     pub fn options() -> FlussDatafusionOptions {
         FlussDatafusionOptions::default()
-    }
-
-    /// Builds a context with the Fluss catalog registered through the fake.
-    #[cfg(feature = "test-fake")]
-    pub async fn ctx_with_catalog() -> SessionContext {
-        use fluss_datafusion::{FlussDatafusion, RegisterCatalogOptions};
-
-        use super::fake_source;
-
-        let fd = FlussDatafusion::new_with_source(fake_source(), options());
-        let ctx = SessionContext::new();
-        fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
-            .await
-            .expect("register_catalog");
-        ctx
     }
 
     /// Total row count across all batches.

@@ -40,8 +40,6 @@ pub enum FlussDatafusionError {
     TypeConversion(String),
     /// An error surfaced from the underlying Fluss client.
     FlussClient(String),
-    /// A test fixture could not be loaded or replayed.
-    Fixture(String),
     /// An invariant inside the crate was violated.
     Internal(String),
 }
@@ -56,7 +54,6 @@ impl Display for FlussDatafusionError {
             Self::SchemaMismatch(msg) => write!(f, "schema mismatch: {msg}"),
             Self::TypeConversion(msg) => write!(f, "type conversion error: {msg}"),
             Self::FlussClient(msg) => write!(f, "fluss client error: {msg}"),
-            Self::Fixture(msg) => write!(f, "fixture error: {msg}"),
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }
@@ -73,18 +70,6 @@ impl From<fluss::error::Error> for FlussDatafusionError {
 impl From<arrow::error::ArrowError> for FlussDatafusionError {
     fn from(err: arrow::error::ArrowError) -> Self {
         Self::SchemaMismatch(err.to_string())
-    }
-}
-
-impl From<std::io::Error> for FlussDatafusionError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Fixture(err.to_string())
-    }
-}
-
-impl From<serde_json::Error> for FlussDatafusionError {
-    fn from(err: serde_json::Error) -> Self {
-        Self::Fixture(err.to_string())
     }
 }
 

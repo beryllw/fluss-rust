@@ -17,8 +17,7 @@
 
 //! Integration test entrypoint for fluss-datafusion.
 //!
-//! Submodules are feature-gated:
-//!   cargo test -p fluss-datafusion --features test-fake          # cluster-free
-//!   cargo test -p fluss-datafusion --features integration_tests  # needs Docker
+//! The integration suite runs against a real Fluss cluster and is feature-gated:
+//!   cargo test -p fluss-datafusion --features integration_tests  # needs a container runtime
 
 mod integration;

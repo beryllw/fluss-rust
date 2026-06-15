@@ -1946,8 +1946,6 @@ dependencies = [
  "fluss-rs",
  "fluss-test-cluster",
  "futures",
- "serde",
- "serde_json",
  "tokio",
 ]
 
