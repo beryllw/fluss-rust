@@ -56,6 +56,39 @@ pub(crate) fn scalar_to_key_value(value: &ScalarValue) -> Result<KeyValue> {
     }
 }
 
+/// Converts a DataFusion `ScalarValue` equality literal into the Fluss
+/// partition-value string form used for equality pruning.
+///
+/// Fluss stores partition values as strings (e.g. "US", "2024-01-15"), so the
+/// supported literal types are rendered to their string representation. NULL
+/// payloads and unsupported types are rejected with
+/// [`FlussDatafusionError::TypeConversion`] rather than silently coercing; the
+/// caller treats that as "no binding" (pruning is best-effort).
+pub(crate) fn scalar_to_partition_string(value: &ScalarValue) -> Result<String> {
+    match value {
+        ScalarValue::Utf8(Some(v)) => Ok(v.clone()),
+        ScalarValue::Int8(Some(v)) => Ok(v.to_string()),
+        ScalarValue::Int16(Some(v)) => Ok(v.to_string()),
+        ScalarValue::Int32(Some(v)) => Ok(v.to_string()),
+        ScalarValue::Int64(Some(v)) => Ok(v.to_string()),
+        ScalarValue::Boolean(Some(v)) => Ok(v.to_string()),
+        // A typed-but-null literal cannot identify a partition.
+        ScalarValue::Utf8(None)
+        | ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::Boolean(None)
+        | ScalarValue::Null => Err(FlussDatafusionError::TypeConversion(
+            "NULL literal cannot be used as a partition value".to_string(),
+        )),
+        other => Err(FlussDatafusionError::TypeConversion(format!(
+            "scalar type {} is not supported as a partition value",
+            other.data_type()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +140,27 @@ mod tests {
     #[test]
     fn rejects_unsupported_types() {
         let err = scalar_to_key_value(&ScalarValue::Float64(Some(1.0))).unwrap_err();
+        assert!(
+            matches!(err, FlussDatafusionError::TypeConversion(_)),
+            "expected TypeConversion, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn partition_string_converts_utf8_and_int() {
+        assert_eq!(
+            scalar_to_partition_string(&ScalarValue::Utf8(Some("US".to_string()))).unwrap(),
+            "US"
+        );
+        assert_eq!(
+            scalar_to_partition_string(&ScalarValue::Int32(Some(42))).unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn partition_string_rejects_null() {
+        let err = scalar_to_partition_string(&ScalarValue::Utf8(None)).unwrap_err();
         assert!(
             matches!(err, FlussDatafusionError::TypeConversion(_)),
             "expected TypeConversion, got {err:?}"

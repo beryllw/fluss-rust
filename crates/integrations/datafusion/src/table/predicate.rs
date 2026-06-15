@@ -32,7 +32,7 @@ use datafusion::prelude::Expr;
 
 use crate::backend::{KeyValue, LookupKey};
 use crate::error::{FlussDatafusionError, Result};
-use crate::types::scalar::scalar_to_key_value;
+use crate::types::scalar::{scalar_to_key_value, scalar_to_partition_string};
 
 /// True if a single filter is a `primary_key_column = literal` equality.
 ///
@@ -111,6 +111,47 @@ pub(crate) fn analyze_kv_filters(
         key.push(value);
     }
     Ok(key)
+}
+
+/// True if a single filter is a `partition_column = literal` equality.
+///
+/// Used by the log table's `supports_filters_pushdown` to mark partition-column
+/// equality filters as (inexact) pushdown candidates; every other filter stays
+/// `Unsupported`.
+pub(crate) fn is_partition_equality(filter: &Expr, partition_keys: &[String]) -> bool {
+    matches!(
+        single_equality(filter),
+        Some((column, _)) if partition_keys.iter().any(|pk| pk == column)
+    )
+}
+
+/// Extracts the partition-column equality bindings (column -> value string) from
+/// the filter conjunction, considering ONLY columns in `partition_keys`. Equality
+/// only; non-equality or non-partition filters are ignored (left to FilterExec).
+/// Returns the bindings found (possibly empty => no pruning => scan all).
+///
+/// Conversion of a literal to the partition-value string is best-effort: a value
+/// that cannot be rendered (e.g. NULL, an unsupported type) is skipped rather than
+/// failing, because the residual `FilterExec` guarantees correctness regardless of
+/// how aggressively pruning narrows the partition set.
+pub(crate) fn analyze_partition_filters(
+    filters: &[Expr],
+    partition_keys: &[String],
+) -> HashMap<String, String> {
+    let mut bindings: HashMap<String, String> = HashMap::new();
+    for filter in filters {
+        let Some((column, scalar)) = single_equality(filter) else {
+            continue;
+        };
+        if !partition_keys.iter().any(|pk| pk == column) {
+            continue;
+        }
+        if let Ok(value) = scalar_to_partition_string(&scalar) {
+            // Last write wins; duplicates are not an error for best-effort pruning.
+            bindings.insert(column.to_string(), value);
+        }
+    }
+    bindings
 }
 
 /// Matches a single `column = literal` (in either operand order) and returns the
@@ -252,5 +293,36 @@ mod tests {
         assert!(is_primary_key_equality(&col("id").eq(lit(1i32)), &pk));
         assert!(!is_primary_key_equality(&col("name").eq(lit("x")), &pk));
         assert!(!is_primary_key_equality(&col("id").gt(lit(1i32)), &pk));
+    }
+
+    #[test]
+    fn partition_equality_binding_is_extracted() {
+        let parts = pks(&["region"]);
+        let filters = vec![col("region").eq(lit("US"))];
+        let bindings = analyze_partition_filters(&filters, &parts);
+        assert_eq!(bindings.get("region"), Some(&"US".to_string()));
+        assert_eq!(bindings.len(), 1);
+    }
+
+    #[test]
+    fn non_partition_column_yields_no_binding() {
+        let parts = pks(&["region"]);
+        let filters = vec![col("name").eq(lit("x"))];
+        assert!(analyze_partition_filters(&filters, &parts).is_empty());
+    }
+
+    #[test]
+    fn range_on_partition_column_yields_no_binding() {
+        let parts = pks(&["region"]);
+        let filters = vec![col("region").gt(lit("US"))];
+        assert!(analyze_partition_filters(&filters, &parts).is_empty());
+    }
+
+    #[test]
+    fn is_partition_equality_classifies_filters() {
+        let parts = pks(&["region"]);
+        assert!(is_partition_equality(&col("region").eq(lit("US")), &parts));
+        assert!(!is_partition_equality(&col("name").eq(lit("x")), &parts));
+        assert!(!is_partition_equality(&col("region").gt(lit("US")), &parts));
     }
 }

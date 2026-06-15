@@ -16,6 +16,9 @@ Apache Fluss 表的访问。它把 Fluss 的 KV 表与 Log 表暴露成 DataFusi
 - **KV 表**：完整主键等值谓词下推为点查（point lookup），支持单主键与复合主键
 - **Log 表**：带 `LIMIT` 的有界扫描（bounded scan），支持投影下推与多 bucket 表（一个 bucket
   对应一个并行 partition；per-bucket last-N，再施加跨 bucket 的最终 `LIMIT`；不保证跨 bucket 顺序）
+- **分区裁剪（partition pruning，仅等值）**：分区 Log 表上的 `partition_col = 'value'` 谓词会把
+  扫描裁剪到匹配的分区；不带分区谓词时扫描所有分区（裁剪是可选优化，绝非必需）。分区 KV 表通过既有的
+  完整主键点查解析，点查本身已定位到唯一所属分区
 - Fluss schema 到 Arrow schema、Fluss row 到 `RecordBatch` 的转换
 - 共享 installer + 每会话 `register_catalog(...)` 的使用模型
 - 不支持的查询形态会**保守失败**（明确报错），而不会静默退化成误导性的全表扫描
@@ -74,8 +77,9 @@ DDL 在同一会话内即时可见。
 
 | 表类型 | 受支持的形态 | 说明 |
 |---|---|---|
-| KV（主键表） | `WHERE <完整主键> = <值>`（复合主键用 `AND` 全列等值） | 下推为点查，命中返回 1 行，未命中返回 0 行（不报错） |
+| KV（主键表） | `WHERE <完整主键> = <值>`（复合主键用 `AND` 全列等值） | 下推为点查，命中返回 1 行，未命中返回 0 行（不报错）。分区 KV 表的分区键是主键的一部分，点查会自动解析到所属分区 |
 | Log（日志表） | `... LIMIT n` | 有界扫描；投影下推；多 bucket（一个 bucket 对应一个并行 partition）；每个 bucket 各保留**末尾** `n` 行（与 Fluss `LimitBatchScanner` 语义一致），再施加跨 bucket 的最终 `LIMIT`；不保证跨 bucket 顺序 |
+| 分区 Log 表 | `WHERE partition_col = 'v' ... LIMIT n` | 仅等值的分区裁剪：扫描仅命中匹配的分区（保留分区与 bucket 的笛卡尔积）；不带分区谓词则扫描全部分区。下推为 `Inexact`，因此其上仍会叠加一个 `FilterExec` 复核谓词 |
 
 ### 会保守失败的形态
 

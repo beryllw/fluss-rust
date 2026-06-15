@@ -43,7 +43,7 @@ use fluss_datafusion::{FlussDatafusion, RegisterCatalogOptions};
 
 use crate::integration::setup;
 use crate::integration::utils::helpers::{
-    CATALOG, collect_i32, expect_query_error, options, render_explain, total_rows,
+    CATALOG, collect_i32, collect_strings, expect_query_error, options, render_explain, total_rows,
 };
 use crate::integration::utils::names;
 
@@ -61,6 +61,8 @@ async fn end_to_end_sql_through_real_backend() {
     setup::create_kv_composite(&connection).await;
     setup::create_log_basic(&connection).await;
     setup::create_log_multi_bucket(&connection).await;
+    setup::create_log_partitioned(&connection).await;
+    setup::create_kv_partitioned(&connection).await;
 
     // The production constructor over the real connection: the path under test.
     let fd = FlussDatafusion::new(connection.clone(), options())
@@ -89,6 +91,9 @@ async fn end_to_end_sql_through_real_backend() {
     log_multi_bucket_scan_returns_limited_rows(&ctx).await;
     log_projection_keeps_only_projected_column(&ctx).await;
     log_missing_limit_fails(&ctx).await;
+    log_partitioned_pruned_scan_returns_only_matching_partition(&ctx).await;
+    log_partitioned_scan_without_predicate_reads_all_partitions(&ctx).await;
+    kv_partitioned_full_pk_lookup_returns_row(&ctx).await;
     explain_shows_custom_plans(&ctx).await;
 
     // Best-effort cleanup so reruns start clean; the cluster also stops on drop.
@@ -435,6 +440,79 @@ async fn log_missing_limit_fails(ctx: &SessionContext) {
         err.contains("LIMIT required"),
         "expected LIMIT-required error, got: {err}"
     );
+}
+
+/// A partition-column equality prunes the bounded scan to the matching partition:
+/// `region = 'US'` returns only the two US rows. The residual `FilterExec` (the
+/// `Inexact` pushdown) keeps correctness even if pruning were imperfect.
+async fn log_partitioned_pruned_scan_returns_only_matching_partition(ctx: &SessionContext) {
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id, name, region FROM {CATALOG}.{}.{} WHERE region = 'US' LIMIT 10",
+            names::DATABASE,
+            names::LOG_PARTITIONED
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(
+        total_rows(&batches),
+        2,
+        "region = 'US' should return exactly the two US rows"
+    );
+    for region in collect_strings(&batches, 2) {
+        assert_eq!(region, "US", "pruned scan must only return US rows");
+    }
+}
+
+/// With no partition predicate, the scan reads ALL partitions (pruning is optional,
+/// never required): all four rows across US and EU are returned.
+async fn log_partitioned_scan_without_predicate_reads_all_partitions(ctx: &SessionContext) {
+    let batches = ctx
+        .sql(&format!(
+            "SELECT id FROM {CATALOG}.{}.{} LIMIT 10",
+            names::DATABASE,
+            names::LOG_PARTITIONED
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(
+        total_rows(&batches),
+        4,
+        "no partition predicate must scan all partitions (four rows)"
+    );
+}
+
+/// A partitioned KV table resolves the partition from the full primary key via the
+/// Fluss `Lookuper`: the existing full-PK lookup path needs no partition-specific
+/// code. `region = 'US' AND id = 1` returns the single matching row.
+async fn kv_partitioned_full_pk_lookup_returns_row(ctx: &SessionContext) {
+    let batches = ctx
+        .sql(&format!(
+            "SELECT region, id, score FROM {CATALOG}.{}.{} WHERE region = 'US' AND id = 1",
+            names::DATABASE,
+            names::KV_PARTITIONED
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(total_rows(&batches), 1, "full PK lookup should match one row");
+    let scores = batches[0]
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("score int64");
+    assert_eq!(scores.value(0), 100);
 }
 
 async fn explain_shows_custom_plans(ctx: &SessionContext) {

@@ -93,6 +93,7 @@ impl SchemaProvider for FlussSchemaProvider {
                 table_ref,
                 entry.arrow_schema,
                 entry.meta.num_buckets,
+                entry.meta.partition_keys.clone(),
             );
             Ok(Some(Arc::new(provider)))
         }

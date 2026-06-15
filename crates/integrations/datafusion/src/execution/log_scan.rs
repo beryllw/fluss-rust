@@ -17,10 +17,13 @@
 
 //! Custom `ExecutionPlan` for a bounded log scan.
 //!
-//! A leaf plan reporting one partition per bucket: `execute(partition)` scans
-//! exactly bucket `partition` via [`FlussSource::log_scan`] with a required
-//! `limit`, so buckets read in parallel. Each partition returns its bucket's
-//! last-`limit` rows; DataFusion applies a final cross-bucket `LIMIT` above this
+//! A leaf plan reporting one DataFusion partition per scan target, where a target
+//! is a `(partition_id, bucket)` pair (`partition_id` is `None` for a
+//! non-partitioned table). `execute(partition)` scans exactly that target via
+//! [`FlussSource::log_scan`] with a required `limit`, so targets read in parallel.
+//! For a partitioned table the target set is the cross product of the partitions
+//! kept after pruning and the table's buckets. Each target returns its bucket's
+//! last-`limit` rows; DataFusion applies a final cross-target `LIMIT` above this
 //! plan. The display name `FlussLogScanExec` makes the bounded scan visible in
 //! `EXPLAIN`.
 //!
@@ -49,8 +52,9 @@ pub(crate) struct FlussLogScanExec {
     /// Column indices into the full table schema; `None` means all columns.
     projection: Option<Vec<usize>>,
     limit: usize,
-    /// Number of buckets = number of output partitions (one bucket per partition).
-    num_buckets: i32,
+    /// Scan targets: one `(partition_id, bucket)` per DataFusion output partition.
+    /// `partition_id` is `None` for a non-partitioned table.
+    targets: Vec<(Option<i64>, i32)>,
     /// Output (post-projection) schema declared to DataFusion.
     projected_schema: SchemaRef,
     properties: PlanProperties,
@@ -62,14 +66,14 @@ impl FlussLogScanExec {
         table_ref: TableRef,
         projection: Option<Vec<usize>>,
         limit: usize,
-        num_buckets: i32,
+        targets: Vec<(Option<i64>, i32)>,
         projected_schema: SchemaRef,
     ) -> Self {
-        // One partition per bucket so buckets read in parallel; `execute(partition)`
-        // scans bucket `partition`.
+        // One DataFusion partition per target so targets read in parallel;
+        // `execute(partition)` scans `targets[partition]`.
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
-            Partitioning::UnknownPartitioning(num_buckets.max(0) as usize),
+            Partitioning::UnknownPartitioning(targets.len()),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -78,7 +82,7 @@ impl FlussLogScanExec {
             table_ref,
             projection,
             limit,
-            num_buckets,
+            targets,
             projected_schema,
             properties,
         }
@@ -89,8 +93,10 @@ impl Debug for FlussLogScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FlussLogScanExec(table={}, limit={}, num_buckets={})",
-            self.table_ref, self.limit, self.num_buckets
+            "FlussLogScanExec(table={}, limit={}, partitions={})",
+            self.table_ref,
+            self.limit,
+            self.targets.len()
         )
     }
 }
@@ -101,8 +107,10 @@ impl DisplayAs for FlussLogScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "FlussLogScanExec: table={}, limit={}, num_buckets={}",
-                    self.table_ref, self.limit, self.num_buckets
+                    "FlussLogScanExec: table={}, limit={}, partitions={}",
+                    self.table_ref,
+                    self.limit,
+                    self.targets.len()
                 )
             }
             DisplayFormatType::TreeRender => {
@@ -147,13 +155,13 @@ impl ExecutionPlan for FlussLogScanExec {
         let table_ref = self.table_ref.clone();
         let projection = self.projection.clone();
         let limit = self.limit;
-        // One partition maps to one bucket; this partition scans exactly that bucket.
-        let bucket = partition as i32;
+        // One DataFusion partition maps to one (partition_id, bucket) target.
+        let (partition_id, bucket) = self.targets[partition];
 
         let future = async move {
             // `log_scan` already projects to `projection`; do NOT re-project.
             let batches = source
-                .log_scan(&table_ref, bucket, projection.as_deref(), limit)
+                .log_scan(&table_ref, partition_id, bucket, projection.as_deref(), limit)
                 .await?;
             Ok(batches)
         };

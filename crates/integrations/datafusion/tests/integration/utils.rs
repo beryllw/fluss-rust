@@ -39,6 +39,10 @@ pub mod names {
     pub const LOG_LIVE: &str = "df_log_live";
     /// Log table created up front, then dropped, to prove drops are reflected live.
     pub const LOG_TRANSIENT: &str = "df_log_transient";
+    /// Partitioned log table proving partition pruning of bounded scans.
+    pub const LOG_PARTITIONED: &str = "df_log_partitioned";
+    /// Partitioned KV table proving full-PK lookup resolves the partition.
+    pub const KV_PARTITIONED: &str = "df_kv_partitioned";
 }
 
 /// Shared SQL-path helpers for the real-cluster integration suite.
@@ -76,6 +80,21 @@ pub mod helpers {
                     .expect("expected int32 column")
                     .values()
                     .to_vec()
+            })
+            .collect()
+    }
+
+    /// Flattens the string values of column `col` across all batches, in order.
+    pub fn collect_strings(batches: &[RecordBatch], col: usize) -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| {
+                let arr = b
+                    .column(col)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("expected string column");
+                (0..arr.len()).map(|i| arr.value(i).to_string())
             })
             .collect()
     }

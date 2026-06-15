@@ -31,7 +31,7 @@ use fluss::error::FlussError;
 use fluss::metadata::{TableBucket, TableInfo, TablePath};
 use fluss::row::GenericRow;
 
-use super::{FlussSource, FlussTableMeta, KeyValue, LookupKey, TableRef};
+use super::{FlussPartition, FlussSource, FlussTableMeta, KeyValue, LookupKey, TableRef};
 use crate::error::{FlussDatafusionError, Result};
 
 /// Wraps a shared [`FlussConnection`] and adapts it to the [`FlussSource`] seam.
@@ -52,6 +52,7 @@ impl RealFlussSource {
             schema: info.get_schema().clone(),
             primary_keys: info.get_primary_keys().clone(),
             num_buckets: info.get_num_buckets(),
+            partition_keys: info.get_partition_keys().to_vec(),
         }
     }
 }
@@ -120,9 +121,32 @@ impl FlussSource for RealFlussSource {
         Ok(result.to_record_batch()?)
     }
 
+    async fn list_partitions(&self, table: &TableRef) -> Result<Vec<FlussPartition>> {
+        let admin = self.connection.get_admin()?;
+        let path: TablePath = table.into();
+        let infos = admin.list_partition_infos(&path).await?;
+        Ok(infos
+            .into_iter()
+            .map(|info| {
+                let spec = info.get_resolved_partition_spec();
+                let values = spec
+                    .get_partition_keys()
+                    .iter()
+                    .cloned()
+                    .zip(spec.get_partition_values().iter().cloned())
+                    .collect();
+                FlussPartition {
+                    partition_id: info.get_partition_id(),
+                    values,
+                }
+            })
+            .collect())
+    }
+
     async fn log_scan(
         &self,
         table: &TableRef,
+        partition_id: Option<i64>,
         bucket: i32,
         projection: Option<&[usize]>,
         limit: usize,
@@ -138,9 +162,9 @@ impl FlussSource for RealFlussSource {
         if let Some(indices) = projection {
             scan = scan.project(indices)?;
         }
-        let mut scanner = scan
-            .limit(limit_i32)?
-            .create_bucket_batch_scanner(TableBucket::new(table_id, bucket))?;
+        let mut scanner = scan.limit(limit_i32)?.create_bucket_batch_scanner(
+            TableBucket::new_with_partition(table_id, partition_id, bucket),
+        )?;
 
         let batches = scanner.collect_all_batches().await?;
         Ok(batches.into_iter().map(|b| b.into_batch()).collect())

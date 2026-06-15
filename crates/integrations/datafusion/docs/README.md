@@ -21,6 +21,11 @@ forms, so you can query Fluss directly with `ctx.sql(...)`.
 - **Log tables**: bounded scan with `LIMIT`, supporting projection pushdown and
   multi-bucket tables (one bucket per parallel partition, per-bucket last-N with
   a final cross-bucket `LIMIT`; no cross-bucket order guarantee).
+- **Partition pruning** (equality-only): a `partition_col = 'value'` filter on a
+  partitioned log table prunes the scan to the matching partitions; with no
+  partition predicate all partitions are scanned (pruning is optional, never
+  required). Partitioned KV tables are resolved through the existing full-PK
+  lookup, which already targets the single owning partition.
 - Fluss-schema-to-Arrow-schema and Fluss-row-to-`RecordBatch` conversion.
 - A usage model of a shared installer plus per-session `register_catalog(...)`.
 - Unsupported query forms **fail conservatively** (raise an explicit error)
@@ -84,8 +89,9 @@ visible in the same session immediately.
 
 | Table type | Supported form | Notes |
 |---|---|---|
-| KV (primary-key table) | `WHERE <full primary key> = <value>` (composite keys use `AND` equality on every column) | Pushed down as a point lookup; a hit returns 1 row, a miss returns 0 rows (no error) |
+| KV (primary-key table) | `WHERE <full primary key> = <value>` (composite keys use `AND` equality on every column) | Pushed down as a point lookup; a hit returns 1 row, a miss returns 0 rows (no error). For a partitioned KV table the partition key is part of the PK, so the lookup resolves the partition automatically |
 | Log table | `... LIMIT n` | Bounded scan; projection pushdown; multi-bucket (one bucket per parallel partition); each bucket keeps its **last** `n` rows (matching Fluss `LimitBatchScanner` semantics), with a final cross-bucket `LIMIT` applied; no cross-bucket order guarantee |
+| Partitioned log table | `WHERE partition_col = 'v' ... LIMIT n` | Equality-only partition pruning: the scan targets only matching partitions (cross product of kept partitions and buckets); no partition predicate scans all partitions. Pushdown is `Inexact`, so a residual `FilterExec` still re-applies the predicate |
 
 ### Forms that fail conservatively
 

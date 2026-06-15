@@ -70,10 +70,11 @@ impl From<&TableRef> for fluss::metadata::TablePath {
 /// `fluss::metadata::TableInfo`. It carries exactly what catalog wiring,
 /// predicate analysis, and execution need.
 ///
-/// `table_id`, `schema_id`, `table_ref`, and `num_buckets` are captured from the
-/// source but not yet read by Phase 1 execution (the bounded scan reads
-/// `num_buckets` straight off `TableInfo`). They are retained for the multi-bucket
-/// scan and partition-pruning work that consumes them.
+/// `table_id`, `schema_id`, and `table_ref` are captured from the source but not
+/// yet read by Phase 1 execution. They are retained for the work that consumes
+/// them. `partition_keys` is empty for a non-partitioned table and otherwise
+/// names the partition columns (in partition-key order) used for equality
+/// pruning of log scans.
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct FlussTableMeta {
@@ -84,12 +85,25 @@ pub struct FlussTableMeta {
     pub schema: fluss::metadata::Schema,
     pub primary_keys: Vec<String>,
     pub num_buckets: i32,
+    /// Partition-key column names, in partition-key order. Empty when the table
+    /// is not partitioned.
+    pub partition_keys: Vec<String>,
 }
 
 impl FlussTableMeta {
     pub fn has_primary_key(&self) -> bool {
         !self.primary_keys.is_empty()
     }
+}
+
+/// One partition of a partitioned Fluss table: its id plus the partition-key
+/// values (as strings, in partition-key order) used for equality pruning.
+#[derive(Debug, Clone)]
+pub struct FlussPartition {
+    pub partition_id: i64,
+    /// (partition_key, value) pairs in partition-key order. Fluss stores
+    /// partition values as strings.
+    pub values: Vec<(String, String)>,
 }
 
 /// One scalar key field for a full-primary-key equality lookup.
@@ -133,17 +147,24 @@ pub trait FlussSource: Send + Sync {
     /// with the table's projected schema when the key is absent.
     async fn lookup(&self, table: &TableRef, key: &LookupKey) -> Result<RecordBatch>;
 
+    /// Lists the partitions of a partitioned table. Returns an empty vec for a
+    /// non-partitioned table (callers should not call it in that case).
+    async fn list_partitions(&self, table: &TableRef) -> Result<Vec<FlussPartition>>;
+
     /// Performs a bounded log scan of ONE bucket.
     ///
-    /// `bucket` is the bucket id to scan (one bucket maps to one DataFusion
-    /// partition). `projection` is column indices into the table schema (`None` =
-    /// all columns). `limit` is the required maximum number of rows. Returns that
-    /// bucket's LAST `limit` rows (Fluss `LimitBatchScanner` keeps the tail), as
-    /// the batches produced by the bounded scan (possibly several). A
-    /// cross-bucket final cap is applied by DataFusion above the per-bucket scans.
+    /// `partition_id` selects the partition to scan (`None` for a non-partitioned
+    /// table). `bucket` is the bucket id to scan; one `(partition, bucket)` target
+    /// maps to one DataFusion partition. `projection` is column indices into the
+    /// table schema (`None` = all columns). `limit` is the required maximum number
+    /// of rows. Returns that bucket's LAST `limit` rows (Fluss
+    /// `LimitBatchScanner` keeps the tail), as the batches produced by the bounded
+    /// scan (possibly several). A cross-bucket final cap is applied by DataFusion
+    /// above the per-bucket scans.
     async fn log_scan(
         &self,
         table: &TableRef,
+        partition_id: Option<i64>,
         bucket: i32,
         projection: Option<&[usize]>,
         limit: usize,

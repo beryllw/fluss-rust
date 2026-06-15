@@ -25,11 +25,15 @@
 
 #![cfg(feature = "integration_tests")]
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use fluss::client::FlussConnection;
-use fluss::metadata::{DataTypes, Schema, TableInfo, TableDescriptor, TablePath};
+use fluss::metadata::{
+    DataTypes, PartitionSpec, Schema, TableDescriptor, TableInfo, TablePath,
+};
 use fluss::row::GenericRow;
+use fluss::rpc::message::OffsetSpec;
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 
 use crate::integration::utils::names;
@@ -247,6 +251,112 @@ pub async fn create_log_named(connection: &FlussConnection, table_name: &str) ->
     admin.get_table_info(&table_path).await.unwrap()
 }
 
+/// Creates and populates the partitioned log table (partition key `region`, one
+/// bucket per partition), waits until each partition's bucket can serve reads, and
+/// returns its `TableInfo`. Used to exercise partition pruning of bounded scans.
+pub async fn create_log_partitioned(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::LOG_PARTITIONED);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .column("region", DataTypes::string())
+                .build()
+                .unwrap(),
+        )
+        .partitioned_by(vec!["region"])
+        // Single bucket per partition keeps the bounded scan deterministic.
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    // Create the two partitions up front; the writer routes rows by region.
+    for region in ["US", "EU"] {
+        let spec = PartitionSpec::new(HashMap::from([("region", region)]));
+        admin
+            .create_partition(&table_path, &spec, true)
+            .await
+            .unwrap();
+        wait_for_partition_offsets(connection, &table_path, region).await;
+    }
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_append().unwrap().create_writer().unwrap();
+    let rows = [
+        (1, "a", "US"),
+        (2, "b", "US"),
+        (3, "c", "EU"),
+        (4, "d", "EU"),
+    ];
+    for (id, name, region) in &rows {
+        let mut row = GenericRow::new(3);
+        row.set_field(0, *id);
+        row.set_field(1, *name);
+        row.set_field(2, *region);
+        writer.append(&row).unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
+/// Creates and populates the partitioned KV table (partition key `region`, which
+/// is also part of the primary key), waits until each partition can serve reads,
+/// and returns its `TableInfo`. Used to prove a full-PK lookup resolves the
+/// partition automatically via the Fluss `Lookuper`.
+pub async fn create_kv_partitioned(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::KV_PARTITIONED);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("region", DataTypes::string())
+                .column("id", DataTypes::int())
+                .column("score", DataTypes::bigint())
+                // For a partitioned PK table the partition key must be part of the PK.
+                .primary_key(vec!["region", "id"])
+                .build()
+                .unwrap(),
+        )
+        .partitioned_by(vec!["region"])
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    for region in ["US", "EU"] {
+        let spec = PartitionSpec::new(HashMap::from([("region", region)]));
+        admin
+            .create_partition(&table_path, &spec, true)
+            .await
+            .unwrap();
+        wait_for_partition_offsets(connection, &table_path, region).await;
+    }
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_upsert().unwrap().create_writer().unwrap();
+    let rows = [("US", 1, 100i64), ("US", 2, 200), ("EU", 1, 300)];
+    for (region, id, score) in &rows {
+        let mut row = GenericRow::new(3);
+        row.set_field(0, *region);
+        row.set_field(1, *id);
+        row.set_field(2, *score);
+        writer.upsert(&row).unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
 /// Best-effort drop of a single table under `names::DATABASE`.
 pub async fn drop_table_named(connection: &FlussConnection, table_name: &str) {
     let admin = connection.get_admin().unwrap();
@@ -314,7 +424,6 @@ async fn wait_for_bucket_offsets(
     table_path: &TablePath,
     buckets: &[i32],
 ) {
-    use fluss::rpc::message::OffsetSpec;
     let admin = connection.get_admin().unwrap();
     let start = std::time::Instant::now();
     loop {
@@ -332,6 +441,31 @@ async fn wait_for_bucket_offsets(
     }
 }
 
+/// Waits until bucket 0 of partition `partition_value` of `table_path` can serve
+/// reads. A partition-qualified bounded scan reads each partition's bucket, so the
+/// partition must be ready before the scan runs.
+async fn wait_for_partition_offsets(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    partition_value: &str,
+) {
+    let admin = connection.get_admin().unwrap();
+    let start = std::time::Instant::now();
+    loop {
+        if admin
+            .list_partition_offsets(table_path, partition_value, &[0], OffsetSpec::Latest)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+        if start.elapsed() >= READY_TIMEOUT {
+            panic!("partition {partition_value} of {table_path} not ready in {READY_TIMEOUT:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Best-effort drop of the Phase 1 tables so reruns start clean.
 pub async fn drop_phase1_tables(connection: &FlussConnection) {
     let admin = connection.get_admin().unwrap();
@@ -340,6 +474,8 @@ pub async fn drop_phase1_tables(connection: &FlussConnection) {
         names::KV_COMPOSITE,
         names::LOG_BASIC,
         names::LOG_MULTI_BUCKET,
+        names::LOG_PARTITIONED,
+        names::KV_PARTITIONED,
     ] {
         let _ = admin
             .drop_table(&TablePath::new(names::DATABASE, name), true)

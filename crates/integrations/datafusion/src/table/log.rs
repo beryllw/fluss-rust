@@ -20,8 +20,16 @@
 //! Surfaces an append-only Fluss table to DataFusion via a bounded scan. Phase 1
 //! requires a `LIMIT`: `scan` fails clearly with `LimitRequired` when none is
 //! present rather than degrading into a full scan. Projection is pushed down to
-//! [`FlussSource::log_scan`]. No filter pushdown is supported yet (every filter is
-//! `Unsupported`, so a residual `FilterExec` is layered above the scan).
+//! [`FlussSource::log_scan`].
+//!
+//! Partition pruning (equality-only): for a partitioned table, a
+//! `partition_col = 'value'` filter is reported as `Inexact` pushdown, partitions
+//! are listed and filtered to those matching every binding, and the scan targets
+//! become the cross product of the kept partitions and the buckets. Pruning is
+//! best-effort and never required: with no partition predicate the scan reads all
+//! partitions, and the `Inexact` pushdown keeps a residual `FilterExec` above the
+//! scan so correctness never depends on the pruning. A non-partitioned table
+//! supports no filter pushdown (every filter is `Unsupported`).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -31,20 +39,24 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::{DataFusionError, Result as DfResult};
 use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
 use crate::execution::log_scan::FlussLogScanExec;
+use crate::table::predicate::{analyze_partition_filters, is_partition_equality};
 
 /// An append-only Fluss table backed by a required-`LIMIT` bounded scan.
 pub(crate) struct FlussLogTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
     schema: SchemaRef,
-    /// Bucket count = number of scan partitions read in parallel.
+    /// Bucket count = number of scan partitions read in parallel (per partition).
     num_buckets: i32,
+    /// Partition-key column names; empty when the table is not partitioned.
+    partition_keys: Vec<String>,
 }
 
 impl std::fmt::Debug for FlussLogTableProvider {
@@ -61,12 +73,14 @@ impl FlussLogTableProvider {
         table_ref: TableRef,
         schema: SchemaRef,
         num_buckets: i32,
+        partition_keys: Vec<String>,
     ) -> Self {
         Self {
             source,
             table_ref,
             schema,
             num_buckets,
+            partition_keys,
         }
     }
 }
@@ -89,11 +103,27 @@ impl TableProvider for FlussLogTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // Phase 1 log tables support no filter pushdown; residual filters become a
-        // `FilterExec` above the scan.
+        // A non-partitioned log table supports no filter pushdown; residual filters
+        // become a `FilterExec` above the scan.
+        if self.partition_keys.is_empty() {
+            return Ok(filters
+                .iter()
+                .map(|_| TableProviderFilterPushDown::Unsupported)
+                .collect());
+        }
+        // For a partitioned table, partition-column equality drives pruning. Report
+        // it as `Inexact` (not `Exact`) so DataFusion still layers a `FilterExec`
+        // that re-applies the predicate: pruning is best-effort and this keeps the
+        // result correct even if string-matching is imperfect.
         Ok(filters
             .iter()
-            .map(|_| TableProviderFilterPushDown::Unsupported)
+            .map(|filter| {
+                if is_partition_equality(filter, &self.partition_keys) {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
             .collect())
     }
 
@@ -101,7 +131,7 @@ impl TableProvider for FlussLogTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         // A bounded scan requires a `LIMIT`; fail clearly rather than full-scan.
@@ -124,7 +154,43 @@ impl TableProvider for FlussLogTableProvider {
             Some(indices) => Arc::new(self.schema.project(indices)?),
         };
 
-        // Per-bucket pushdown of `limit` returns each bucket's last-`limit` rows;
+        // Compute the scan targets: one (partition_id, bucket) per DataFusion
+        // output partition.
+        let buckets = 0..self.num_buckets;
+        let targets: Vec<(Option<i64>, i32)> = if self.partition_keys.is_empty() {
+            // Non-partitioned: one target per bucket, no partition id.
+            buckets.map(|b| (None, b)).collect()
+        } else {
+            // Partitioned: list partitions, keep those matching every equality
+            // binding (no bindings => keep all), then cross with the buckets.
+            let partitions = self.source.list_partitions(&self.table_ref).await?;
+            let bindings = analyze_partition_filters(filters, &self.partition_keys);
+            partitions
+                .into_iter()
+                .filter(|partition| {
+                    bindings.iter().all(|(k, v)| {
+                        partition
+                            .values
+                            .iter()
+                            .any(|(pk, pv)| pk == k && pv == v)
+                    })
+                })
+                .flat_map(|partition| {
+                    buckets
+                        .clone()
+                        .map(move |b| (Some(partition.partition_id), b))
+                })
+                .collect()
+        };
+
+        // No target (partitioned table with zero partitions, or no partition
+        // matched the predicate) means zero rows: return an `EmptyExec` with the
+        // projected schema rather than a 0-partition plan.
+        if targets.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(projected_schema)));
+        }
+
+        // Per-target pushdown of `limit` returns each bucket's last-`limit` rows;
         // DataFusion still layers a global `LIMIT` above this multi-partition scan,
         // so the merged result is capped at exactly `limit` rows.
         Ok(Arc::new(FlussLogScanExec::new(
@@ -132,7 +198,7 @@ impl TableProvider for FlussLogTableProvider {
             self.table_ref.clone(),
             projection,
             limit,
-            self.num_buckets,
+            targets,
             projected_schema,
         )))
     }
