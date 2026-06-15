@@ -127,6 +127,7 @@ crates/integrations/datafusion/
       utils.rs         # shared table-name constants + SQL-path helper
       setup.rs         # integration_tests: real-cluster bootstrap + table creation/seeding
       e2e.rs           # integration_tests: end-to-end SQL against the real backend
+      live_metadata.rs # integration_tests: live post-DDL visibility (no cache)
 ```
 
 > Note: the crate lives at `crates/integrations/datafusion/` (the package name is
@@ -173,8 +174,8 @@ through the `new()` production path against a real cluster.
 
 ### `backend/` (internal access seam)
 
-- The `FlussSource` trait (`pub(crate)`) covers only the atomic operations Phase 1
-  actually uses: metadata listing/fetching, KV full-primary-key
+- The `FlussSource` trait (`pub(crate)`) covers only the atomic operations the
+  crate actually uses: metadata listing/fetching, KV full-primary-key
   `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), and log
   bounded `log_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`.
   `log_scan` takes an `Option<i64>` partition id (`None` for a non-partitioned
@@ -366,8 +367,7 @@ are two layers:
 | Layer | Feature | Containers | Purpose |
 |---|---|---|---|
 | Unit tests | default | No | schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, and error mapping |
-| Integration tests (e2e) | `integration_tests` | Yes | real SQL against the real backend (`FlussDatafusion::new` -> `RealFlussSource`), covering catalog listing, KV point lookup (single/composite PK, missing key, and unsupported forms such as non-PK / partial PK / `IN` / no filter), log bounded scan and projection, `EXPLAIN` custom plans, and the Arrow schema exposed by `TableProvider` |
-| Integration tests (live metadata) | `integration_tests` | Yes | proves the live, no-cache contract: a table created AFTER `register_catalog` is queryable and listed in the same session, and a dropped table disappears from that session's listing / `table()` resolution |
+| Integration tests | `integration_tests` | Yes | real SQL against the real backend (`FlussDatafusion::new` -> `RealFlussSource`), covering catalog listing, KV point lookup (single/composite PK, missing key, and unsupported forms such as non-PK / partial PK / `IN` / no filter), log bounded scan and projection, partition pruning, `EXPLAIN` custom plans, the Arrow schema exposed by `TableProvider`, and the live no-cache contract (`register_catalog`-after DDL is visible in the same session, and drops disappear from listing / `table()` resolution) |
 
 The integration tests assert sequentially against a single cluster inside one
 test function: standing up a Fluss cluster is expensive, while these assertions

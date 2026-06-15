@@ -13,7 +13,7 @@ forms, so you can query Fluss directly with `ctx.sql(...)`.
 > dependency direction is strictly one-way: `fluss client/core -> fluss-datafusion`,
 > never the reverse.
 
-## Current capabilities (Phase 1)
+## Capabilities
 
 - List databases / tables, and fetch a table's schema and table type.
 - **KV tables**: full-primary-key equality predicate pushed down as a point
@@ -32,9 +32,9 @@ forms, so you can query Fluss directly with `ctx.sql(...)`.
 - Unsupported query forms **fail conservatively** (raise an explicit error)
   rather than silently degrading into a misleading full-table scan.
 
-Phase 1 **excludes**: PostgreSQL / MySQL compatibility objects, REST/gRPC
+It **does not include**: PostgreSQL / MySQL compatibility objects, REST/gRPC
 interfaces, session or operation lifecycle, principal routing, multi-cluster,
-SQL writes (DML), and gateway auth / audit.
+SQL writes (DML), or gateway auth / audit.
 
 ## Usage
 
@@ -133,8 +133,7 @@ crate bridges the two: the synchronous callbacks run the async source call to
 completion via a small `block_on` helper (`src/runtime.rs`), spawning a short-lived
 thread when already inside a tokio runtime to avoid the nested-runtime panic. The
 known, accepted cost is **one admin RPC per catalog call** (plus the thread hop on
-the synchronous paths). This is intentional for this phase; no caching is layered
-on top.
+the synchronous paths). This is intentional; no caching is layered on top.
 
 ## Error model
 
@@ -151,7 +150,7 @@ DataFusion paths (such as `ctx.sql(...).collect()`). The type deliberately does
 | Feature | Purpose | Containers needed |
 |---|---|---|
 | (default) | Unit tests: schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, and error mapping | No |
-| `integration_tests` | Integration tests against a real Fluss cluster: e2e (real SQL against the real backend) plus live-metadata visibility | Yes (Docker / podman) |
+| `integration_tests` | Integration tests against a real Fluss cluster: real SQL against the real backend, covering query execution, the exposed Arrow schema, and live metadata visibility | Yes (Docker / podman) |
 
 Common commands:
 
@@ -159,8 +158,8 @@ Common commands:
 # Unit tests (fast, the default CI gate)
 cargo test -p fluss-datafusion
 
-# Real-cluster e2e (requires a working container runtime)
-cargo test -p fluss-datafusion --features integration_tests -- e2e
+# Real-cluster integration tests (requires a working container runtime)
+cargo test -p fluss-datafusion --features integration_tests
 ```
 
 There are only two test layers: unit tests (no cluster required) plus

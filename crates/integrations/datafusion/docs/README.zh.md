@@ -10,7 +10,7 @@ Apache Fluss 表的访问。它把 Fluss 的 KV 表与 Log 表暴露成 DataFusi
 > 本 crate 不感知调用方身份、协议、会话变量或鉴权模式，也不知道自己是否运行在 gateway 内。
 > 依赖方向是单向的：`fluss client/core -> fluss-datafusion`，绝不反向。
 
-## 当前能力（Phase 1）
+## 当前能力
 
 - 列举 database / table，获取表的 schema 与表类型
 - **KV 表**：完整主键等值谓词下推为点查（point lookup），支持单主键与复合主键
@@ -23,7 +23,7 @@ Apache Fluss 表的访问。它把 Fluss 的 KV 表与 Log 表暴露成 DataFusi
 - 共享 installer + 每会话 `register_catalog(...)` 的使用模型
 - 不支持的查询形态会**保守失败**（明确报错），而不会静默退化成误导性的全表扫描
 
-Phase 1 **不包含**：PostgreSQL / MySQL 兼容对象、REST/gRPC 接口、会话或操作生命周期、
+本 crate **不包含**：PostgreSQL / MySQL 兼容对象、REST/gRPC 接口、会话或操作生命周期、
 principal 路由、多集群、SQL 写入（DML）、gateway 鉴权 / 审计。
 
 ## 使用方式
@@ -112,7 +112,7 @@ DataFusion 的 `CatalogProvider` / `SchemaProvider` 列举方法是**同步**的
 接口是 async 的。为保持实时，crate 在二者之间做桥接：同步回调通过一个小的 `block_on` 助手
 （`src/runtime.rs`）把 async 源调用跑到完成；当已处于 tokio runtime 内时，会临时起一个短命
 线程以规避嵌套 runtime 的 panic。已知且接受的代价是**每次 catalog 调用一次 admin RPC**（同步
-路径还多一次线程跳转）。本阶段刻意如此，不在其上叠加任何缓存。
+路径还多一次线程跳转）。设计上刻意如此，不在其上叠加任何缓存。
 
 ## 错误模型
 
@@ -127,7 +127,7 @@ DataFusion 的 `CatalogProvider` / `SchemaProvider` 列举方法是**同步**的
 | feature | 用途 | 是否需要容器 |
 |---|---|---|
 | （默认） | 单元测试：schema 映射、`ScalarValue` 转 key、谓词识别、下推决策、错误映射 | 否 |
-| `integration_tests` | 真实 Fluss 集群集成测试：e2e（真实 SQL 走真实后端）+ 实时元数据可见性 | 是（Docker / podman） |
+| `integration_tests` | 真实 Fluss 集群集成测试：真实 SQL 走真实后端，覆盖查询执行、Arrow schema 暴露与实时元数据可见性 | 是（Docker / podman） |
 
 常用命令：
 
@@ -135,8 +135,8 @@ DataFusion 的 `CatalogProvider` / `SchemaProvider` 列举方法是**同步**的
 # 单元测试（快，CI 默认门禁）
 cargo test -p fluss-datafusion
 
-# 真实集群 e2e（需要可用的容器运行时）
-cargo test -p fluss-datafusion --features integration_tests -- e2e
+# 真实集群集成测试（需要可用的容器运行时）
+cargo test -p fluss-datafusion --features integration_tests
 ```
 
 测试只有两层：单元测试（不依赖集群）+ 真实集群集成测试。没有 fake/fixture 镜像层，因此不存在
