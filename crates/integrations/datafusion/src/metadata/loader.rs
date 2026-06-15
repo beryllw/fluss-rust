@@ -28,9 +28,6 @@ use arrow::datatypes::SchemaRef;
 use crate::backend::{FlussTableMeta, SharedFlussSource, TableRef};
 use crate::error::Result;
 
-/// Database -> ordered table-name listing: one full-cluster view.
-pub(crate) type DatabaseListing = Vec<(String, Vec<String>)>;
-
 /// Per-table metadata: the crate-owned meta plus its derived Arrow schema.
 #[derive(Clone)]
 pub(crate) struct TableEntry {
@@ -63,20 +60,6 @@ impl MetadataLoader {
     /// the seam alone, per the crate's dependency rule.
     pub(crate) fn source(&self) -> SharedFlussSource {
         self.source.clone()
-    }
-
-    /// Returns the database -> table-name listing, fetched live every call.
-    ///
-    /// One admin RPC per database for the table listing is the known, accepted
-    /// cost of keeping listings always-fresh; there is no snapshot to go stale.
-    pub(crate) async fn databases(&self) -> Result<DatabaseListing> {
-        let db_names = self.source.list_databases().await?;
-        let mut listing = Vec::with_capacity(db_names.len());
-        for db in db_names {
-            let tables = self.source.list_tables(&db).await?;
-            listing.push((db, tables));
-        }
-        Ok(listing)
     }
 
     /// Loads the Arrow schema + meta for one table live every call.

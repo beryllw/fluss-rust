@@ -28,10 +28,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider};
 
 use crate::catalog::schema::FlussSchemaProvider;
 use crate::metadata::MetadataLoader;
-use crate::runtime::block_on_with_runtime;
-
-/// Catalog access thread panic message shared by the blocking bridges.
-const ACCESS_PANIC: &str = "fluss catalog access thread panicked";
+use crate::runtime::{block_on_with_runtime, ACCESS_PANIC};
 
 /// Read-only catalog provider that lists Fluss databases live on every call.
 #[derive(Debug)]
@@ -51,15 +48,12 @@ impl CatalogProvider for FlussCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        let loader = self.loader.clone();
+        let source = self.loader.source();
         block_on_with_runtime(
-            async move {
-                match loader.databases().await {
-                    Ok(listing) => listing.into_iter().map(|(db, _)| db).collect(),
-                    // Sync trait can't propagate errors; degrade to empty, as paimon does.
-                    Err(_) => vec![],
-                }
-            },
+            // Only database names are needed here; list them directly rather than
+            // also fetching per-database tables. Sync trait can't propagate errors;
+            // degrade to empty, as paimon does.
+            async move { source.list_databases().await.unwrap_or_default() },
             ACCESS_PANIC,
         )
     }

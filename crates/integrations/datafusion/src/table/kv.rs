@@ -37,6 +37,7 @@ use datafusion::prelude::Expr;
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::execution::lookup::FlussKvLookupExec;
 use crate::table::predicate::{analyze_kv_filters, is_primary_key_equality};
+use crate::types::record_batch::normalize_projection;
 
 /// A primary-keyed Fluss table backed by point lookups.
 pub(crate) struct FlussKvTableProvider {
@@ -114,11 +115,7 @@ impl TableProvider for FlussKvTableProvider {
         // surfaced verbatim; this provider never falls back to a full scan.
         let key = analyze_kv_filters(filters, &self.primary_keys)?;
 
-        let projection = projection.cloned();
-        let projected_schema = match &projection {
-            None => self.schema.clone(),
-            Some(indices) => Arc::new(self.schema.project(indices)?),
-        };
+        let (projection, projected_schema) = normalize_projection(projection, &self.schema)?;
 
         Ok(Arc::new(FlussKvLookupExec::new(
             self.source.clone(),

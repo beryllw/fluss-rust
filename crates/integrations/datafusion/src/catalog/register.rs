@@ -24,12 +24,12 @@
 use std::sync::Arc;
 
 use crate::catalog::provider::FlussCatalogProvider;
-use crate::error::Result;
 use crate::metadata::MetadataLoader;
 
 /// Builds a catalog provider that serves every listing live from the loader.
-pub(crate) async fn build_catalog_provider(
-    loader: Arc<MetadataLoader>,
-) -> Result<Arc<FlussCatalogProvider>> {
-    Ok(Arc::new(FlussCatalogProvider::new(loader)))
+///
+/// Construction is a cheap, infallible wrap of the shared loader: there is no
+/// pre-listing or I/O here, so this is neither async nor fallible.
+pub(crate) fn build_catalog_provider(loader: Arc<MetadataLoader>) -> Arc<FlussCatalogProvider> {
+    Arc::new(FlussCatalogProvider::new(loader))
 }

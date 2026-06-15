@@ -34,15 +34,22 @@ use crate::backend::{KeyValue, LookupKey};
 use crate::error::{FlussDatafusionError, Result};
 use crate::types::scalar::{scalar_to_key_value, scalar_to_partition_string};
 
+/// True if a single filter is a `column = literal` equality whose column is one of
+/// `columns`. Shared by the KV (primary-key) and Log (partition-key) pushdown
+/// classifiers below.
+fn is_equality_on(filter: &Expr, columns: &[String]) -> bool {
+    matches!(
+        single_equality(filter),
+        Some((column, _)) if columns.iter().any(|c| c == column)
+    )
+}
+
 /// True if a single filter is a `primary_key_column = literal` equality.
 ///
 /// Used by `supports_filters_pushdown` to mark only PK-equality filters as
 /// consumed (`Exact`); every other filter stays `Unsupported`.
 pub(crate) fn is_primary_key_equality(filter: &Expr, primary_keys: &[String]) -> bool {
-    matches!(
-        single_equality(filter),
-        Some((column, _)) if primary_keys.iter().any(|pk| pk == column)
-    )
+    is_equality_on(filter, primary_keys)
 }
 
 /// Analyzes the filter conjunction and, only when it forms a complete
@@ -119,10 +126,7 @@ pub(crate) fn analyze_kv_filters(
 /// equality filters as (inexact) pushdown candidates; every other filter stays
 /// `Unsupported`.
 pub(crate) fn is_partition_equality(filter: &Expr, partition_keys: &[String]) -> bool {
-    matches!(
-        single_equality(filter),
-        Some((column, _)) if partition_keys.iter().any(|pk| pk == column)
-    )
+    is_equality_on(filter, partition_keys)
 }
 
 /// Extracts the partition-column equality bindings (column -> value string) from

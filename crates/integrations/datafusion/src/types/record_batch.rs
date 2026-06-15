@@ -21,9 +21,36 @@
 //! reshaping the crate does here. Arrow batch assembly itself stays in `fluss`'s
 //! helpers, so this module never rebuilds columns from scratch.
 
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
+use arrow::error::ArrowError;
 
 use crate::error::{FlussDatafusionError, Result};
+
+/// Normalizes a scan projection against the full table schema.
+///
+/// A `None` projection — or a full identity projection like `Some([0, 1, .., N-1])`,
+/// which `SELECT *` can produce — is normalized to `None` so the source reads every
+/// column. Returns the normalized projection paired with its output schema (the full
+/// `schema` for `None`, otherwise the projected schema). Both the KV and Log scan
+/// paths go through here so projection handling stays identical.
+pub(crate) fn normalize_projection(
+    projection: Option<&Vec<usize>>,
+    schema: &SchemaRef,
+) -> std::result::Result<(Option<Vec<usize>>, SchemaRef), ArrowError> {
+    let full_count = schema.fields().len();
+    let normalized = match projection {
+        Some(indices) if indices.iter().copied().eq(0..full_count) => None,
+        other => other.cloned(),
+    };
+    let projected_schema = match &normalized {
+        None => schema.clone(),
+        Some(indices) => Arc::new(schema.project(indices)?),
+    };
+    Ok((normalized, projected_schema))
+}
 
 /// Projects `batch` down to `projection` (column indices into the full schema).
 ///

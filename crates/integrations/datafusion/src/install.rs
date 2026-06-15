@@ -76,7 +76,7 @@ impl FlussDatafusion {
         catalog_name: &str,
         _options: RegisterCatalogOptions,
     ) -> Result<()> {
-        let provider = build_catalog_provider(self.inner.loader.clone()).await?;
+        let provider = build_catalog_provider(self.inner.loader.clone());
         ctx.register_catalog(catalog_name, provider);
         Ok(())
     }

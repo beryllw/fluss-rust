@@ -32,12 +32,9 @@ use datafusion::error::Result as DfResult;
 use crate::backend::TableRef;
 use crate::error::FlussDatafusionError;
 use crate::metadata::MetadataLoader;
-use crate::runtime::block_on_with_runtime;
+use crate::runtime::{block_on_with_runtime, ACCESS_PANIC};
 use crate::table::kv::FlussKvTableProvider;
 use crate::table::log::FlussLogTableProvider;
-
-/// Catalog access thread panic message shared by the blocking bridges.
-const ACCESS_PANIC: &str = "fluss catalog access thread panicked";
 
 /// One Fluss database surfaced as a DataFusion schema, listing tables live.
 #[derive(Debug)]

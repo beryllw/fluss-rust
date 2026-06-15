@@ -47,6 +47,7 @@ use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
 use crate::execution::log_scan::FlussLogScanExec;
 use crate::table::predicate::{analyze_partition_filters, is_partition_equality};
+use crate::types::record_batch::normalize_projection;
 
 /// An append-only Fluss table backed by a required-`LIMIT` bounded scan.
 pub(crate) struct FlussLogTableProvider {
@@ -142,17 +143,9 @@ impl TableProvider for FlussLogTableProvider {
             )))
         })?;
 
-        // Normalize a full identity projection (e.g. `SELECT *` may arrive as
-        // `Some([0,1,..])`) to `None` so the bounded scan reads all columns.
-        let full_count = self.schema.fields().len();
-        let projection = match projection {
-            Some(indices) if indices.iter().copied().eq(0..full_count) => None,
-            other => other.cloned(),
-        };
-        let projected_schema = match &projection {
-            None => self.schema.clone(),
-            Some(indices) => Arc::new(self.schema.project(indices)?),
-        };
+        // A full identity projection (e.g. `SELECT *` may arrive as `Some([0,1,..])`)
+        // is normalized to `None` so the bounded scan reads all columns.
+        let (projection, projected_schema) = normalize_projection(projection, &self.schema)?;
 
         // Compute the scan targets: one (partition_id, bucket) per DataFusion
         // output partition.

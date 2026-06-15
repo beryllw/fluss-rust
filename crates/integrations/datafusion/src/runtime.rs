@@ -28,6 +28,10 @@ use std::sync::OnceLock;
 
 use tokio::runtime::{Handle, Runtime};
 
+/// Panic message shared by the blocking catalog bridges when their helper thread
+/// dies. Lives here next to [`block_on_with_runtime`], the only place it is used.
+pub(crate) const ACCESS_PANIC: &str = "fluss catalog access thread panicked";
+
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 fn global_runtime() -> &'static Runtime {
