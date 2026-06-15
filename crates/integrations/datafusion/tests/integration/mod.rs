@@ -22,6 +22,8 @@
 //! - `e2e`: real-cluster end-to-end SQL through the real backend (`integration_tests`).
 //! - `live_metadata`: real-cluster proof that post-registration DDL is visible
 //!   live in the same session (`integration_tests`).
+//! - `example_smoke`: real-cluster smoke test for the package-local runnable demo
+//!   path (`integration_tests`).
 
 pub mod utils;
 
@@ -33,3 +35,6 @@ pub mod e2e;
 
 #[cfg(feature = "integration_tests")]
 pub mod live_metadata;
+
+#[cfg(feature = "integration_tests")]
+pub mod example_smoke;

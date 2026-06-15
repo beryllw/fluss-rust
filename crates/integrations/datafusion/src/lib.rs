@@ -69,6 +69,13 @@
 //! }
 //! ```
 //!
+//! For a runnable version of this path against an external cluster, see the
+//! `datafusion_demo` example:
+//!
+//! ```bash
+//! cargo run -p fluss-datafusion --example datafusion_demo -- --bootstrap-servers 127.0.0.1:9123
+//! ```
+//!
 //! # Further reading
 //!
 //! See `docs/README.md` for a fuller overview of capabilities, configuration, and

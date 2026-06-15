@@ -28,6 +28,10 @@ keywords.workspace = true
 categories.workspace = true
 description = "DataFusion integration for Apache Fluss"
 
+[[example]]
+name = "datafusion_demo"
+path = "examples/datafusion_demo.rs"
+
 [dependencies]
 fluss = { workspace = true }
 datafusion = { workspace = true }

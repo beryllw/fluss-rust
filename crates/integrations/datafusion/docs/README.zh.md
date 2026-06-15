@@ -73,6 +73,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 catalog 完全实时——不持有任何 database/table 列表缓存，因此每次列举/取表都会回源 Fluss，
 DDL 在同一会话内即时可见。
 
+## 可运行示例
+
+包内自带一个 example，对接外部 Fluss 集群把完整路径端到端跑通：它自建两张很小的演示表
+（一张 KV 表、一张 log 表），执行一次 KV 点查、一次 log `LIMIT` 扫描，并对二者 `EXPLAIN`，
+最后清理演示表。它只用上面展示的公开 API。
+
+demo 需要一个可连接的 Fluss 集群。workspace 自带一个启动器，会以 detached 容器拉起一个临时
+本地集群（zookeeper + coordinator + tablet server），因此完整的 quick start 是：
+
+```bash
+# 1) 在 127.0.0.1:9123 起一个本地集群（需要 Docker / podman 在运行）。
+#    首次运行会拉镜像，并阻塞到集群 ready。
+cargo run -p fluss-test-cluster -- start
+
+# 2) 运行 demo（默认即 --bootstrap-servers 127.0.0.1:9123）。
+cargo run -p fluss-datafusion --example datafusion_demo
+
+# 3) 用完后销毁集群。
+cargo run -p fluss-test-cluster -- stop
+```
+
+如需连接已有集群，用 `--bootstrap-servers HOST:PORT` 指定即可。`example_smoke` 集成测试在
+真实集群上跑同一条 demo 路径（自行管理集群生命周期），确保这个文档入口不会悄悄失效：
+
+```bash
+cargo test -p fluss-datafusion --features integration_tests -- example_smoke
+```
+
 ## 受支持的查询形态
 
 | 表类型 | 受支持的形态 | 说明 |

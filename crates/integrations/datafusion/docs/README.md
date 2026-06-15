@@ -86,6 +86,38 @@ across many `SessionContext`s. The catalog is fully live — it holds no cached
 database/table listing, so every listing/table call goes back to Fluss and DDL is
 visible in the same session immediately.
 
+## Runnable demo
+
+A package-local example wires the full path end to end against an external Fluss
+cluster: it self-seeds two tiny demo tables (a KV table and a log table), runs a
+KV point lookup, a log `LIMIT` scan, and `EXPLAIN` on both, then drops the demo
+tables. It uses only the public API shown above.
+
+The demo needs a Fluss cluster to connect to. The workspace ships a launcher that
+starts a throwaway local cluster (zookeeper + coordinator + tablet server) as
+detached containers, so a full quick start is:
+
+```bash
+# 1) Start a local cluster on 127.0.0.1:9123 (needs Docker / podman running).
+#    Pulls images on first run and blocks until the cluster is ready.
+cargo run -p fluss-test-cluster -- start
+
+# 2) Run the demo (defaults to --bootstrap-servers 127.0.0.1:9123).
+cargo run -p fluss-datafusion --example datafusion_demo
+
+# 3) Tear the cluster down when finished.
+cargo run -p fluss-test-cluster -- stop
+```
+
+Point the demo at an existing cluster instead with
+`--bootstrap-servers HOST:PORT`. The `example_smoke` integration test exercises
+the same demo path against a real cluster (managing its own cluster lifecycle),
+so the documented entrypoint cannot silently rot:
+
+```bash
+cargo test -p fluss-datafusion --features integration_tests -- example_smoke
+```
+
 ## Supported query forms
 
 | Table type | Supported form | Notes |
