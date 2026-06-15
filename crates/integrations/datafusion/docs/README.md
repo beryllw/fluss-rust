@@ -32,8 +32,8 @@ SQL writes (DML), and gateway auth / audit.
 
 The overall model is "one shared installer plus a per-session install":
 
-1. Construct one shared `FlussDatafusion` from a `FlussConnection` (it holds the
-   metadata cache internally).
+1. Construct one shared `FlussDatafusion` from a `FlussConnection` (stateless; it
+   holds no metadata cache).
 2. Each SQL session creates its own `SessionContext`.
 3. The session installs the Fluss catalog into that context via
    `register_catalog(...)`.
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.bootstrap_servers = "127.0.0.1:9123".to_string();
     let connection = Arc::new(FlussConnection::new(config).await?);
 
-    // 2) Build the shared installer (construct once, reuse the metadata cache across sessions).
+    // 2) Build the shared installer (construct once, reuse across sessions; metadata stays live).
     let fd = FlussDatafusion::new(connection, FlussDatafusionOptions::default()).await?;
 
     // 3) Each session creates its own context and installs the catalog.
@@ -74,9 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 `FlussDatafusion` is `Arc`-shared and stateless: construct it once and reuse it
-across many `SessionContext`s. Repeated `register_catalog` calls (including on a
-freshly created context) reuse the cached database/table listing and do not
-re-issue remote metadata requests.
+across many `SessionContext`s. The catalog is fully live — it holds no cached
+database/table listing, so every listing/table call goes back to Fluss and DDL is
+visible in the same session immediately.
 
 ## Supported query forms
 
@@ -100,65 +100,32 @@ shows `FlussKvLookupExec`, and a Log bounded scan shows `FlussLogScanExec`.
 
 ## Configuration
 
-`FlussDatafusionOptions`:
+`FlussDatafusionOptions` and `RegisterCatalogOptions` are both currently empty
+placeholders, reserved for future options. The catalog is fully live with no
+cache to tune, so there is nothing to configure today.
 
-| Field | Default | Meaning |
-|---|---|---|
-| `metadata_cache_ttl` | `300s` | TTL for the shared metadata cache; the database/table listing is not re-fetched during this window |
+## Metadata visibility
 
-`RegisterCatalogOptions` is currently an empty placeholder, reserved for future
-per-catalog options.
+The catalog is **fully live, with zero snapshot and no cache**: every catalog
+listing/table call (`schema_names()`, `schema()`, `table_names()`,
+`table_exist()`, `table()`) fetches fresh from Fluss. This matches SQL catalog
+semantics — DDL is visible in the same `SessionContext` immediately:
 
-## Metadata visibility and known limitations (open for discussion)
+- A table created **after** `register_catalog` is queryable in the same session,
+  with no need to re-register.
+- A dropped table disappears from that same session's listing and `table()`
+  resolution right away.
+- A table's schema/meta is re-read on every access, so schema changes are
+  reflected immediately.
 
-> This is a **known open question**. The current implementation deliberately
-> keeps snapshot semantics; the fix is to be discussed later.
-
-DataFusion's `CatalogProvider` / `SchemaProvider` listing methods
-(`schema_names()`, `table_names()`, `table_exist()`) are **synchronous**, whereas
-Fluss's metadata interface is async. There are only two ways to obtain an async
-result inside a synchronous context: put the data into memory ahead of time (a
-snapshot), or `block_on` and wait for the remote response inside the synchronous
-context (which requires working around tokio's nested runtime and pays the cost
-of a blocking RPC plus thread creation on every listing). This crate chooses the
-**snapshot** approach, trading for nanosecond-level synchronous reads and a clean
-implementation.
-
-This yields two layers of snapshot semantics:
-
-| Layer | Freeze point | Behavior |
-|---|---|---|
-| Provider snapshot | At the moment of `register_catalog`, the database/table names are frozen into a `Vec<String>` | The provider **never goes back to the source** during its `SessionContext` lifetime; it does not refresh even after the cache TTL expires |
-| Cache TTL (`metadata_cache_ttl`, default 300s) | On the next `build_catalog_provider` / the first load of a given table's meta | Determines whether to go back to the source when rebuilding the provider or loading a table schema |
-
-**Current visibility contract:**
-
-- A catalog's database/table listing is a snapshot as of the `register_catalog`
-  moment.
-- Tables created **after** registration are **invisible** to that
-  `SessionContext` (`table()` returns `None` for a name not in the snapshot,
-  without going back to the source), independent of the cache TTL. To see new
-  tables, call `register_catalog` again.
-- A table's schema/meta is cached on first access according to the TTL; schema
-  changes within the TTL are not reflected immediately.
-
-**Fix directions under discussion** (not yet implemented, noted for memory):
-
-- Document the contract without changing code — if consumers already re-register
-  per request / per session, snapshot staleness is barely a problem.
-- Provide explicit `invalidate()` / `refresh()` primitives on `FlussDatafusion`
-  that consumers call after DDL as needed — keeping synchronous reads fast and
-  making refresh event-driven.
-- Change the provider to peek the cache synchronously rather than freeze a `Vec`
-  (a partial fix; the synchronous methods still cannot go back to the source on
-  their own when the cache is empty or expired).
-- Query live via `block_on` (always fresh, but at the cost of a blocking RPC plus
-  the nested-runtime thread hack on every listing).
-
-The choice depends on the consumer's access pattern (re-register per request vs.
-long-lived session) and the source of DDL (whether it flows through this crate /
-gateway). This is left to be decided later in light of the gateway's actual
-usage.
+DataFusion's `CatalogProvider` / `SchemaProvider` listing methods are
+**synchronous**, whereas Fluss's metadata interface is async. To stay live, the
+crate bridges the two: the synchronous callbacks run the async source call to
+completion via a small `block_on` helper (`src/runtime.rs`), spawning a short-lived
+thread when already inside a tokio runtime to avoid the nested-runtime panic. The
+known, accepted cost is **one admin RPC per catalog call** (plus the thread hop on
+the synchronous paths). This is intentional for this phase; no caching is layered
+on top.
 
 ## Error model
 
@@ -174,8 +141,8 @@ DataFusion paths (such as `ctx.sql(...).collect()`). The type deliberately does
 
 | Feature | Purpose | Containers needed |
 |---|---|---|
-| (default) | Unit tests: schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, error mapping, and the metadata cache's TTL / hit-reuse logic | No |
-| `integration_tests` | Integration tests against a real Fluss cluster: e2e (real SQL against the real backend) | Yes (Docker / podman) |
+| (default) | Unit tests: schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, and error mapping | No |
+| `integration_tests` | Integration tests against a real Fluss cluster: e2e (real SQL against the real backend) plus live-metadata visibility | Yes (Docker / podman) |
 
 Common commands:
 
@@ -204,7 +171,7 @@ creation and seeding).
                v
 +-----------------------------+
 |       FlussDatafusion       |   shared installer (Arc, stateless)
-|    MetadataLoader + Cache   |   reuses metadata across sessions
+|     MetadataLoader (live)   |   no cache; every call hits Fluss
 +--------------+--------------+
                | FlussSource (internal trait, crate boundary)
                v
@@ -218,7 +185,7 @@ creation and seeding).
 
 Module responsibilities:
 
-- `metadata/`: shared metadata loading and caching.
+- `metadata/`: shared live metadata loading (no cache).
 - `catalog/`: `CatalogProvider` / `SchemaProvider`.
 - `table/`: `TableProvider` and predicate recognition.
 - `execution/`: custom `ExecutionPlan`s (`FlussKvLookupExec` / `FlussLogScanExec`).

@@ -174,6 +174,47 @@ pub async fn create_log_basic(connection: &FlussConnection) -> TableInfo {
     admin.get_table_info(&table_path).await.unwrap()
 }
 
+/// Creates and populates a single-bucket log table under an arbitrary name,
+/// waiting until its bucket can serve reads. Used to create tables on demand
+/// (e.g. AFTER `register_catalog`) so the live-metadata test can prove visibility.
+pub async fn create_log_named(connection: &FlussConnection, table_name: &str) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, table_name);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .build()
+                .unwrap(),
+        )
+        // Single bucket keeps the bounded scan deterministic.
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_append().unwrap().create_writer().unwrap();
+    writer.append_arrow_batch(log_batch()).unwrap();
+    writer.flush().await.unwrap();
+
+    wait_for_offsets(connection, &table_path).await;
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
+/// Best-effort drop of a single table under `names::DATABASE`.
+pub async fn drop_table_named(connection: &FlussConnection, table_name: &str) {
+    let admin = connection.get_admin().unwrap();
+    let _ = admin
+        .drop_table(&TablePath::new(names::DATABASE, table_name), true)
+        .await;
+}
+
 /// Builds the log table's input batch with explicit Arrow arrays.
 ///
 /// Built by hand (rather than the `record_batch!` macro) because that macro

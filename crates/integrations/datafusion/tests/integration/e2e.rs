@@ -18,11 +18,11 @@
 //! End-to-end path: drives real `ctx.sql(...)` through the production public API
 //! (`FlussDatafusion::new` -> `RealFlussSource`) against a live Fluss cluster.
 //!
-//! This is the single integration suite: the real backend, the sync/async
+//! This is the primary integration suite: the real backend, the sync/async
 //! metadata bridge, the catalog tree, and the custom execution plans all run
-//! against actual Fluss. There is no cluster-free mirror — the per-call
-//! cache/TTL mechanics are covered by `metadata::cache` unit tests, and the
-//! pushdown contract is verified here against the real server.
+//! against actual Fluss. There is no cluster-free mirror — the catalog is fully
+//! live (no cache), and the pushdown contract is verified here against the real
+//! server. Live post-DDL visibility is covered by the `live_metadata` suite.
 //!
 //! Gated by `integration_tests` (needs a container runtime). Run with:
 //!   cargo test -p fluss-datafusion --features integration_tests -- e2e

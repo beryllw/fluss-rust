@@ -17,39 +17,31 @@
 
 //! `CatalogProvider` over a Fluss cluster.
 //!
-//! Built once from a shared metadata snapshot at `register_catalog` time, then
-//! handed to one or more `SessionContext`s. Schemas (databases) are pre-built from
-//! the snapshot so the synchronous `schema_names()`/`schema()` can serve them
-//! without async work.
+//! Holds only the shared loader and serves every call live: the synchronous
+//! `schema_names()`/`schema()` bridge to the async source via the global runtime,
+//! so databases created after `register_catalog` are visible in the same session.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
 
 use crate::catalog::schema::FlussSchemaProvider;
+use crate::metadata::MetadataLoader;
+use crate::runtime::block_on_with_runtime;
 
-/// Read-only catalog provider backed by a shared metadata snapshot.
+/// Catalog access thread panic message shared by the blocking bridges.
+const ACCESS_PANIC: &str = "fluss catalog access thread panicked";
+
+/// Read-only catalog provider that lists Fluss databases live on every call.
 #[derive(Debug)]
 pub(crate) struct FlussCatalogProvider {
-    /// Insertion-ordered schema names for stable listing.
-    schema_names: Vec<String>,
-    schemas: HashMap<String, Arc<dyn SchemaProvider>>,
+    loader: Arc<MetadataLoader>,
 }
 
 impl FlussCatalogProvider {
-    pub(crate) fn new(schemas: Vec<(String, Arc<FlussSchemaProvider>)>) -> Self {
-        let mut schema_names = Vec::with_capacity(schemas.len());
-        let mut map: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
-        for (name, provider) in schemas {
-            schema_names.push(name.clone());
-            map.insert(name, provider);
-        }
-        Self {
-            schema_names,
-            schemas: map,
-        }
+    pub(crate) fn new(loader: Arc<MetadataLoader>) -> Self {
+        Self { loader }
     }
 }
 
@@ -59,10 +51,38 @@ impl CatalogProvider for FlussCatalogProvider {
     }
 
     fn schema_names(&self) -> Vec<String> {
-        self.schema_names.clone()
+        let loader = self.loader.clone();
+        block_on_with_runtime(
+            async move {
+                match loader.databases().await {
+                    Ok(listing) => listing.into_iter().map(|(db, _)| db).collect(),
+                    // Sync trait can't propagate errors; degrade to empty, as paimon does.
+                    Err(_) => vec![],
+                }
+            },
+            ACCESS_PANIC,
+        )
     }
 
     fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
-        self.schemas.get(name).cloned()
+        let loader = self.loader.clone();
+        let name = name.to_string();
+        // Check existence live so an unknown database returns `None` (matching the
+        // paimon `DatabaseNotExist -> None` behaviour and the e2e expectation that
+        // `catalog.schema("does_not_exist")` is `None`).
+        let exists = block_on_with_runtime(
+            {
+                let loader = loader.clone();
+                let name = name.clone();
+                async move {
+                    matches!(loader.source().list_databases().await, Ok(dbs) if dbs.iter().any(|d| d == &name))
+                }
+            },
+            ACCESS_PANIC,
+        );
+        if !exists {
+            return None;
+        }
+        Some(Arc::new(FlussSchemaProvider::new(name, loader)) as Arc<dyn SchemaProvider>)
     }
 }

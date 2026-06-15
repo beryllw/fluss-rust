@@ -20,6 +20,8 @@
 //! - `utils`: shared SQL-path helpers (always compiled).
 //! - `setup`: shared real-cluster bootstrap + table DDL/DML (`integration_tests`).
 //! - `e2e`: real-cluster end-to-end SQL through the real backend (`integration_tests`).
+//! - `live_metadata`: real-cluster proof that post-registration DDL is visible
+//!   live in the same session (`integration_tests`).
 
 pub mod utils;
 
@@ -28,3 +30,6 @@ pub mod setup;
 
 #[cfg(feature = "integration_tests")]
 pub mod e2e;
+
+#[cfg(feature = "integration_tests")]
+pub mod live_metadata;

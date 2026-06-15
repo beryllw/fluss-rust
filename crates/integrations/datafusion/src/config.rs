@@ -15,20 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::time::Duration;
-
-#[derive(Debug, Clone)]
-pub struct FlussDatafusionOptions {
-    pub metadata_cache_ttl: Duration,
-}
-
-impl Default for FlussDatafusionOptions {
-    fn default() -> Self {
-        Self {
-            metadata_cache_ttl: Duration::from_secs(300),
-        }
-    }
-}
+/// Installer-wide options. Empty placeholder for now (the catalog is fully live
+/// with no cache to tune), kept as a stable type for future global options.
+#[derive(Debug, Clone, Default)]
+pub struct FlussDatafusionOptions {}
 
 #[derive(Debug, Clone, Default)]
 pub struct RegisterCatalogOptions {}

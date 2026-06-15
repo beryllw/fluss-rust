@@ -17,9 +17,10 @@
 
 //! `SchemaProvider` for a single Fluss database.
 //!
-//! `table_names()` is synchronous and served from the snapshot captured at
-//! `register_catalog` time. `table()` is async: per-table metadata + Arrow schema
-//! are loaded lazily through the shared loader (and cached there).
+//! Every method is live: `table_names()`/`table_exist()` bridge the synchronous
+//! catalog callbacks to the async source, and `table()` loads per-table metadata +
+//! Arrow schema fresh each call. Tables created after `register_catalog` are
+//! therefore visible in the same session.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -29,30 +30,25 @@ use datafusion::catalog::{SchemaProvider, TableProvider};
 use datafusion::error::Result as DfResult;
 
 use crate::backend::TableRef;
+use crate::error::FlussDatafusionError;
 use crate::metadata::MetadataLoader;
+use crate::runtime::block_on_with_runtime;
 use crate::table::kv::FlussKvTableProvider;
 use crate::table::log::FlussLogTableProvider;
 
-/// One Fluss database surfaced as a DataFusion schema.
+/// Catalog access thread panic message shared by the blocking bridges.
+const ACCESS_PANIC: &str = "fluss catalog access thread panicked";
+
+/// One Fluss database surfaced as a DataFusion schema, listing tables live.
 #[derive(Debug)]
 pub(crate) struct FlussSchemaProvider {
     database: String,
-    /// Table-name snapshot captured at registration (no async listing here).
-    table_names: Vec<String>,
     loader: Arc<MetadataLoader>,
 }
 
 impl FlussSchemaProvider {
-    pub(crate) fn new(
-        database: String,
-        table_names: Vec<String>,
-        loader: Arc<MetadataLoader>,
-    ) -> Self {
-        Self {
-            database,
-            table_names,
-            loader,
-        }
+    pub(crate) fn new(database: String, loader: Arc<MetadataLoader>) -> Self {
+        Self { database, loader }
     }
 }
 
@@ -63,15 +59,23 @@ impl SchemaProvider for FlussSchemaProvider {
     }
 
     fn table_names(&self) -> Vec<String> {
-        self.table_names.clone()
+        let loader = self.loader.clone();
+        let database = self.database.clone();
+        block_on_with_runtime(
+            // Sync trait can't propagate errors; degrade to empty, as paimon does.
+            async move { loader.source().list_tables(&database).await.unwrap_or_default() },
+            ACCESS_PANIC,
+        )
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
-        if !self.table_names.iter().any(|t| t == name) {
-            return Ok(None);
-        }
         let table_ref = TableRef::new(self.database.clone(), name.to_string());
-        let entry = self.loader.table_entry(&table_ref).await?;
+        let entry = match self.loader.table_entry(&table_ref).await {
+            Ok(entry) => entry,
+            // A missing table is `Ok(None)`, not an error; any other failure propagates.
+            Err(FlussDatafusionError::TableNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         if entry.meta.has_primary_key() {
             // KV table: a real point-lookup provider (Task 4).
             let provider = FlussKvTableProvider::new(
@@ -83,16 +87,24 @@ impl SchemaProvider for FlussSchemaProvider {
             Ok(Some(Arc::new(provider)))
         } else {
             // Log table: a required-`LIMIT` bounded-scan provider (Task 5).
-            let provider = FlussLogTableProvider::new(
-                self.loader.source(),
-                table_ref,
-                entry.arrow_schema,
-            );
+            let provider =
+                FlussLogTableProvider::new(self.loader.source(), table_ref, entry.arrow_schema);
             Ok(Some(Arc::new(provider)))
         }
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        self.table_names.iter().any(|t| t == name)
+        let loader = self.loader.clone();
+        let database = self.database.clone();
+        let name = name.to_string();
+        block_on_with_runtime(
+            async move {
+                matches!(
+                    loader.source().list_tables(&database).await,
+                    Ok(tables) if tables.iter().any(|t| t == &name)
+                )
+            },
+            ACCESS_PANIC,
+        )
     }
 }

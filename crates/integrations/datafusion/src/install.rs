@@ -25,22 +25,23 @@ use crate::backend::real::RealFlussSource;
 use crate::catalog::build_catalog_provider;
 use crate::config::{FlussDatafusionOptions, RegisterCatalogOptions};
 use crate::error::Result;
-use crate::metadata::{MetadataCache, MetadataLoader};
+use crate::metadata::MetadataLoader;
 
 /// Shared, stateless installer for Fluss DataFusion integration.
 ///
-/// Built once around a connection and shared metadata/cache state; a SQL session
-/// then installs Fluss catalog support into its own `SessionContext` via
-/// [`FlussDatafusion::register_catalog`].
+/// Built once around a connection; a SQL session then installs Fluss catalog
+/// support into its own `SessionContext` via
+/// [`FlussDatafusion::register_catalog`]. The catalog is fully live: it holds no
+/// metadata cache, so DDL is visible in the same session immediately.
 pub struct FlussDatafusion {
     inner: Arc<Inner>,
 }
 
 struct Inner {
-    /// Shared, session-agnostic metadata loader (fronts the source with a cache).
-    /// One instance per installer, reused across every `SessionContext`. The loader
-    /// owns the single `FlussSource` handle; the rest of the crate reaches Fluss
-    /// only through it.
+    /// Shared, session-agnostic metadata loader (a thin, cache-free pass-through
+    /// over the source). One instance per installer, reused across every
+    /// `SessionContext`. The loader owns the single `FlussSource` handle; the rest
+    /// of the crate reaches Fluss only through it.
     loader: Arc<MetadataLoader>,
 }
 
@@ -51,25 +52,24 @@ impl FlussDatafusion {
     /// crate never depends on `FlussConnection` outside this boundary.
     pub async fn new(
         connection: Arc<FlussConnection>,
-        options: FlussDatafusionOptions,
+        _options: FlussDatafusionOptions,
     ) -> Result<Self> {
         let source: SharedFlussSource = Arc::new(RealFlussSource::new(connection));
-        Ok(Self::from_source(source, options))
+        Ok(Self::from_source(source))
     }
 
-    fn from_source(source: SharedFlussSource, options: FlussDatafusionOptions) -> Self {
-        let cache = Arc::new(MetadataCache::new(options.metadata_cache_ttl));
-        let loader = Arc::new(MetadataLoader::new(source, cache));
+    fn from_source(source: SharedFlussSource) -> Self {
+        let loader = Arc::new(MetadataLoader::new(source));
         Self {
             inner: Arc::new(Inner { loader }),
         }
     }
 
-    /// Registers the Fluss catalog tree into a session context.
+    /// Registers the Fluss catalog into a session context.
     ///
-    /// Builds a `CatalogProvider` backed by the shared metadata cache and installs
-    /// it via `ctx.register_catalog`. Repeated calls (including on a fresh context)
-    /// reuse the cached database/table listing and do not re-hit the source.
+    /// Builds a `CatalogProvider` backed by the shared loader and installs it via
+    /// `ctx.register_catalog`. The provider lists databases/tables live on every
+    /// call, so DDL is visible in the same session without re-registering.
     pub async fn register_catalog(
         &self,
         ctx: &SessionContext,

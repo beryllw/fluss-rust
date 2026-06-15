@@ -51,7 +51,7 @@
 //!     config.bootstrap_servers = "127.0.0.1:9123".to_string();
 //!     let connection = Arc::new(FlussConnection::new(config).await?);
 //!
-//!     // 2) Build the shared installer (construct once, reuse the metadata cache across sessions).
+//!     // 2) Build the shared installer (construct once, reuse across sessions; metadata stays live).
 //!     let fd = FlussDatafusion::new(connection, FlussDatafusionOptions::default()).await?;
 //!
 //!     // 3) Each session creates its own context and installs the catalog.
@@ -85,6 +85,7 @@ mod error;
 mod execution;
 mod install;
 mod metadata;
+mod runtime;
 mod table;
 mod types;
 

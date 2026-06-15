@@ -15,29 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared metadata loader.
+//! Live metadata loader.
 //!
 //! Depends only on [`FlussSource`] (via `SharedFlussSource`), never on
-//! `FlussConnection`/`FlussAdmin` directly, and fronts every source read with the
-//! shared [`MetadataCache`]. The database/table listing is loaded once; per-table
-//! metadata + Arrow schema are loaded lazily and cached on first `table()`.
-
-use std::sync::Arc;
+//! `FlussConnection`/`FlussAdmin` directly. It holds no cache: every call goes
+//! straight to the source so DDL is visible in the same session immediately
+//! (matching SQL catalog semantics). The loader stays the home for Arrow-schema
+//! derivation so callers do not re-implement the Fluss-to-Arrow mapping.
 
 use arrow::datatypes::SchemaRef;
 
 use crate::backend::{FlussTableMeta, SharedFlussSource, TableRef};
 use crate::error::Result;
-use crate::metadata::cache::{DatabaseListing, MetadataCache, TableEntry};
 
-/// Loads and caches Fluss metadata behind the [`FlussSource`] seam.
-pub(crate) struct MetadataLoader {
-    source: SharedFlussSource,
-    cache: Arc<MetadataCache>,
+/// Database -> ordered table-name listing: one full-cluster view.
+pub(crate) type DatabaseListing = Vec<(String, Vec<String>)>;
+
+/// Per-table metadata: the crate-owned meta plus its derived Arrow schema.
+#[derive(Clone)]
+pub(crate) struct TableEntry {
+    pub meta: FlussTableMeta,
+    pub arrow_schema: SchemaRef,
 }
 
-// `SharedFlussSource` (a trait object) and the lock-guarded cache are not `Debug`;
-// catalog providers that embed the loader still need `Debug`, so provide a terse one.
+/// Loads Fluss metadata live behind the [`FlussSource`] seam.
+pub(crate) struct MetadataLoader {
+    source: SharedFlussSource,
+}
+
+// `SharedFlussSource` (a trait object) is not `Debug`; catalog providers that
+// embed the loader still need `Debug`, so provide a terse one.
 impl std::fmt::Debug for MetadataLoader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataLoader").finish_non_exhaustive()
@@ -45,8 +52,8 @@ impl std::fmt::Debug for MetadataLoader {
 }
 
 impl MetadataLoader {
-    pub(crate) fn new(source: SharedFlussSource, cache: Arc<MetadataCache>) -> Self {
-        Self { source, cache }
+    pub(crate) fn new(source: SharedFlussSource) -> Self {
+        Self { source }
     }
 
     /// Returns a clone of the shared [`FlussSource`] handle.
@@ -58,36 +65,25 @@ impl MetadataLoader {
         self.source.clone()
     }
 
-    /// Returns the database -> table-name listing, fetching from the source only
-    /// when the shared cache has no fresh snapshot. This is the single full-cluster
-    /// read; it is shared across all `SessionContext`s.
+    /// Returns the database -> table-name listing, fetched live every call.
+    ///
+    /// One admin RPC per database for the table listing is the known, accepted
+    /// cost of keeping listings always-fresh; there is no snapshot to go stale.
     pub(crate) async fn databases(&self) -> Result<DatabaseListing> {
-        if let Some(cached) = self.cache.databases() {
-            return Ok(cached);
-        }
-
         let db_names = self.source.list_databases().await?;
         let mut listing = Vec::with_capacity(db_names.len());
         for db in db_names {
             let tables = self.source.list_tables(&db).await?;
             listing.push((db, tables));
         }
-        self.cache.store_databases(listing.clone());
         Ok(listing)
     }
 
-    /// Returns the cached/loaded Arrow schema + meta for one table.
+    /// Loads the Arrow schema + meta for one table live every call.
     pub(crate) async fn table_entry(&self, table: &TableRef) -> Result<TableEntry> {
-        let key = table.to_string();
-        if let Some(entry) = self.cache.table(&key) {
-            return Ok(entry);
-        }
-
         let meta = self.source.get_table_meta(table).await?;
         let arrow_schema = arrow_schema_of(&meta)?;
-        let entry = TableEntry { meta, arrow_schema };
-        self.cache.store_table(key, entry.clone());
-        Ok(entry)
+        Ok(TableEntry { meta, arrow_schema })
     }
 }
 

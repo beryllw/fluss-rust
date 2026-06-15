@@ -62,7 +62,7 @@ gateway.
                v
 +-----------------------------+
 |       FlussDatafusion       |   shared installer (Arc, stateless)
-|    MetadataLoader + Cache   |   reuses metadata across sessions
+|     MetadataLoader (live)   |   no cache; every call hits Fluss
 +--------------+--------------+
                | FlussSource (internal trait, crate boundary)
                v
@@ -94,17 +94,17 @@ crates/integrations/datafusion/
     config.rs          # FlussDatafusionOptions / RegisterCatalogOptions
     error.rs           # FlussDatafusionError / Result
     install.rs         # FlussDatafusion: new / register_catalog
+    runtime.rs         # sync<->async bridge for synchronous catalog callbacks
     backend/
       mod.rs           # FlussSource trait (pub(crate)) + shared aliases
       real.rs          # production implementation, wraps FlussConnection
     metadata/
       mod.rs
-      cache.rs         # shared, RwLock-guarded, per-entry TTL
-      loader.rs        # depends only on FlussSource, fronts the cache
+      loader.rs        # live pass-through over FlussSource; no cache
     catalog/
       mod.rs
-      provider.rs      # FlussCatalogProvider (sync schema_names / schema)
-      schema.rs        # FlussSchemaProvider (async table() lazy loading)
+      provider.rs      # FlussCatalogProvider (live sync schema_names / schema)
+      schema.rs        # FlussSchemaProvider (live table_names; async table())
       register.rs      # build_catalog_provider
     table/
       mod.rs
@@ -144,9 +144,7 @@ The public surface is deliberately minimal and is exported entirely from
 - `FlussDatafusionError` / `Result` (`error.rs`).
 
 ```rust
-pub struct FlussDatafusionOptions {
-    pub metadata_cache_ttl: std::time::Duration,   // default 300s
-}
+pub struct FlussDatafusionOptions {}               // placeholder; the catalog is live, nothing to tune
 
 pub struct RegisterCatalogOptions {}               // placeholder, reserved for per-catalog options
 
@@ -188,33 +186,43 @@ through the `new()` production path against a real cluster.
 
 ### `metadata/`
 
-- `cache.rs`: a shared, `RwLock`-guarded snapshot (db/table listing + per-table
-  `TableEntry{meta, arrow_schema}`), with a per-entry `Instant`-based TTL. **The
-  lock guard is released immediately after reading/cloning, and is never held
-  across an `.await`.**
-- `loader.rs`: `MetadataLoader` depends only on `SharedFlussSource` and fronts the
-  cache. The database/table listing is a single whole-cluster read shared across
-  all `SessionContext`s; per-table meta + Arrow schema is lazily loaded and
-  cached on the first `table()` call. The Arrow schema is converted via
-  `fluss::record::to_arrow_schema(meta.schema.row_type())`.
+- `loader.rs`: `MetadataLoader` depends only on `SharedFlussSource` and holds no
+  cache. `databases()` reads the whole-cluster db/table listing live every call;
+  `table_entry()` re-reads per-table meta + Arrow schema live every call. The
+  Arrow schema is converted via
+  `fluss::record::to_arrow_schema(meta.schema.row_type())`. The loader stays the
+  home for that derivation so callers do not re-implement the mapping.
+
+### `runtime.rs`
+
+- The sync<->async bridge for DataFusion's synchronous catalog callbacks.
+  `block_on_with_runtime` drives an async source call to completion from a
+  synchronous callback; when already inside a tokio runtime it spawns a
+  short-lived thread that `block_on`s a global runtime handle, avoiding the
+  "cannot block within a runtime" panic. A single lazily-built global runtime
+  backs the fallback so no runtime is created per call.
 
 ### `catalog/`
 
-- `provider.rs`: `FlussCatalogProvider` maps a Fluss database to a schema. The
-  synchronous `schema_names()` / `schema()` are served directly from the snapshot
-  pre-built at `register_catalog` time, with no async needed.
-- `schema.rs`: `FlussSchemaProvider`'s synchronous `table_names()` comes from the
-  registration-time snapshot; its async `table()` branches on
+- `provider.rs`: `FlussCatalogProvider` holds only the shared loader. The
+  synchronous `schema_names()` lists databases live (via `block_on_with_runtime`);
+  `schema()` checks the database exists live and returns `None` for an unknown
+  name (mirroring paimon's `DatabaseNotExist -> None`), otherwise hands back a
+  `FlussSchemaProvider`.
+- `schema.rs`: `FlussSchemaProvider` holds the database name + loader. Its
+  synchronous `table_names()` / `table_exist()` list tables live; its async
+  `table()` loads the entry live, maps `TableNotFound -> Ok(None)`, and branches on
   `meta.has_primary_key()` to return either `FlussKvTableProvider` (KV) or
   `FlussLogTableProvider` (log).
-- `register.rs`: `build_catalog_provider` assembles the provider tree from the
-  shared (cache-fronted) listing snapshot, and takes effect when
-  `register_catalog` calls `ctx.register_catalog(...)`.
+- `register.rs`: `build_catalog_provider` simply wraps the loader in a
+  `FlussCatalogProvider`; it does no pre-listing, so registration is cheap and
+  listings never go stale.
 
-> The sync/async bridge uses a "snapshot at registration time" instead of a
-> `block_on` inside a synchronous callback, thereby avoiding the nested-runtime
-> thread hack. The cost is the snapshot semantics of listing visibility; see the
-> README's "Metadata visibility and known limitations".
+> The sync/async bridge uses a live `block_on` inside the synchronous callbacks
+> (via `runtime.rs`) instead of a registration-time snapshot. This makes the
+> catalog fully live — DDL is visible in the same session immediately — at the
+> known, accepted cost of one admin RPC (plus a thread hop) per catalog call. See
+> the README's "Metadata visibility".
 
 ### `table/`
 
@@ -315,15 +323,16 @@ are two layers:
 
 | Layer | Feature | Containers | Purpose |
 |---|---|---|---|
-| Unit tests | default | No | schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, error mapping, and the metadata cache's TTL / hit-reuse logic |
+| Unit tests | default | No | schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, and error mapping |
 | Integration tests (e2e) | `integration_tests` | Yes | real SQL against the real backend (`FlussDatafusion::new` -> `RealFlussSource`), covering catalog listing, KV point lookup (single/composite PK, missing key, and unsupported forms such as non-PK / partial PK / `IN` / no filter), log bounded scan and projection, `EXPLAIN` custom plans, and the Arrow schema exposed by `TableProvider` |
+| Integration tests (live metadata) | `integration_tests` | Yes | proves the live, no-cache contract: a table created AFTER `register_catalog` is queryable and listed in the same session, and a dropped table disappears from that session's listing / `table()` resolution |
 
 The integration tests assert sequentially against a single cluster inside one
 test function: standing up a Fluss cluster is expensive, while these assertions
 are all read-only and mutually independent, so they share one cluster to lower
-the cost (`setup.rs` provides shared table creation and seeding). The per-call
-cache hit/invalidate is a white-box mechanism covered by `metadata::cache`'s unit
-tests, with no need to re-verify it against the real backend.
+the cost (`setup.rs` provides shared table creation and seeding). Because the
+catalog holds no cache, there is no white-box cache mechanism to unit-test;
+live-visibility behaviour is verified end to end against the real backend.
 
 Verification commands:
 

@@ -15,13 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared metadata loading and cache behaviour.
+//! Shared, live metadata loading.
 //!
-//! `cache` owns the lock-protected snapshot; `loader` fronts the [`FlussSource`]
-//! seam with that cache. Both are session-agnostic and shared via the installer.
+//! `loader` is a thin, session-agnostic pass-through over the [`FlussSource`]
+//! seam: every call hits Fluss so DDL is visible immediately. It holds no cache.
 
-pub(crate) mod cache;
 pub(crate) mod loader;
 
-pub(crate) use cache::MetadataCache;
 pub(crate) use loader::MetadataLoader;

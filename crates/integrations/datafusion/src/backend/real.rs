@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use fluss::client::FlussConnection;
+use fluss::error::FlussError;
 use fluss::metadata::{TableBucket, TableInfo, TablePath};
 use fluss::row::GenericRow;
 
@@ -110,7 +111,16 @@ impl FlussSource for RealFlussSource {
     async fn get_table_meta(&self, table: &TableRef) -> Result<FlussTableMeta> {
         let admin = self.connection.get_admin()?;
         let path: TablePath = table.into();
-        let info = admin.get_table_info(&path).await?;
+        let info = admin.get_table_info(&path).await.map_err(|err| {
+            // Translate the source's "table does not exist" API error into the
+            // crate's structured `TableNotFound` so the catalog `table()` path can
+            // map it to `Ok(None)` instead of propagating an opaque client error.
+            if err.api_error() == Some(FlussError::TableNotExist) {
+                FlussDatafusionError::TableNotFound(table.to_string())
+            } else {
+                FlussDatafusionError::from(err)
+            }
+        })?;
         Ok(Self::meta_from_table_info(table, &info))
     }
 

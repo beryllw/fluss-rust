@@ -18,8 +18,8 @@
 //! DataFusion catalog layer over Fluss metadata.
 //!
 //! `provider` is the `CatalogProvider`, `schema` the per-database
-//! `SchemaProvider` (+ a minimal placeholder `TableProvider`), and `register`
-//! builds the tree from the shared metadata snapshot.
+//! `SchemaProvider`, and `register` builds the provider. Every listing/table call
+//! is served live from the shared loader (no snapshot, no cache).
 
 pub(crate) mod provider;
 pub(crate) mod register;

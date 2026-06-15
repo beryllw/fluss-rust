@@ -33,6 +33,10 @@ pub mod names {
     pub const KV_COMPOSITE: &str = "df_kv_composite";
     /// Log (append-only) table for bounded scans.
     pub const LOG_BASIC: &str = "df_log_basic";
+    /// Log table created AFTER `register_catalog` to prove live visibility.
+    pub const LOG_LIVE: &str = "df_log_live";
+    /// Log table created up front, then dropped, to prove drops are reflected live.
+    pub const LOG_TRANSIENT: &str = "df_log_transient";
 }
 
 /// Shared SQL-path helpers for the real-cluster integration suite.

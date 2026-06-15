@@ -15,31 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Builds the Fluss `CatalogProvider` tree from the shared metadata snapshot.
+//! Builds the Fluss `CatalogProvider`.
 //!
-//! The single full-cluster read (database/table listing) goes through the shared
-//! loader, so a second `register_catalog` on a fresh context reuses the cache and
-//! does not re-hit the source.
+//! There is no pre-listing here: the provider holds only the shared loader and
+//! lists databases/tables live, so registration is cheap and listings never go
+//! stale.
 
 use std::sync::Arc;
 
 use crate::catalog::provider::FlussCatalogProvider;
-use crate::catalog::schema::FlussSchemaProvider;
 use crate::error::Result;
 use crate::metadata::MetadataLoader;
 
-/// Builds a catalog provider from the shared (cache-fronted) listing snapshot.
+/// Builds a catalog provider that serves every listing live from the loader.
 pub(crate) async fn build_catalog_provider(
     loader: Arc<MetadataLoader>,
 ) -> Result<Arc<FlussCatalogProvider>> {
-    let listing = loader.databases().await?;
-    let schemas = listing
-        .into_iter()
-        .map(|(database, tables)| {
-            let provider =
-                Arc::new(FlussSchemaProvider::new(database.clone(), tables, loader.clone()));
-            (database, provider)
-        })
-        .collect();
-    Ok(Arc::new(FlussCatalogProvider::new(schemas)))
+    Ok(Arc::new(FlussCatalogProvider::new(loader)))
 }
