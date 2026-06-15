@@ -47,7 +47,7 @@ test-fake = []
 integration_tests = []
 
 [dev-dependencies]
-fluss-test-cluster = { path = "../fluss-test-cluster" }
+fluss-test-cluster = { path = "../../fluss-test-cluster" }
 tokio = { workspace = true }
 arrow = { workspace = true }
 futures = "0.3"
