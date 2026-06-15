@@ -1,33 +1,43 @@
 # fluss-datafusion
 
-`fluss-datafusion` 是一个**无状态**的 DataFusion 集成 crate，职责单一：把 `SQL` 转换成对
-Apache Fluss 表的访问。它把 Fluss 的 KV 表与 Log 表暴露成 DataFusion 的
-`CatalogProvider` / `SchemaProvider` / `TableProvider`，并为受支持的查询形态提供自定义
-`ExecutionPlan`，让你直接用 `ctx.sql(...)` 查询 Fluss。
+> For the Chinese version, see [README.zh.md](./README.zh.md).
 
-> 本 crate 不感知调用方身份、协议、会话变量或鉴权模式，也不知道自己是否运行在 gateway 内。
-> 依赖方向是单向的：`fluss client/core -> fluss-datafusion`，绝不反向。
+`fluss-datafusion` is a **stateless** DataFusion integration crate with a single
+responsibility: turning `SQL` into access to Apache Fluss tables. It exposes
+Fluss KV and Log tables to DataFusion as `CatalogProvider` / `SchemaProvider` /
+`TableProvider`, and supplies custom `ExecutionPlan`s for the supported query
+forms, so you can query Fluss directly with `ctx.sql(...)`.
 
-## 当前能力（Phase 1）
+> This crate is unaware of caller identity, protocol, session variables, or auth
+> mode, and it does not know whether it is running inside a gateway. The
+> dependency direction is strictly one-way: `fluss client/core -> fluss-datafusion`,
+> never the reverse.
 
-- 列举 database / table，获取表的 schema 与表类型
-- **KV 表**：完整主键等值谓词下推为点查（point lookup），支持单主键与复合主键
-- **Log 表**：带 `LIMIT` 的有界扫描（bounded scan），支持投影下推
-- Fluss schema 到 Arrow schema、Fluss row 到 `RecordBatch` 的转换
-- 共享 installer + 每会话 `register_catalog(...)` 的使用模型
-- 不支持的查询形态会**保守失败**（明确报错），而不会静默退化成误导性的全表扫描
+## Current capabilities (Phase 1)
 
-Phase 1 **不包含**：PostgreSQL / MySQL 兼容对象、REST/gRPC 接口、会话或操作生命周期、
-principal 路由、多集群、SQL 写入（DML）、gateway 鉴权 / 审计。
+- List databases / tables, and fetch a table's schema and table type.
+- **KV tables**: full-primary-key equality predicate pushed down as a point
+  lookup, for both single and composite primary keys.
+- **Log tables**: bounded scan with `LIMIT`, supporting projection pushdown.
+- Fluss-schema-to-Arrow-schema and Fluss-row-to-`RecordBatch` conversion.
+- A usage model of a shared installer plus per-session `register_catalog(...)`.
+- Unsupported query forms **fail conservatively** (raise an explicit error)
+  rather than silently degrading into a misleading full-table scan.
 
-## 使用方式
+Phase 1 **excludes**: PostgreSQL / MySQL compatibility objects, REST/gRPC
+interfaces, session or operation lifecycle, principal routing, multi-cluster,
+SQL writes (DML), and gateway auth / audit.
 
-整体是「一个共享 installer + 每个 SQL 会话各自安装」的模型：
+## Usage
 
-1. 用一个 `FlussConnection` 构造一个共享的 `FlussDatafusion`（内部持有元数据缓存）。
-2. 每个 SQL 会话创建自己的 `SessionContext`。
-3. 会话通过 `register_catalog(...)` 把 Fluss catalog 装入该 context。
-4. 之后照常 `ctx.sql(...)`。
+The overall model is "one shared installer plus a per-session install":
+
+1. Construct one shared `FlussDatafusion` from a `FlussConnection` (it holds the
+   metadata cache internally).
+2. Each SQL session creates its own `SessionContext`.
+3. The session installs the Fluss catalog into that context via
+   `register_catalog(...)`.
+4. From then on, just call `ctx.sql(...)` as usual.
 
 ```rust,no_run
 use std::sync::Arc;
@@ -40,20 +50,20 @@ use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogO
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1) 连接 Fluss。
+    // 1) Connect to Fluss.
     let mut config = Config::default();
     config.bootstrap_servers = "127.0.0.1:9123".to_string();
     let connection = Arc::new(FlussConnection::new(config).await?);
 
-    // 2) 构造共享 installer（一次构造，跨会话复用元数据缓存）。
+    // 2) Build the shared installer (construct once, reuse the metadata cache across sessions).
     let fd = FlussDatafusion::new(connection, FlussDatafusionOptions::default()).await?;
 
-    // 3) 每个会话各自创建 context 并安装 catalog。
+    // 3) Each session creates its own context and installs the catalog.
     let ctx = SessionContext::new();
     fd.register_catalog(&ctx, "fluss", RegisterCatalogOptions::default())
         .await?;
 
-    // 4) 正常查询。表名形如 <catalog>.<database>.<table>。
+    // 4) Query normally. Table names look like <catalog>.<database>.<table>.
     let df = ctx
         .sql("SELECT id, name, age FROM fluss.my_db.users WHERE id = 2")
         .await?;
@@ -63,131 +73,157 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`FlussDatafusion` 是 `Arc` 共享、无状态的：构造一次即可被多个 `SessionContext` 复用，
-重复 `register_catalog`（包括在新建 context 上）会复用已缓存的 database/table 列表，
-不会重复打远端元数据请求。
+`FlussDatafusion` is `Arc`-shared and stateless: construct it once and reuse it
+across many `SessionContext`s. Repeated `register_catalog` calls (including on a
+freshly created context) reuse the cached database/table listing and do not
+re-issue remote metadata requests.
 
-## 受支持的查询形态
+## Supported query forms
 
-| 表类型 | 受支持的形态 | 说明 |
+| Table type | Supported form | Notes |
 |---|---|---|
-| KV（主键表） | `WHERE <完整主键> = <值>`（复合主键用 `AND` 全列等值） | 下推为点查，命中返回 1 行，未命中返回 0 行（不报错） |
-| Log（日志表） | `... LIMIT n` | 有界扫描；投影下推；保留**末尾** `n` 行（与 Fluss `LimitBatchScanner` 语义一致） |
+| KV (primary-key table) | `WHERE <full primary key> = <value>` (composite keys use `AND` equality on every column) | Pushed down as a point lookup; a hit returns 1 row, a miss returns 0 rows (no error) |
+| Log table | `... LIMIT n` | Bounded scan; projection pushdown; keeps the **last** `n` rows (matching Fluss `LimitBatchScanner` semantics) |
 
-### 会保守失败的形态
+### Forms that fail conservatively
 
-下面这些会在**计划阶段**直接报错，而不会退化成全表扫描：
+The following fail outright at **planning time** instead of degrading into a
+full-table scan:
 
-| 查询 | 报错 |
+| Query | Error |
 |---|---|
-| KV 表用非主键列做谓词，如 `WHERE name = 'x'` | `unsupported query pattern: ...` |
-| Log 表不带 `LIMIT`，如 `SELECT * FROM log_t` | `LIMIT required: ...` |
+| A KV table with a predicate on a non-primary-key column, e.g. `WHERE name = 'x'` | `unsupported query pattern: ...` |
+| A Log table without `LIMIT`, e.g. `SELECT * FROM log_t` | `LIMIT required: ...` |
 
-可以用 `EXPLAIN` 确认走的是自定义执行计划：KV 点查显示 `FlussKvLookupExec`，
-Log 有界扫描显示 `FlussLogScanExec`。
+You can confirm the custom execution plan with `EXPLAIN`: a KV point lookup
+shows `FlussKvLookupExec`, and a Log bounded scan shows `FlussLogScanExec`.
 
-## 配置
+## Configuration
 
-`FlussDatafusionOptions`：
+`FlussDatafusionOptions`:
 
-| 字段 | 默认值 | 含义 |
+| Field | Default | Meaning |
 |---|---|---|
-| `metadata_cache_ttl` | `300s` | 共享元数据缓存的 TTL；database/table 列表在此期间不重新拉取 |
+| `metadata_cache_ttl` | `300s` | TTL for the shared metadata cache; the database/table listing is not re-fetched during this window |
 
-`RegisterCatalogOptions` 目前为空占位，为后续 per-catalog 选项预留。
+`RegisterCatalogOptions` is currently an empty placeholder, reserved for future
+per-catalog options.
 
-## 元数据可见性与已知限制（待讨论）
+## Metadata visibility and known limitations (open for discussion)
 
-> 这是一个**已知的开放问题**，当前实现刻意保持快照语义，修复方案后续再讨论。
+> This is a **known open question**. The current implementation deliberately
+> keeps snapshot semantics; the fix is to be discussed later.
 
-DataFusion 的 `CatalogProvider` / `SchemaProvider` 列举方法（`schema_names()`、
-`table_names()`、`table_exist()`）是**同步**的，而 Fluss 的元数据接口是 async 的。要在
-同步上下文里拿到 async 结果，只有两条路：提前把数据放进内存（快照），或在同步上下文里
-`block_on` 阻塞等待远程返回（需要绕开 tokio 嵌套运行时，每次列举都付一次阻塞 RPC + 线程
-创建的代价）。本 crate 选择了**快照**，以换取同步读的纳秒级开销和干净的实现。
+DataFusion's `CatalogProvider` / `SchemaProvider` listing methods
+(`schema_names()`, `table_names()`, `table_exist()`) are **synchronous**, whereas
+Fluss's metadata interface is async. There are only two ways to obtain an async
+result inside a synchronous context: put the data into memory ahead of time (a
+snapshot), or `block_on` and wait for the remote response inside the synchronous
+context (which requires working around tokio's nested runtime and pays the cost
+of a blocking RPC plus thread creation on every listing). This crate chooses the
+**snapshot** approach, trading for nanosecond-level synchronous reads and a clean
+implementation.
 
-由此带来两层快照语义：
+This yields two layers of snapshot semantics:
 
-| 层 | 冻结点 | 行为 |
+| Layer | Freeze point | Behavior |
 |---|---|---|
-| Provider 快照 | `register_catalog` 那一刻把 database/table 名冻成 `Vec<String>` | 该 Provider 在其 `SessionContext` 生命周期内**不再回源**；即使缓存 TTL 过期也不刷新 |
-| 缓存 TTL（`metadata_cache_ttl`，默认 300s） | 下一次 `build_catalog_provider` / 首次加载某表 meta 时 | 决定重新构建 Provider 或加载表 schema 时是否回源 |
+| Provider snapshot | At the moment of `register_catalog`, the database/table names are frozen into a `Vec<String>` | The provider **never goes back to the source** during its `SessionContext` lifetime; it does not refresh even after the cache TTL expires |
+| Cache TTL (`metadata_cache_ttl`, default 300s) | On the next `build_catalog_provider` / the first load of a given table's meta | Determines whether to go back to the source when rebuilding the provider or loading a table schema |
 
-**当前可见性契约：**
+**Current visibility contract:**
 
-- catalog 的 database/table 列表是 `register_catalog` 时刻的快照。
-- 注册**之后**新建的表，对该 `SessionContext` **不可见**（`table()` 对不在快照中的名字直接
-  返回 `None`，不回源），与缓存 TTL 无关。要看到新表，需重新 `register_catalog`。
-- 表的 schema/meta 在首次访问时按 TTL 缓存；TTL 内的 schema 变更不会立即反映。
+- A catalog's database/table listing is a snapshot as of the `register_catalog`
+  moment.
+- Tables created **after** registration are **invisible** to that
+  `SessionContext` (`table()` returns `None` for a name not in the snapshot,
+  without going back to the source), independent of the cache TTL. To see new
+  tables, call `register_catalog` again.
+- A table's schema/meta is cached on first access according to the TTL; schema
+  changes within the TTL are not reflected immediately.
 
-**待讨论的修复方向**（尚未实现，仅备忘）：
+**Fix directions under discussion** (not yet implemented, noted for memory):
 
-- 写清契约、不改代码——若消费方本就每请求/每会话重新注册，快照陈旧几乎不构成问题。
-- 在 `FlussDatafusion` 上提供显式 `invalidate()` / `refresh()` 原语，由消费方在 DDL 后按需
-  调用——保住同步读的快，把刷新做成事件驱动。
-- Provider 改为同步窥探缓存而非冻结 `Vec`（半解，缓存空/过期时同步方法仍无法自行回源）。
-- 走 `block_on` 现查（永远新鲜，但代价是每次列举一次阻塞 RPC + 嵌套运行时线程 hack）。
+- Document the contract without changing code — if consumers already re-register
+  per request / per session, snapshot staleness is barely a problem.
+- Provide explicit `invalidate()` / `refresh()` primitives on `FlussDatafusion`
+  that consumers call after DDL as needed — keeping synchronous reads fast and
+  making refresh event-driven.
+- Change the provider to peek the cache synchronously rather than freeze a `Vec`
+  (a partial fix; the synchronous methods still cannot go back to the source on
+  their own when the cache is empty or expired).
+- Query live via `block_on` (always fresh, but at the cost of a blocking RPC plus
+  the nested-runtime thread hack on every listing).
 
-选型取决于消费方的访问模式（每请求注册 vs 长生命周期 session）与 DDL 来源（是否经过本
-crate / gateway）。这部分留待后续结合 gateway 的实际用法再定。
+The choice depends on the consumer's access pattern (re-register per request vs.
+long-lived session) and the source of DDL (whether it flows through this crate /
+gateway). This is left to be decided later in light of the gateway's actual
+usage.
 
-## 错误模型
+## Error model
 
-公开错误类型 `FlussDatafusionError`（别名 `Result<T>`），明确区分各类不支持/失败：
-`DatabaseNotFound` / `TableNotFound` / `UnsupportedQueryPattern` / `LimitRequired` /
-`SchemaMismatch` / `TypeConversion` / `FlussClient` / `Internal`。
-它会被桥接成 DataFusion 的 `DataFusionError::External`，因此能通过标准 DataFusion 路径
-（如 `ctx.sql(...).collect()`）正常冒泡。该类型刻意**不**编码任何 PostgreSQL / gateway 概念。
+The public error type `FlussDatafusionError` (with the alias `Result<T>`) clearly
+distinguishes the various unsupported/failure cases: `DatabaseNotFound` /
+`TableNotFound` / `UnsupportedQueryPattern` / `LimitRequired` / `SchemaMismatch` /
+`TypeConversion` / `FlussClient` / `Internal`. It is bridged into DataFusion's
+`DataFusionError::External`, so it bubbles up normally through the standard
+DataFusion paths (such as `ctx.sql(...).collect()`). The type deliberately does
+**not** encode any PostgreSQL / gateway concepts.
 
-## 测试与 feature
+## Testing and features
 
-| feature | 用途 | 是否需要容器 |
+| Feature | Purpose | Containers needed |
 |---|---|---|
-| （默认） | 单元测试：schema 映射、`ScalarValue` 转 key、谓词识别、下推决策、错误映射，以及 metadata cache 的 TTL / 命中复用逻辑 | 否 |
-| `integration_tests` | 真实 Fluss 集群集成测试：e2e（真实 SQL 走真实后端） | 是（Docker / podman） |
+| (default) | Unit tests: schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, error mapping, and the metadata cache's TTL / hit-reuse logic | No |
+| `integration_tests` | Integration tests against a real Fluss cluster: e2e (real SQL against the real backend) | Yes (Docker / podman) |
 
-常用命令：
+Common commands:
 
 ```bash
-# 单元测试（快，CI 默认门禁）
+# Unit tests (fast, the default CI gate)
 cargo test -p fluss-datafusion
 
-# 真实集群 e2e（需要可用的容器运行时）
+# Real-cluster e2e (requires a working container runtime)
 cargo test -p fluss-datafusion --features integration_tests -- e2e
 ```
 
-测试只有两层：单元测试（不依赖集群）+ 真实集群集成测试。没有 fake/fixture 镜像层，因此不存在
-「免集群断言」与「真实断言」相互漂移的风险；集成测试直接对真实后端验证完整的 catalog / 执行 /
-pushdown 契约（`setup.rs` 提供共享建表/灌数）。
+There are only two test layers: unit tests (no cluster required) plus
+real-cluster integration tests. There is no fake/fixture mock layer, so there is
+no risk of "cluster-free assertions" and "real assertions" drifting apart from
+each other; the integration tests verify the full catalog / execution / pushdown
+contract directly against the real backend (`setup.rs` provides shared table
+creation and seeding).
 
-## 架构与边界
+## Architecture and boundaries
 
 ```
 +-----------------------------+
-|        SessionContext       |   每个 SQL 会话一个
+|       SessionContext        |   one per SQL session
 +--------------+--------------+
                | register_catalog(...)
                v
 +-----------------------------+
-|        FlussDatafusion       |   共享 installer（Arc，无状态）
-|  - MetadataLoader + Cache    |   跨会话复用元数据
+|       FlussDatafusion       |   shared installer (Arc, stateless)
+|    MetadataLoader + Cache   |   reuses metadata across sessions
 +--------------+--------------+
-               | FlussSource（内部 trait，crate 边界）
+               | FlussSource (internal trait, crate boundary)
                v
 +-----------------------------+
-|       RealFlussSource        |   包裹 Arc<FlussConnection>
+|       RealFlussSource       |   wraps Arc<FlussConnection>
 +--------------+--------------+
+               |
                v
         Fluss client / core
 ```
 
-模块职责：
+Module responsibilities:
 
-- `metadata/`：共享元数据加载与缓存
-- `catalog/`：`CatalogProvider` / `SchemaProvider`
-- `table/`：`TableProvider` 与谓词识别
-- `execution/`：自定义 `ExecutionPlan`（`FlussKvLookupExec` / `FlussLogScanExec`）
-- `types/`：Fluss <-> Arrow 类型桥接
-- `install.rs`：共享 installer / 注册入口
+- `metadata/`: shared metadata loading and caching.
+- `catalog/`: `CatalogProvider` / `SchemaProvider`.
+- `table/`: `TableProvider` and predicate recognition.
+- `execution/`: custom `ExecutionPlan`s (`FlussKvLookupExec` / `FlussLogScanExec`).
+- `types/`: Fluss <-> Arrow type bridging.
+- `install.rs`: shared installer / registration entry point.
 
-这里**不**包含任何服务端代码、协议适配、`pg_catalog`、REST handler、鉴权、会话注册或操作生命周期逻辑。
+This contains **no** server-side code, protocol adapters, `pg_catalog`, REST
+handlers, auth, session registration, or operation-lifecycle logic.
