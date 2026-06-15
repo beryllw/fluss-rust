@@ -21,11 +21,12 @@ forms, so you can query Fluss directly with `ctx.sql(...)`.
 - **Log tables**: bounded scan with `LIMIT`, supporting projection pushdown and
   multi-bucket tables (one bucket per parallel partition, per-bucket last-N with
   a final cross-bucket `LIMIT`; no cross-bucket order guarantee).
-- **Partition pruning** (equality-only): a `partition_col = 'value'` filter on a
-  partitioned log table prunes the scan to the matching partitions; with no
-  partition predicate all partitions are scanned (pruning is optional, never
-  required). Partitioned KV tables are resolved through the existing full-PK
-  lookup, which already targets the single owning partition.
+- **Partition pruning** (equality-only): equality predicates on partition columns
+  of a partitioned log table prune the scan to partitions matching every bound
+  partition-key value that was provided; with no partition predicate all
+  partitions are scanned (pruning is optional, never required). Partitioned KV
+  tables are resolved through the existing full-PK lookup, which already targets
+  the single owning partition.
 - Fluss-schema-to-Arrow-schema and Fluss-row-to-`RecordBatch` conversion.
 - A usage model of a shared installer plus per-session `register_catalog(...)`.
 - Unsupported query forms **fail conservatively** (raise an explicit error)

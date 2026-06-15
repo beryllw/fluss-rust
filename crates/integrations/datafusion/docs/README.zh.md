@@ -16,9 +16,9 @@ Apache Fluss 表的访问。它把 Fluss 的 KV 表与 Log 表暴露成 DataFusi
 - **KV 表**：完整主键等值谓词下推为点查（point lookup），支持单主键与复合主键
 - **Log 表**：带 `LIMIT` 的有界扫描（bounded scan），支持投影下推与多 bucket 表（一个 bucket
   对应一个并行 partition；per-bucket last-N，再施加跨 bucket 的最终 `LIMIT`；不保证跨 bucket 顺序）
-- **分区裁剪（partition pruning，仅等值）**：分区 Log 表上的 `partition_col = 'value'` 谓词会把
-  扫描裁剪到匹配的分区；不带分区谓词时扫描所有分区（裁剪是可选优化，绝非必需）。分区 KV 表通过既有的
-  完整主键点查解析，点查本身已定位到唯一所属分区
+- **分区裁剪（partition pruning，仅等值）**：分区 Log 表上，凡是提供了分区列等值谓词，就会按已提供的
+  分区键绑定值把扫描裁剪到匹配分区；不带分区谓词时扫描所有分区（裁剪是可选优化，绝非必需）。分区 KV
+  表通过既有的完整主键点查解析，点查本身已定位到唯一所属分区
 - Fluss schema 到 Arrow schema、Fluss row 到 `RecordBatch` 的转换
 - 共享 installer + 每会话 `register_catalog(...)` 的使用模型
 - 不支持的查询形态会**保守失败**（明确报错），而不会静默退化成误导性的全表扫描

@@ -322,10 +322,11 @@ Locked-in decisions:
    global cross-bucket last-N coordination.
 6. `ORDER BY` pushdown is out of scope; cross-bucket global row order is not
    guaranteed.
-7. Partition pruning is supported for partitioned log tables, equality-only. A
-   `partition_col = 'value'` filter (full equality on each partition key) prunes
-   the scan to the matching partitions; a partition predicate is never required,
-   so with no partition predicate all partitions are scanned. The scan targets are
+7. Partition pruning is supported for partitioned log tables, equality-only.
+   Equality predicates on partition columns prune the scan to partitions matching
+   every bound partition-key value that was provided; full equality on every
+   partition key is NOT required. A partition predicate is never required, so
+   with no partition predicate all partitions are scanned. The scan targets are
    the cross product of the kept partitions and the buckets, and each target is
    one DataFusion partition (partition x bucket => DataFusion partitions). Pushdown
    is `Inexact`, so DataFusion still layers a `FilterExec` that re-applies the
