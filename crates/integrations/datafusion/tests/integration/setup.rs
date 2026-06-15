@@ -174,6 +174,46 @@ pub async fn create_log_basic(connection: &FlussConnection) -> TableInfo {
     admin.get_table_info(&table_path).await.unwrap()
 }
 
+/// Bucket count for the multi-bucket log table.
+const MULTI_BUCKET_COUNT: i32 = 3;
+
+/// Creates and populates the multi-bucket log table, waits until ALL of its
+/// buckets can serve reads, and returns its `TableInfo`.
+///
+/// Seeds 12 rows across 3 buckets so a bounded scan exercises per-bucket
+/// parallel partitions plus DataFusion's cross-bucket final `LIMIT`.
+pub async fn create_log_multi_bucket(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::LOG_MULTI_BUCKET);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .build()
+                .unwrap(),
+        )
+        // Multiple buckets exercise the per-bucket parallel scan path.
+        .distributed_by(Some(MULTI_BUCKET_COUNT), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_append().unwrap().create_writer().unwrap();
+    writer.append_arrow_batch(multi_bucket_log_batch()).unwrap();
+    writer.flush().await.unwrap();
+
+    // Every bucket is read as its own partition, so all must be ready first.
+    let buckets: Vec<i32> = (0..MULTI_BUCKET_COUNT).collect();
+    wait_for_bucket_offsets(connection, &table_path, &buckets).await;
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
 /// Creates and populates a single-bucket log table under an arbitrary name,
 /// waiting until its bucket can serve reads. Used to create tables on demand
 /// (e.g. AFTER `register_catalog`) so the live-metadata test can prove visibility.
@@ -235,13 +275,51 @@ pub fn log_batch() -> arrow::array::RecordBatch {
         .expect("build log batch")
 }
 
+/// Builds the multi-bucket log table's input batch: 12 rows that spread across
+/// the table's buckets, so a bounded scan must merge several partitions.
+pub fn multi_bucket_log_batch() -> arrow::array::RecordBatch {
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int32, true),
+        Field::new("name", DataType::Utf8, true),
+    ]));
+    let ids: Vec<i32> = (1..=12).collect();
+    let names: Vec<String> = ids.iter().map(|i| format!("r{i}")).collect();
+    let name_refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    arrow::array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from(ids)),
+            Arc::new(StringArray::from(name_refs)),
+        ],
+    )
+    .expect("build multi-bucket log batch")
+}
+
+/// Waits until bucket 0 of `table_path` can serve reads.
 async fn wait_for_offsets(connection: &FlussConnection, table_path: &TablePath) {
+    wait_for_bucket_offsets(connection, table_path, &[0]).await;
+}
+
+/// Waits until every bucket in `buckets` of `table_path` can serve reads.
+///
+/// A multi-bucket bounded scan reads each bucket as its own partition, so all of
+/// them must be ready before the scan runs or a bucket could return zero rows.
+async fn wait_for_bucket_offsets(
+    connection: &FlussConnection,
+    table_path: &TablePath,
+    buckets: &[i32],
+) {
     use fluss::rpc::message::OffsetSpec;
     let admin = connection.get_admin().unwrap();
     let start = std::time::Instant::now();
     loop {
         if admin
-            .list_offsets(table_path, &[0], OffsetSpec::Latest)
+            .list_offsets(table_path, buckets, OffsetSpec::Latest)
             .await
             .is_ok()
         {
@@ -257,7 +335,12 @@ async fn wait_for_offsets(connection: &FlussConnection, table_path: &TablePath) 
 /// Best-effort drop of the Phase 1 tables so reruns start clean.
 pub async fn drop_phase1_tables(connection: &FlussConnection) {
     let admin = connection.get_admin().unwrap();
-    for name in [names::KV_SIMPLE, names::KV_COMPOSITE, names::LOG_BASIC] {
+    for name in [
+        names::KV_SIMPLE,
+        names::KV_COMPOSITE,
+        names::LOG_BASIC,
+        names::LOG_MULTI_BUCKET,
+    ] {
         let _ = admin
             .drop_table(&TablePath::new(names::DATABASE, name), true)
             .await;

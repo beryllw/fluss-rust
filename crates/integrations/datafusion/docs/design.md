@@ -248,8 +248,9 @@ through the `new()` production path against a real cluster.
   `execute()` calls `source.lookup` asynchronously through `single_batch_stream`
   to produce 0/1 rows; it implements `DisplayAs`, so `EXPLAIN` shows
   `FlussKvLookupExec`.
-- `log_scan.rs`: `FlussLogScanExec`, a single-partition leaf whose `execute()`
-  calls `source.log_scan(projection, limit)` asynchronously through
+- `log_scan.rs`: `FlussLogScanExec`, a leaf that reports `num_buckets` partitions;
+  `execute(partition)` scans bucket `partition` via
+  `source.log_scan(bucket, projection, limit)` asynchronously through
   `bounded_batches_stream`; `EXPLAIN` shows `FlussLogScanExec`.
 - `stream.rs`: adapts the lookup / scan output into a DataFusion stream
   (`futures::stream::once` / Vec versions); dropping it is cooperative
@@ -286,8 +287,12 @@ Locked-in decisions:
 3. No offset pseudo-column is exposed and offset predicates are not supported.
 4. The underlying Fluss `LimitBatchScanner` keeps the **last** `limit` rows
    (last-N), not the first-N starting from the earliest offset.
-5. Phase 1 supports only a single-bucket bounded scan; multi-bucket tables fail
-   cleanly with `UnsupportedQueryPattern` to avoid silently dropping rows.
+5. Multi-bucket bounded scan is supported: one bucket maps to one DataFusion
+   partition (`FlussLogScanExec` reports `num_buckets` partitions, read in
+   parallel). Each bucket independently returns its own last-`limit` rows
+   (per-bucket last-N), and DataFusion applies a final cross-bucket `LIMIT` above
+   the scan, so the merged result is capped at exactly `limit` rows. There is no
+   global cross-bucket last-N coordination.
 6. `ORDER BY` pushdown is out of scope; cross-bucket global row order is not
    guaranteed.
 

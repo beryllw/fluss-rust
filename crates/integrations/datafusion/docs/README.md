@@ -18,7 +18,9 @@ forms, so you can query Fluss directly with `ctx.sql(...)`.
 - List databases / tables, and fetch a table's schema and table type.
 - **KV tables**: full-primary-key equality predicate pushed down as a point
   lookup, for both single and composite primary keys.
-- **Log tables**: bounded scan with `LIMIT`, supporting projection pushdown.
+- **Log tables**: bounded scan with `LIMIT`, supporting projection pushdown and
+  multi-bucket tables (one bucket per parallel partition, per-bucket last-N with
+  a final cross-bucket `LIMIT`; no cross-bucket order guarantee).
 - Fluss-schema-to-Arrow-schema and Fluss-row-to-`RecordBatch` conversion.
 - A usage model of a shared installer plus per-session `register_catalog(...)`.
 - Unsupported query forms **fail conservatively** (raise an explicit error)
@@ -83,7 +85,7 @@ visible in the same session immediately.
 | Table type | Supported form | Notes |
 |---|---|---|
 | KV (primary-key table) | `WHERE <full primary key> = <value>` (composite keys use `AND` equality on every column) | Pushed down as a point lookup; a hit returns 1 row, a miss returns 0 rows (no error) |
-| Log table | `... LIMIT n` | Bounded scan; projection pushdown; keeps the **last** `n` rows (matching Fluss `LimitBatchScanner` semantics) |
+| Log table | `... LIMIT n` | Bounded scan; projection pushdown; multi-bucket (one bucket per parallel partition); each bucket keeps its **last** `n` rows (matching Fluss `LimitBatchScanner` semantics), with a final cross-bucket `LIMIT` applied; no cross-bucket order guarantee |
 
 ### Forms that fail conservatively
 

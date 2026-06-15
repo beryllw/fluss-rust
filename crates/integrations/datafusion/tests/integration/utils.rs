@@ -33,6 +33,8 @@ pub mod names {
     pub const KV_COMPOSITE: &str = "df_kv_composite";
     /// Log (append-only) table for bounded scans.
     pub const LOG_BASIC: &str = "df_log_basic";
+    /// Multi-bucket log table proving per-bucket parallel scan + global LIMIT.
+    pub const LOG_MULTI_BUCKET: &str = "df_log_multi_bucket";
     /// Log table created AFTER `register_catalog` to prove live visibility.
     pub const LOG_LIVE: &str = "df_log_live";
     /// Log table created up front, then dropped, to prove drops are reflected live.

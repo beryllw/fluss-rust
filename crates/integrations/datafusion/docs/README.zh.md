@@ -14,7 +14,8 @@ Apache Fluss 表的访问。它把 Fluss 的 KV 表与 Log 表暴露成 DataFusi
 
 - 列举 database / table，获取表的 schema 与表类型
 - **KV 表**：完整主键等值谓词下推为点查（point lookup），支持单主键与复合主键
-- **Log 表**：带 `LIMIT` 的有界扫描（bounded scan），支持投影下推
+- **Log 表**：带 `LIMIT` 的有界扫描（bounded scan），支持投影下推与多 bucket 表（一个 bucket
+  对应一个并行 partition；per-bucket last-N，再施加跨 bucket 的最终 `LIMIT`；不保证跨 bucket 顺序）
 - Fluss schema 到 Arrow schema、Fluss row 到 `RecordBatch` 的转换
 - 共享 installer + 每会话 `register_catalog(...)` 的使用模型
 - 不支持的查询形态会**保守失败**（明确报错），而不会静默退化成误导性的全表扫描
@@ -74,7 +75,7 @@ DDL 在同一会话内即时可见。
 | 表类型 | 受支持的形态 | 说明 |
 |---|---|---|
 | KV（主键表） | `WHERE <完整主键> = <值>`（复合主键用 `AND` 全列等值） | 下推为点查，命中返回 1 行，未命中返回 0 行（不报错） |
-| Log（日志表） | `... LIMIT n` | 有界扫描；投影下推；保留**末尾** `n` 行（与 Fluss `LimitBatchScanner` 语义一致） |
+| Log（日志表） | `... LIMIT n` | 有界扫描；投影下推；多 bucket（一个 bucket 对应一个并行 partition）；每个 bucket 各保留**末尾** `n` 行（与 Fluss `LimitBatchScanner` 语义一致），再施加跨 bucket 的最终 `LIMIT`；不保证跨 bucket 顺序 |
 
 ### 会保守失败的形态
 

@@ -43,6 +43,8 @@ pub(crate) struct FlussLogTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
     schema: SchemaRef,
+    /// Bucket count = number of scan partitions read in parallel.
+    num_buckets: i32,
 }
 
 impl std::fmt::Debug for FlussLogTableProvider {
@@ -54,11 +56,17 @@ impl std::fmt::Debug for FlussLogTableProvider {
 }
 
 impl FlussLogTableProvider {
-    pub(crate) fn new(source: SharedFlussSource, table_ref: TableRef, schema: SchemaRef) -> Self {
+    pub(crate) fn new(
+        source: SharedFlussSource,
+        table_ref: TableRef,
+        schema: SchemaRef,
+        num_buckets: i32,
+    ) -> Self {
         Self {
             source,
             table_ref,
             schema,
+            num_buckets,
         }
     }
 }
@@ -116,11 +124,15 @@ impl TableProvider for FlussLogTableProvider {
             Some(indices) => Arc::new(self.schema.project(indices)?),
         };
 
+        // Per-bucket pushdown of `limit` returns each bucket's last-`limit` rows;
+        // DataFusion still layers a global `LIMIT` above this multi-partition scan,
+        // so the merged result is capped at exactly `limit` rows.
         Ok(Arc::new(FlussLogScanExec::new(
             self.source.clone(),
             self.table_ref.clone(),
             projection,
             limit,
+            self.num_buckets,
             projected_schema,
         )))
     }

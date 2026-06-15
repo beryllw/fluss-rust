@@ -133,14 +133,18 @@ pub trait FlussSource: Send + Sync {
     /// with the table's projected schema when the key is absent.
     async fn lookup(&self, table: &TableRef, key: &LookupKey) -> Result<RecordBatch>;
 
-    /// Performs a bounded log scan.
+    /// Performs a bounded log scan of ONE bucket.
     ///
-    /// `projection` is column indices into the table schema (`None` = all
-    /// columns). `limit` is the required maximum number of rows. Returns the
-    /// batches produced by the bounded scan (possibly several).
+    /// `bucket` is the bucket id to scan (one bucket maps to one DataFusion
+    /// partition). `projection` is column indices into the table schema (`None` =
+    /// all columns). `limit` is the required maximum number of rows. Returns that
+    /// bucket's LAST `limit` rows (Fluss `LimitBatchScanner` keeps the tail), as
+    /// the batches produced by the bounded scan (possibly several). A
+    /// cross-bucket final cap is applied by DataFusion above the per-bucket scans.
     async fn log_scan(
         &self,
         table: &TableRef,
+        bucket: i32,
         projection: Option<&[usize]>,
         limit: usize,
     ) -> Result<Vec<RecordBatch>>;

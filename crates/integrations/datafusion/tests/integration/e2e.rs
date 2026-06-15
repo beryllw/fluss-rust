@@ -60,6 +60,7 @@ async fn end_to_end_sql_through_real_backend() {
     setup::create_kv_simple(&connection).await;
     setup::create_kv_composite(&connection).await;
     setup::create_log_basic(&connection).await;
+    setup::create_log_multi_bucket(&connection).await;
 
     // The production constructor over the real connection: the path under test.
     let fd = FlussDatafusion::new(connection.clone(), options())
@@ -85,6 +86,7 @@ async fn end_to_end_sql_through_real_backend() {
     kv_full_scan_without_filter_fails(&ctx).await;
     kv_in_list_predicate_fails(&ctx).await;
     log_bounded_scan_with_limit_returns_rows(&ctx).await;
+    log_multi_bucket_scan_returns_limited_rows(&ctx).await;
     log_projection_keeps_only_projected_column(&ctx).await;
     log_missing_limit_fails(&ctx).await;
     explain_shows_custom_plans(&ctx).await;
@@ -351,6 +353,49 @@ async fn log_bounded_scan_with_limit_returns_rows(ctx: &SessionContext) {
     assert_eq!(total_rows(&batches), 4, "limit 4 should yield four rows");
     // Fluss's LimitBatchScanner keeps the LAST `limit` rows: ids [1..6] -> [3,4,5,6].
     assert_eq!(collect_i32(&batches, 0), vec![3, 4, 5, 6]);
+}
+
+/// A multi-bucket log table seeds 12 rows across 3 buckets; each bucket returns
+/// its own last-`limit` rows and DataFusion caps the merged result at the global
+/// `LIMIT`. `LIMIT 5` (smaller than the row count, not a multiple of the bucket
+/// count) must yield EXACTLY 5 rows, proving the cross-bucket final limit holds.
+/// Cross-bucket order is not guaranteed, so only the COUNT is asserted.
+async fn log_multi_bucket_scan_returns_limited_rows(ctx: &SessionContext) {
+    let batches = ctx
+        .sql(&format!(
+            "SELECT * FROM {CATALOG}.{}.{} LIMIT 5",
+            names::DATABASE,
+            names::LOG_MULTI_BUCKET
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(
+        total_rows(&batches),
+        5,
+        "LIMIT 5 across buckets must yield exactly five rows (global limit holds)"
+    );
+
+    // The custom multi-bucket scan still surfaces in EXPLAIN.
+    let explained = ctx
+        .sql(&format!(
+            "EXPLAIN SELECT * FROM {CATALOG}.{}.{} LIMIT 5",
+            names::DATABASE,
+            names::LOG_MULTI_BUCKET
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+    let rendered = render_explain(&explained);
+    assert!(
+        rendered.contains("FlussLogScanExec"),
+        "EXPLAIN should show the multi-bucket log-scan plan, got:\n{rendered}"
+    );
 }
 
 async fn log_projection_keeps_only_projected_column(ctx: &SessionContext) {

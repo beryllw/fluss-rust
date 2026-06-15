@@ -17,9 +17,12 @@
 
 //! Custom `ExecutionPlan` for a bounded log scan.
 //!
-//! A single-partition leaf plan that performs exactly one
-//! [`FlussSource::log_scan`] with a required `limit`. The display name
-//! `FlussLogScanExec` makes the bounded scan visible in `EXPLAIN`.
+//! A leaf plan reporting one partition per bucket: `execute(partition)` scans
+//! exactly bucket `partition` via [`FlussSource::log_scan`] with a required
+//! `limit`, so buckets read in parallel. Each partition returns its bucket's
+//! last-`limit` rows; DataFusion applies a final cross-bucket `LIMIT` above this
+//! plan. The display name `FlussLogScanExec` makes the bounded scan visible in
+//! `EXPLAIN`.
 //!
 //! Asymmetry vs the KV path: `log_scan` already returns batches projected to
 //! `projection`, so this plan passes the projection down and must NOT re-project
@@ -46,6 +49,8 @@ pub(crate) struct FlussLogScanExec {
     /// Column indices into the full table schema; `None` means all columns.
     projection: Option<Vec<usize>>,
     limit: usize,
+    /// Number of buckets = number of output partitions (one bucket per partition).
+    num_buckets: i32,
     /// Output (post-projection) schema declared to DataFusion.
     projected_schema: SchemaRef,
     properties: PlanProperties,
@@ -57,11 +62,14 @@ impl FlussLogScanExec {
         table_ref: TableRef,
         projection: Option<Vec<usize>>,
         limit: usize,
+        num_buckets: i32,
         projected_schema: SchemaRef,
     ) -> Self {
+        // One partition per bucket so buckets read in parallel; `execute(partition)`
+        // scans bucket `partition`.
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema.clone()),
-            Partitioning::UnknownPartitioning(1),
+            Partitioning::UnknownPartitioning(num_buckets.max(0) as usize),
             EmissionType::Incremental,
             Boundedness::Bounded,
         );
@@ -70,6 +78,7 @@ impl FlussLogScanExec {
             table_ref,
             projection,
             limit,
+            num_buckets,
             projected_schema,
             properties,
         }
@@ -80,8 +89,8 @@ impl Debug for FlussLogScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FlussLogScanExec(table={}, limit={})",
-            self.table_ref, self.limit
+            "FlussLogScanExec(table={}, limit={}, num_buckets={})",
+            self.table_ref, self.limit, self.num_buckets
         )
     }
 }
@@ -92,8 +101,8 @@ impl DisplayAs for FlussLogScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "FlussLogScanExec: table={}, limit={}",
-                    self.table_ref, self.limit
+                    "FlussLogScanExec: table={}, limit={}, num_buckets={}",
+                    self.table_ref, self.limit, self.num_buckets
                 )
             }
             DisplayFormatType::TreeRender => {
@@ -131,18 +140,20 @@ impl ExecutionPlan for FlussLogScanExec {
 
     fn execute(
         &self,
-        _partition: usize,
+        partition: usize,
         _context: Arc<TaskContext>,
     ) -> DfResult<SendableRecordBatchStream> {
         let source = self.source.clone();
         let table_ref = self.table_ref.clone();
         let projection = self.projection.clone();
         let limit = self.limit;
+        // One partition maps to one bucket; this partition scans exactly that bucket.
+        let bucket = partition as i32;
 
         let future = async move {
             // `log_scan` already projects to `projection`; do NOT re-project.
             let batches = source
-                .log_scan(&table_ref, projection.as_deref(), limit)
+                .log_scan(&table_ref, bucket, projection.as_deref(), limit)
                 .await?;
             Ok(batches)
         };

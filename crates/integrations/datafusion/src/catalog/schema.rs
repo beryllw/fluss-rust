@@ -87,8 +87,13 @@ impl SchemaProvider for FlussSchemaProvider {
             Ok(Some(Arc::new(provider)))
         } else {
             // Log table: a required-`LIMIT` bounded-scan provider (Task 5).
-            let provider =
-                FlussLogTableProvider::new(self.loader.source(), table_ref, entry.arrow_schema);
+            // `num_buckets` drives per-bucket parallel scan partitions (Task A5).
+            let provider = FlussLogTableProvider::new(
+                self.loader.source(),
+                table_ref,
+                entry.arrow_schema,
+                entry.meta.num_buckets,
+            );
             Ok(Some(Arc::new(provider)))
         }
     }
