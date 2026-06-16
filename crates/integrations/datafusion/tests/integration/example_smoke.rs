@@ -44,8 +44,8 @@ async fn package_local_demo_runs_against_real_cluster() {
 
     assert_eq!(summary.kv_name, "Noco");
     assert_eq!(summary.kv_age, 25);
-    assert_eq!(summary.log_ids, vec![2, 3, 4]);
-    assert_eq!(summary.log_actions, vec!["click", "scroll", "close"]);
+    assert_eq!(summary.log_ids, vec![1, 2, 3]);
+    assert_eq!(summary.log_actions, vec!["open", "click", "scroll"]);
     assert!(
         summary.kv_explain.contains("FlussKvLookupExec"),
         "expected KV explain to show FlussKvLookupExec, got:\n{}",

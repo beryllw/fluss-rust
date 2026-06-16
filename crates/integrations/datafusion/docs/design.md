@@ -25,11 +25,14 @@ The design is deliberately narrow:
 ### Currently supported
 
 1. Database and table discovery (list / get schema / table type).
-2. KV (primary-keyed) tables support two read shapes: a full-primary-key equality
-   predicate pushed down as a point lookup, or a bounded `LIMIT` scan when no
-   complete PK equality is present.
-3. Bounded scan for log tables, which must carry a `LIMIT`, with projection
-   pushdown.
+2. KV (primary-keyed) tables support three read shapes in precedence order: a
+   full-primary-key equality predicate pushed down as a point lookup, a bucket-key
+   prefix equality (plus all partition keys when partitioned) pushed down as a
+   prefix lookup, or a bounded `LIMIT` scan when neither equality shape is
+   present.
+3. Log tables support two scan shapes: a head-first first-N scan when a `LIMIT`
+   is present, or a finite earliest->latest snapshot scan when no `LIMIT` is
+   present, both with projection pushdown.
 4. Reuse of the Fluss-to-Arrow schema and row conversion.
 5. DataFusion integration via `CatalogProvider` / `SchemaProvider` /
    `TableProvider` / custom `ExecutionPlan`s.
@@ -44,7 +47,7 @@ implemented):
 - session / user / auth / multi-cluster awareness.
 - SQL DML writes.
 - direct-access REST / gRPC APIs.
-- KV prefix-scan pushdown and batch-lookup optimizations.
+- batch-lookup optimizations.
 - offset pseudo-columns and offset-predicate pushdown.
 - complex filter / join / aggregate / sort pushdown.
 
@@ -177,18 +180,23 @@ through the `new()` production path against a real cluster.
 
 - The `FlussSource` trait (`pub(crate)`) covers only the atomic operations the
   crate actually uses: metadata listing/fetching, KV full-primary-key
-  `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), and the
-  bounded `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`.
-  `bounded_scan` serves BOTH log and KV bounded scans — the fluss client's
-  `LimitBatchScanner` decodes log vs KV batches per table type, so one call backs
-  both. It takes an `Option<i64>` partition id (`None` for a non-partitioned
-  table) so the scanner can target a partition-qualified bucket.
+  `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), KV bounded
+  `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`, and
+  log snapshot `log_scan(partition_id, bucket, projection, row_limit) -> Vec<RecordBatch>`.
+  `bounded_scan` remains the tail-oriented `LimitBatchScanner` path for KV only.
+  `log_scan` is log-specific: it reads earliest->latest, with `Some(n)` meaning
+  first-N and `None` meaning a full finite snapshot to the latest offsets captured
+  at query start. Both take an `Option<i64>` partition id (`None` for a
+  non-partitioned table) so the scanner can target a partition-qualified bucket.
 - `real.rs`: the sole implementation, wrapping `FlussConnection` / `FlussAdmin` /
   lookuper / scanner, reusing Fluss's existing Arrow helpers (such as
   `LookupResult::to_record_batch`) rather than reimplementing Arrow assembly.
   `list_partitions` maps `admin.list_partition_infos` to the crate's
-  `FlussPartition` (partition id + partition-key/value string pairs); `bounded_scan`
-  builds the bucket via `TableBucket::new_with_partition`.
+  `FlussPartition` (partition id + partition-key/value string pairs); both scan
+  methods build the bucket via `TableBucket::new_with_partition`. `log_scan`
+  captures `Earliest` and `Latest` offsets once per target at query start,
+  subscribes a `RecordBatchLogScanner` at the earliest offset, and polls until it
+  either reaches the captured latest offset or satisfies the requested first-N cap.
 - The seam returns the crate's own slim `FlussTableMeta` (schema + primary_keys +
   num_buckets + partition_keys, etc.), decoupling upper layers from
   `fluss::metadata::TableInfo` and carrying only the fields catalog wiring,
@@ -277,19 +285,20 @@ through the `new()` production path against a real cluster.
   re-applies) for a partitioned table and everything else is `Unsupported`. This
   prevents the unsound case where a partial PK equality + `LIMIT` would be marked
   `Exact` and silently dropped.
-- `log.rs`: `FlussLogTableProvider` cleanly returns `LimitRequired` when `limit`
-  is `None`; the projection is pushed down to `FlussSource::bounded_scan`, and a full
-  identity projection from `SELECT *` is normalized to `None`. For a
-  non-partitioned table `supports_filters_pushdown` is always `Unsupported`. For a
-  partitioned table it reports partition-column equality as `Inexact` (so a
-  residual `FilterExec` still re-applies the predicate — pruning is best-effort)
-  and everything else as `Unsupported`. `scan()` computes the scan targets
-  (`Vec<(Option<i64>, i32)>` of partition id + bucket): non-partitioned tables
-  emit one `(None, bucket)` per bucket; partitioned tables list partitions, keep
-  those matching every equality binding (no bindings => keep all), and emit the
-  cross product of kept partitions and buckets. An empty target set (no partition
-  matched, or a partitioned table with zero partitions) yields an `EmptyExec` with
-  the projected schema rather than a 0-partition scan.
+- `log.rs`: `FlussLogTableProvider` no longer requires `LIMIT`. The projection is
+  pushed down to the log source scan, and a full identity projection from
+  `SELECT *` is normalized to `None`. For a non-partitioned table
+  `supports_filters_pushdown` is always `Unsupported`. For a partitioned table it
+  reports partition-column equality as `Inexact` (so a residual `FilterExec`
+  still re-applies the predicate — pruning is best-effort) and everything else as
+  `Unsupported`. `scan()` computes the scan targets (`Vec<(Option<i64>, i32)>` of
+  partition id + bucket): non-partitioned tables emit one `(None, bucket)` per
+  bucket; partitioned tables list partitions, keep those matching every equality
+  binding (no bindings => keep all), and emit the cross product of kept partitions
+  and buckets. An empty target set (no partition matched, or a partitioned table
+  with zero partitions) yields an `EmptyExec` with the projected schema rather
+  than a 0-partition scan. `LIMIT` now means head-first first-N; no `LIMIT` means
+  a finite earliest->latest snapshot.
 
 ### `execution/`
 
@@ -298,16 +307,18 @@ through the `new()` production path against a real cluster.
   to produce 0/1 rows; it implements `DisplayAs`, so `EXPLAIN` shows
   `FlussKvLookupExec`.
 - `log_scan.rs`: `FlussLogScanExec`, a leaf that reports one DataFusion partition
-  per scan target (a `(partition_id, bucket)` pair); `execute(partition)` scans
-  `targets[partition]` via `source.bounded_scan(partition_id, bucket, projection, limit)`
-  asynchronously through `bounded_batches_stream`. The same plan backs both log and
-  KV bounded scans; its `EXPLAIN` label is a `plan_name` field — the log provider
-  passes `FlussLogScanExec`, the KV provider passes `FlussKvScanExec`.
+  per scan target (a `(partition_id, bucket)` pair). In log mode,
+  `execute(partition)` calls `source.log_scan(partition_id, bucket, projection, row_limit)`
+  asynchronously through `bounded_batches_stream`; in KV mode it still calls
+  `source.bounded_scan(...)`. The same plan shape backs both log and KV scans; its
+  `EXPLAIN` label is a `plan_name` field — the log provider passes
+  `FlussLogScanExec`, the KV provider passes `FlussKvScanExec`. Debug/display text
+  now shows `limit=<n>` or `limit=None/full`.
 - `stream.rs`: adapts the lookup / scan output into a DataFusion stream
   (`futures::stream::once` / Vec versions); dropping it is cooperative
   cancellation.
-- An asymmetry: `bounded_scan` is already projected on the `FlussSource` side, so
-  the bounded-scan path does **not** project a second time; the KV point lookup
+- An asymmetry: source-side scans are already projected on the `FlussSource`
+  side, so the scan path does **not** project a second time; the KV point lookup
   returns all columns and is then trimmed by `project_batch` in
   `types/record_batch.rs`.
 
@@ -327,44 +338,55 @@ through the `new()` production path against a real cluster.
 
 ### KV tables
 
-A KV (primary-keyed) table supports two read shapes, in precedence order:
+A KV (primary-keyed) table supports three read shapes, in precedence order:
 
 1. **Point lookup** — a **full-primary-key equality** predicate
    (`pk1 = v1 AND pk2 = v2 ...`, covering every PK column). A hit returns 1 row, a
    miss returns 0 rows (no error).
-2. **Bounded scan** — any other predicate shape combined with a `LIMIT`. This runs
+2. **Prefix lookup** — a **complete bucket-key prefix equality**. For a
+   non-partitioned table this is equality on every bucket key; for a partitioned
+   table it is equality on every partition column plus every bucket key. The
+   bucket key must be a STRICT prefix of the physical primary key (the PK with the
+   partition columns removed), matching the Fluss client's `lookup_by(...)`
+   validation. This shape returns all rows whose primary key starts with that
+   prefix and is shown in `EXPLAIN` as `FlussKvPrefixLookupExec`.
+3. **Bounded scan** — any other predicate shape combined with a `LIMIT`. This runs
    the same bounded-scan machinery as the log table (per-bucket last-`limit` rows,
    with DataFusion applying the final cross-target `LIMIT`), shown in `EXPLAIN` as
    `FlussKvScanExec`. For a partitioned table, partition-column equality prunes the
    scanned partitions (`Inexact`, with a residual `FilterExec`).
 
-A query that is neither a complete PK equality nor carries a `LIMIT` (e.g. a
-partial key, a non-key filter, or a bare `SELECT *`) fails cleanly with
-`UnsupportedQueryPattern` and never silently degrades to an unbounded full scan.
-The prefix-scan pushdown (bucket-key equality without the full PK) remains a
-non-goal for now.
+A query that is neither a complete PK equality, nor a complete bucket-key prefix
+ equality, nor carries a `LIMIT` (e.g. a partial key, a non-key filter, or a bare
+`SELECT *`) fails cleanly with `UnsupportedQueryPattern` and never silently
+ degrades to an unbounded full scan.
 
 Partitioned KV tables need no extra handling for the point lookup: for a
 partitioned PK table the partition columns are part of the primary key, so the
 full-PK equality already binds them. The Fluss `Lookuper` resolves the partition
 id from the lookup key row, so the point-lookup path targets the single owning
-partition automatically.
+partition automatically. For a prefix lookup, the partition columns must be part
+of the `lookup_by(...)` column list and the lookup key row so the client can
+resolve the owning partition before routing the bucket-key prefix request.
 
 ### Log tables
 
 Locked-in decisions:
 
-1. `LIMIT` is mandatory; its absence is `LimitRequired`.
+1. `LIMIT` is optional. With `LIMIT n`, log tables return the first `n` rows from
+   the earliest offset forward (head-first first-N). Without `LIMIT`, they return
+   a finite earliest->latest snapshot.
 2. Projection pushdown is supported.
 3. No offset pseudo-column is exposed and offset predicates are not supported.
-4. The underlying Fluss `LimitBatchScanner` keeps the **last** `limit` rows
-   (last-N), not the first-N starting from the earliest offset.
-5. Multi-bucket bounded scan is supported: one bucket maps to one DataFusion
+4. The source captures the latest offset ONCE at query start for each scan
+   target, subscribes at the earliest offset, and polls until it reaches that
+   finite snapshot boundary.
+5. Multi-bucket snapshot scan is supported: one bucket maps to one DataFusion
    partition (`FlussLogScanExec` reports `num_buckets` partitions, read in
-   parallel). Each bucket independently returns its own last-`limit` rows
-   (per-bucket last-N), and DataFusion applies a final cross-bucket `LIMIT` above
-   the scan, so the merged result is capped at exactly `limit` rows. There is no
-   global cross-bucket last-N coordination.
+   parallel). With `LIMIT`, each target independently applies its own first-N cap,
+   and DataFusion applies a final cross-bucket `LIMIT` above the scan, so the
+   merged result is capped at exactly `limit` rows. There is no global cross-bucket
+   first-N coordination.
 6. `ORDER BY` pushdown is out of scope; cross-bucket global row order is not
    guaranteed.
 7. Partition pruning is supported for partitioned log tables, equality-only.

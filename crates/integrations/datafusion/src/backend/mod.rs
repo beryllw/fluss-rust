@@ -18,9 +18,10 @@
 //! Internal Fluss access seam.
 //!
 //! [`FlussSource`] is the single trait the rest of the crate depends on for all
-//! Fluss access (metadata discovery, KV point lookup, bounded log scan). It is a
-//! `pub(crate)` test seam, deliberately NOT a public gateway-shaped backend
-//! abstraction: it carries no session, protocol, or auth concepts.
+//! Fluss access (metadata discovery, KV point lookup, KV bounded scan, log
+//! snapshot scan). It is a `pub(crate)` test seam, deliberately NOT a public
+//! gateway-shaped backend abstraction: it carries no session, protocol, or auth
+//! concepts.
 //!
 //! One implementation exists:
 //! - [`real::RealFlussSource`] wraps the production fluss client.
@@ -84,6 +85,11 @@ pub struct FlussTableMeta {
     /// The Fluss `Schema` (column types + primary key).
     pub schema: fluss::metadata::Schema,
     pub primary_keys: Vec<String>,
+    /// Bucket-key column names, in bucket-key order. For a primary-keyed table a
+    /// bucket key that is a STRICT prefix of the physical primary key (PK minus
+    /// partition keys) enables the prefix-lookup read shape; when it equals the
+    /// physical primary key only the full point lookup applies.
+    pub bucket_keys: Vec<String>,
     pub num_buckets: i32,
     /// Partition-key column names, in partition-key order. Empty when the table
     /// is not partitioned.
@@ -147,25 +153,36 @@ pub trait FlussSource: Send + Sync {
     /// with the table's projected schema when the key is absent.
     async fn lookup(&self, table: &TableRef, key: &LookupKey) -> Result<RecordBatch>;
 
+    /// Performs a bucket-key PREFIX lookup.
+    ///
+    /// Returns every row whose primary key starts with the given bucket-key
+    /// prefix (possibly many rows, or a 0-row batch with the table schema when no
+    /// row matches). `lookup_columns` names the lookup columns in `lookup_by`
+    /// order (partition keys followed by bucket keys for a partitioned table; just
+    /// the bucket keys otherwise) and `key` carries one [`KeyValue`] per lookup
+    /// column, in that same order.
+    async fn prefix_lookup(
+        &self,
+        table: &TableRef,
+        lookup_columns: &[String],
+        key: &LookupKey,
+    ) -> Result<RecordBatch>;
+
     /// Lists the partitions of a partitioned table. Returns an empty vec for a
     /// non-partitioned table (callers should not call it in that case).
     async fn list_partitions(&self, table: &TableRef) -> Result<Vec<FlussPartition>>;
 
     /// Performs a bounded scan of ONE bucket.
     ///
-    /// Serves both append-only (log) and primary-keyed (KV) tables: the fluss
-    /// client's `LimitBatchScanner` decodes log vs KV batches per table type, so
-    /// the same call backs the log table's bounded scan and the KV table's
-    /// `LIMIT` scan.
+    /// Used by KV tables only. The fluss client's `LimitBatchScanner` returns the
+    /// bucket's LAST `limit` rows (tail semantics).
     ///
     /// `partition_id` selects the partition to scan (`None` for a non-partitioned
     /// table). `bucket` is the bucket id to scan; one `(partition, bucket)` target
     /// maps to one DataFusion partition. `projection` is column indices into the
     /// table schema (`None` = all columns). `limit` is the required maximum number
-    /// of rows. Returns that bucket's LAST `limit` rows (Fluss
-    /// `LimitBatchScanner` keeps the tail), as the batches produced by the bounded
-    /// scan (possibly several). A cross-bucket final cap is applied by DataFusion
-    /// above the per-bucket scans.
+    /// of rows. A cross-bucket final cap is applied by DataFusion above the
+    /// per-bucket scans.
     async fn bounded_scan(
         &self,
         table: &TableRef,
@@ -173,6 +190,22 @@ pub trait FlussSource: Send + Sync {
         bucket: i32,
         projection: Option<&[usize]>,
         limit: usize,
+    ) -> Result<Vec<RecordBatch>>;
+
+    /// Performs a finite earliest-to-latest snapshot scan of ONE log bucket.
+    ///
+    /// `row_limit = Some(n)` returns the first `n` rows observed from the earliest
+    /// offset onward for that target. `row_limit = None` reads a finite snapshot
+    /// from the earliest offset up to the latest offset captured when the scan
+    /// starts. Projection is pushed into the scanner; returned batches are already
+    /// projected and should not be re-projected by callers.
+    async fn log_scan(
+        &self,
+        table: &TableRef,
+        partition_id: Option<i64>,
+        bucket: i32,
+        projection: Option<&[usize]>,
+        row_limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>>;
 }
 

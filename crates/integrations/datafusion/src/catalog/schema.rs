@@ -82,6 +82,7 @@ impl SchemaProvider for FlussSchemaProvider {
                 table_ref,
                 entry.arrow_schema,
                 entry.meta.primary_keys.clone(),
+                entry.meta.bucket_keys.clone(),
                 entry.meta.num_buckets,
                 entry.meta.partition_keys.clone(),
             );

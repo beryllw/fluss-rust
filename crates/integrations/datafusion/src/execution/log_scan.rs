@@ -15,25 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Custom `ExecutionPlan` for a bounded scan (log or KV).
+//! Custom `ExecutionPlan` for a Fluss bucket scan target.
 //!
 //! A leaf plan reporting one DataFusion partition per scan target, where a target
 //! is a `(partition_id, bucket)` pair (`partition_id` is `None` for a
-//! non-partitioned table). `execute(partition)` scans exactly that target via
-//! [`FlussSource::bounded_scan`] with a required `limit`, so targets read in
-//! parallel. For a partitioned table the target set is the cross product of the
-//! partitions kept after pruning and the table's buckets. Each target returns its
-//! bucket's last-`limit` rows; DataFusion applies a final cross-target `LIMIT`
-//! above this plan.
+//! non-partitioned table). `execute(partition)` scans exactly that target, so
+//! targets read in parallel. For a partitioned table the target set is the cross
+//! product of the partitions kept after pruning and the table's buckets.
 //!
-//! The same plan backs both the append-only (log) and primary-keyed (KV) bounded
-//! scans because the fluss client decodes log vs KV batches per table type. The
-//! `plan_name` field parameterizes the `EXPLAIN` label so the log provider shows
-//! `FlussLogScanExec` and the KV provider shows `FlussKvScanExec`.
+//! For log tables, the plan executes a finite earliest-to-latest snapshot scan via
+//! [`FlussSource::log_scan`]: `row_limit = Some(n)` means first-N from the head,
+//! and `row_limit = None` means a full snapshot through the latest offsets
+//! captured at query start. For KV tables, the same plan shape still backs the
+//! existing bounded `LIMIT` scan via [`FlussSource::bounded_scan`].
 //!
-//! Asymmetry vs the KV point-lookup path: `bounded_scan` already returns batches
-//! projected to `projection`, so this plan passes the projection down and must NOT
-//! re-project the returned batches.
+//! The `plan_name` field parameterizes the `EXPLAIN` label so the log provider
+//! shows `FlussLogScanExec` and the KV provider shows `FlussKvScanExec`.
+//!
+//! Asymmetry vs the KV point-lookup path: source-side scans already return
+//! batches projected to `projection`, so this plan passes the projection down and
+//! must NOT re-project the returned batches.
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -55,7 +56,10 @@ pub(crate) struct FlussLogScanExec {
     table_ref: TableRef,
     /// Column indices into the full table schema; `None` means all columns.
     projection: Option<Vec<usize>>,
-    limit: usize,
+    row_limit: Option<usize>,
+    /// Whether this plan should use log snapshot semantics (`true`) or KV bounded
+    /// scan semantics (`false`).
+    log_mode: bool,
     /// Scan targets: one `(partition_id, bucket)` per DataFusion output partition.
     /// `partition_id` is `None` for a non-partitioned table.
     targets: Vec<(Option<i64>, i32)>,
@@ -73,7 +77,8 @@ impl FlussLogScanExec {
         source: SharedFlussSource,
         table_ref: TableRef,
         projection: Option<Vec<usize>>,
-        limit: usize,
+        row_limit: Option<usize>,
+        log_mode: bool,
         targets: Vec<(Option<i64>, i32)>,
         projected_schema: SchemaRef,
         plan_name: &'static str,
@@ -90,7 +95,8 @@ impl FlussLogScanExec {
             source,
             table_ref,
             projection,
-            limit,
+            row_limit,
+            log_mode,
             targets,
             projected_schema,
             plan_name,
@@ -101,12 +107,16 @@ impl FlussLogScanExec {
 
 impl Debug for FlussLogScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let limit = self
+            .row_limit
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "None/full".to_string());
         write!(
             f,
             "{}(table={}, limit={}, partitions={})",
             self.plan_name,
             self.table_ref,
-            self.limit,
+            limit,
             self.targets.len()
         )
     }
@@ -114,6 +124,10 @@ impl Debug for FlussLogScanExec {
 
 impl DisplayAs for FlussLogScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        let limit = self
+            .row_limit
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "None/full".to_string());
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
@@ -121,12 +135,12 @@ impl DisplayAs for FlussLogScanExec {
                     "{}: table={}, limit={}, partitions={}",
                     self.plan_name,
                     self.table_ref,
-                    self.limit,
+                    limit,
                     self.targets.len()
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "{}\ntable={}", self.plan_name, self.table_ref)
+                write!(f, "{}\ntable={}\nlimit={}", self.plan_name, self.table_ref, limit)
             }
         }
     }
@@ -166,15 +180,34 @@ impl ExecutionPlan for FlussLogScanExec {
         let source = self.source.clone();
         let table_ref = self.table_ref.clone();
         let projection = self.projection.clone();
-        let limit = self.limit;
+        let row_limit = self.row_limit;
+        let log_mode = self.log_mode;
         // One DataFusion partition maps to one (partition_id, bucket) target.
         let (partition_id, bucket) = self.targets[partition];
 
         let future = async move {
-            // `bounded_scan` already projects to `projection`; do NOT re-project.
-            let batches = source
-                .bounded_scan(&table_ref, partition_id, bucket, projection.as_deref(), limit)
-                .await?;
+            // Source-side scans already project to `projection`; do NOT re-project.
+            let batches = if log_mode {
+                source
+                    .log_scan(
+                        &table_ref,
+                        partition_id,
+                        bucket,
+                        projection.as_deref(),
+                        row_limit,
+                    )
+                    .await?
+            } else {
+                source
+                    .bounded_scan(
+                        &table_ref,
+                        partition_id,
+                        bucket,
+                        projection.as_deref(),
+                        row_limit.expect("KV bounded scan requires LIMIT"),
+                    )
+                    .await?
+            };
             Ok(batches)
         };
 

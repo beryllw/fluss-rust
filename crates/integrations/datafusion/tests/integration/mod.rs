@@ -22,6 +22,9 @@
 //! - `e2e`: real-cluster end-to-end SQL through the real backend (`integration_tests`).
 //! - `kv_bounded_scan`: real-cluster proof a KV table supports a bounded `LIMIT`
 //!   scan and a full-PK point lookup (`integration_tests`).
+//! - `kv_prefix_lookup`: real-cluster proof a KV table whose bucket key is a
+//!   strict PK prefix supports prefix lookup, while a full-PK equality still uses
+//!   point lookup (`integration_tests`).
 //! - `live_metadata`: real-cluster proof that post-registration DDL is visible
 //!   live in the same session (`integration_tests`).
 //! - `example_smoke`: real-cluster smoke test for the package-local runnable demo
@@ -37,6 +40,9 @@ pub mod e2e;
 
 #[cfg(feature = "integration_tests")]
 pub mod kv_bounded_scan;
+
+#[cfg(feature = "integration_tests")]
+pub mod kv_prefix_lookup;
 
 #[cfg(feature = "integration_tests")]
 pub mod live_metadata;

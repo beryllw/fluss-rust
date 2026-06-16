@@ -406,6 +406,53 @@ pub async fn create_kv_bounded(connection: &FlussConnection) -> TableInfo {
     admin.get_table_info(&table_path).await.unwrap()
 }
 
+/// Creates and populates a KV table whose bucket key is a STRICT prefix of the
+/// PK: `PRIMARY KEY (c1, c2)` with `bucket_keys=["c1"]`. Seeded so one `c1`
+/// value matches several rows, proving the prefix lookup returns multiple rows.
+pub async fn create_kv_prefix(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::KV_PREFIX);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("c1", DataTypes::int())
+                .column("c2", DataTypes::int())
+                .column("name", DataTypes::string())
+                .primary_key(vec!["c1", "c2"])
+                .build()
+                .unwrap(),
+        )
+        .distributed_by(Some(1), vec!["c1".to_string()])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_upsert().unwrap().create_writer().unwrap();
+    let rows = [
+        (10, 1, "a"),
+        (10, 2, "b"),
+        (10, 3, "c"),
+        (20, 1, "d"),
+        (30, 1, "e"),
+    ];
+    for (c1, c2, name) in &rows {
+        let mut row = GenericRow::new(3);
+        row.set_field(0, *c1);
+        row.set_field(1, *c2);
+        row.set_field(2, *name);
+        writer.upsert(&row).unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    wait_for_offsets(connection, &table_path).await;
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
 /// Best-effort drop of a single table under `names::DATABASE`.
 pub async fn drop_table_named(connection: &FlussConnection, table_name: &str) {
     let admin = connection.get_admin().unwrap();
@@ -526,6 +573,7 @@ pub async fn drop_phase1_tables(connection: &FlussConnection) {
         names::LOG_PARTITIONED,
         names::KV_PARTITIONED,
         names::KV_BOUNDED,
+        names::KV_PREFIX,
     ] {
         let _ = admin
             .drop_table(&TablePath::new(names::DATABASE, name), true)

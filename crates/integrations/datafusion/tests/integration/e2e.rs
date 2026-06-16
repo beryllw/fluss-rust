@@ -87,10 +87,10 @@ async fn end_to_end_sql_through_real_backend() {
     kv_partial_composite_key_fails(&ctx).await;
     kv_full_scan_without_filter_fails(&ctx).await;
     kv_in_list_predicate_fails(&ctx).await;
-    log_bounded_scan_with_limit_returns_rows(&ctx).await;
+    log_head_first_limit_returns_rows(&ctx).await;
     log_multi_bucket_scan_returns_limited_rows(&ctx).await;
     log_projection_keeps_only_projected_column(&ctx).await;
-    log_missing_limit_fails(&ctx).await;
+    log_without_limit_returns_full_snapshot(&ctx).await;
     log_partitioned_pruned_scan_returns_only_matching_partition(&ctx).await;
     log_partitioned_scan_without_predicate_reads_all_partitions(&ctx).await;
     kv_partitioned_full_pk_lookup_returns_row(&ctx).await;
@@ -342,10 +342,10 @@ async fn kv_in_list_predicate_fails(ctx: &SessionContext) {
     );
 }
 
-async fn log_bounded_scan_with_limit_returns_rows(ctx: &SessionContext) {
+async fn log_head_first_limit_returns_rows(ctx: &SessionContext) {
     let batches = ctx
         .sql(&format!(
-            "SELECT * FROM {CATALOG}.{}.{} LIMIT 4",
+            "SELECT * FROM {CATALOG}.{}.{} LIMIT 2",
             names::DATABASE,
             names::LOG_BASIC
         ))
@@ -355,16 +355,15 @@ async fn log_bounded_scan_with_limit_returns_rows(ctx: &SessionContext) {
         .await
         .expect("collect");
 
-    assert_eq!(total_rows(&batches), 4, "limit 4 should yield four rows");
-    // Fluss's LimitBatchScanner keeps the LAST `limit` rows: ids [1..6] -> [3,4,5,6].
-    assert_eq!(collect_i32(&batches, 0), vec![3, 4, 5, 6]);
+    assert_eq!(total_rows(&batches), 2, "limit 2 should yield two rows");
+    assert_eq!(collect_i32(&batches, 0), vec![1, 2]);
 }
 
-/// A multi-bucket log table seeds 12 rows across 3 buckets; each bucket returns
-/// its own last-`limit` rows and DataFusion caps the merged result at the global
-/// `LIMIT`. `LIMIT 5` (smaller than the row count, not a multiple of the bucket
-/// count) must yield EXACTLY 5 rows, proving the cross-bucket final limit holds.
-/// Cross-bucket order is not guaranteed, so only the COUNT is asserted.
+/// A multi-bucket log table seeds 12 rows across 3 buckets. The source applies a
+/// per-target first-N cap and DataFusion still caps the merged result at the
+/// global `LIMIT`. `LIMIT 5` (smaller than the row count, not a multiple of the
+/// bucket count) must yield EXACTLY 5 rows. Cross-bucket order is not guaranteed,
+/// so only the COUNT is asserted.
 async fn log_multi_bucket_scan_returns_limited_rows(ctx: &SessionContext) {
     let batches = ctx
         .sql(&format!(
@@ -423,28 +422,30 @@ async fn log_projection_keeps_only_projected_column(ctx: &SessionContext) {
         "projection to id should keep exactly one column"
     );
     assert_eq!(batches[0].schema().field(0).name(), "id");
-    assert_eq!(collect_i32(&batches, 0), vec![3, 4, 5, 6]);
+    assert_eq!(collect_i32(&batches, 0), vec![1, 2, 3, 4]);
 }
 
-async fn log_missing_limit_fails(ctx: &SessionContext) {
-    let err = expect_query_error(
-        ctx,
-        &format!(
+async fn log_without_limit_returns_full_snapshot(ctx: &SessionContext) {
+    let batches = ctx
+        .sql(&format!(
             "SELECT * FROM {CATALOG}.{}.{}",
             names::DATABASE,
             names::LOG_BASIC
-        ),
-    )
-    .await;
-    assert!(
-        err.contains("LIMIT required"),
-        "expected LIMIT-required error, got: {err}"
-    );
+        ))
+        .await
+        .expect("plan")
+        .collect()
+        .await
+        .expect("collect");
+
+    assert_eq!(total_rows(&batches), 6, "full snapshot should return all rows");
+    assert_eq!(collect_i32(&batches, 0), vec![1, 2, 3, 4, 5, 6]);
 }
 
-/// A partition-column equality prunes the bounded scan to the matching partition:
-/// `region = 'US'` returns only the two US rows. The residual `FilterExec` (the
-/// `Inexact` pushdown) keeps correctness even if pruning were imperfect.
+/// A partition-column equality prunes the finite snapshot scan to the matching
+/// partition: `region = 'US'` returns only the two US rows. The residual
+/// `FilterExec` (the `Inexact` pushdown) keeps correctness even if pruning were
+/// imperfect.
 async fn log_partitioned_pruned_scan_returns_only_matching_partition(ctx: &SessionContext) {
     let batches = ctx
         .sql(&format!(

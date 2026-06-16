@@ -45,6 +45,8 @@ pub mod names {
     pub const KV_PARTITIONED: &str = "df_kv_partitioned";
     /// KV table seeded with several rows to prove a bounded `LIMIT` scan.
     pub const KV_BOUNDED: &str = "df_kv_bounded";
+    /// KV table whose bucket key is a strict prefix of the PK, proving prefix lookup.
+    pub const KV_PREFIX: &str = "df_kv_prefix";
 }
 
 /// Shared SQL-path helpers for the real-cluster integration suite.

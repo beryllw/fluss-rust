@@ -17,10 +17,10 @@
 
 //! Log `TableProvider`.
 //!
-//! Surfaces an append-only Fluss table to DataFusion via a bounded scan. Phase 1
-//! requires a `LIMIT`: `scan` fails clearly with `LimitRequired` when none is
-//! present rather than degrading into a full scan. Projection is pushed down to
-//! [`FlussSource::bounded_scan`].
+//! Surfaces an append-only Fluss table to DataFusion via a finite snapshot scan.
+//! `LIMIT` means head-first first-N from the earliest offset, while no `LIMIT`
+//! means a full earliest-to-latest snapshot bounded by the latest offsets
+//! captured when the query starts. Projection is pushed down to the source scan.
 //!
 //! Partition pruning (equality-only): for a partitioned table, a
 //! `partition_col = 'value'` filter is reported as `Inexact` pushdown, partitions
@@ -37,19 +37,18 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::error::Result as DfResult;
 use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
 use crate::backend::{SharedFlussSource, TableRef};
-use crate::error::FlussDatafusionError;
 use crate::execution::log_scan::FlussLogScanExec;
 use crate::table::predicate::{analyze_partition_filters, is_partition_equality};
 use crate::types::record_batch::normalize_projection;
 
-/// An append-only Fluss table backed by a required-`LIMIT` bounded scan.
+/// An append-only Fluss table backed by a finite snapshot scan.
 pub(crate) struct FlussLogTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
@@ -135,16 +134,8 @@ impl TableProvider for FlussLogTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
-        // A bounded scan requires a `LIMIT`; fail clearly rather than full-scan.
-        let limit = limit.ok_or_else(|| {
-            DataFusionError::from(FlussDatafusionError::LimitRequired(format!(
-                "log table {} requires a LIMIT for bounded scan",
-                self.table_ref
-            )))
-        })?;
-
         // A full identity projection (e.g. `SELECT *` may arrive as `Some([0,1,..])`)
-        // is normalized to `None` so the bounded scan reads all columns.
+        // is normalized to `None` so the source scan reads all columns.
         let (projection, projected_schema) = normalize_projection(projection, &self.schema)?;
 
         // Compute the scan targets: one (partition_id, bucket) per DataFusion
@@ -183,14 +174,15 @@ impl TableProvider for FlussLogTableProvider {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        // Per-target pushdown of `limit` returns each bucket's last-`limit` rows;
-        // DataFusion still layers a global `LIMIT` above this multi-partition scan,
-        // so the merged result is capped at exactly `limit` rows.
+        // Each target is a finite source-side snapshot scan. `LIMIT` means first-N
+        // from the earliest offset; no `LIMIT` means read the whole snapshot through
+        // the latest offsets captured at query start.
         Ok(Arc::new(FlussLogScanExec::new(
             self.source.clone(),
             self.table_ref.clone(),
             projection,
             limit,
+            true,
             targets,
             projected_schema,
             "FlussLogScanExec",

@@ -17,11 +17,13 @@
 
 //! Custom DataFusion `ExecutionPlan`s over the [`FlussSource`] seam.
 //!
-//! `lookup` is the KV point-lookup plan; `log_scan` holds `FlussLogScanExec`, the
-//! bounded-scan plan shared by both log and KV `LIMIT` scans (its `EXPLAIN` label
-//! is parameterized per table type); `stream` adapts async futures into a
+//! `lookup` is the KV point-lookup plan; `prefix_lookup` is the KV bucket-key
+//! prefix-lookup plan; `log_scan` holds `FlussLogScanExec`, the bounded-scan plan
+//! shared by both log and KV `LIMIT` scans (its `EXPLAIN` label is parameterized
+//! per table type); `stream` adapts async futures into a
 //! `SendableRecordBatchStream`. All reach Fluss only through the source.
 
 pub(crate) mod log_scan;
 pub(crate) mod lookup;
+pub(crate) mod prefix_lookup;
 pub(crate) mod stream;
