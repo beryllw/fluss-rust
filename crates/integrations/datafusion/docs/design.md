@@ -208,6 +208,24 @@ through the `new()` production path against a real cluster.
   short-lived thread that `block_on`s a global runtime handle, avoiding the
   "cannot block within a runtime" panic. A single lazily-built global runtime
   backs the fallback so no runtime is created per call.
+- Correctness note: this private runtime is **not** a connection-ownership
+  runtime. The upstream `fluss-rs` fix made `FlussConnection` runtime-agnostic by
+  turning the connection into a full actor: socket creation/registration, reads,
+  and writes are all pinned to one dedicated I/O runtime inside `fluss-rs`, and
+  callers interact with it only through runtime-agnostic channels. Therefore the
+  catalog bridge's private runtime is no longer a deadlock risk; it only affects
+  the cost model (one thread hop / `block_on`), not connection correctness.
+- Operational implication: if a host wants Fluss socket I/O to share its own
+  long-lived runtime (for thread budgeting or observability), it should inject
+  that runtime when constructing the underlying `FlussConnection` via
+  `FlussConnection::new_with_io_handle(...)`; `fluss-datafusion` itself does not
+  own or configure the Fluss I/O runtime.
+- Known upstream limitation (recorded, not fixed here): `fluss-rs` currently uses
+  an unbounded outbound mpsc for the connection actor. There is no evidence of
+  problematic accumulation today, but under a stalled socket plus many concurrent
+  callers that queue could grow without bound; treat this as an upstream
+  observability / backpressure follow-up rather than a `fluss-datafusion`
+  correctness issue.
 
 ### `catalog/`
 
@@ -394,8 +412,12 @@ This crate is responsible only for `SQL -> Fluss table access`. On top of it,
 `fluss-gateway` should:
 
 1. create one shared `FlussDatafusion` per cluster/proxy connection;
-2. call `register_catalog(&ctx, "fluss", ...)` when a SQL session builds a new
+2. construct the underlying `FlussConnection` with a **single long-lived I/O
+   runtime** (prefer `FlussConnection::new_with_io_handle(...)` when the gateway
+   wants to supply its own runtime; otherwise `FlussConnection::new(...)` falls
+   back to `fluss-rs`'s process-global default);
+3. call `register_catalog(&ctx, "fluss", ...)` when a SQL session builds a new
    `SessionContext`;
-3. layer gateway-specific SQL environment setup on top of the real Fluss catalog;
-4. keep `pg_catalog`, session variables, auth, and timeout / cancel semantics in
+4. layer gateway-specific SQL environment setup on top of the real Fluss catalog;
+5. keep `pg_catalog`, session variables, auth, and timeout / cancel semantics in
    the gateway, not here.

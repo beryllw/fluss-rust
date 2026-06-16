@@ -39,6 +39,25 @@ pub struct FlussConnection {
 
 impl FlussConnection {
     pub async fn new(arg: Config) -> Result<Self> {
+        Self::new_inner(arg, None).await
+    }
+
+    /// Build a connection whose socket I/O runs on the caller-provided I/O runtime.
+    ///
+    /// The handle MUST point to a single, long-lived runtime — never a per-request
+    /// or transient runtime — because every connection's socket fd is registered
+    /// with that runtime's reactor for its whole lifetime (see
+    /// `RpcClient::with_io_handle`). Hosts (e.g. a gateway) use this to unify
+    /// thread count / observability across their I/O. When you don't need this,
+    /// use `new`, which falls back to the process-global `fluss-io` runtime.
+    pub async fn new_with_io_handle(
+        arg: Config,
+        io_handle: tokio::runtime::Handle,
+    ) -> Result<Self> {
+        Self::new_inner(arg, Some(io_handle)).await
+    }
+
+    async fn new_inner(arg: Config, io_handle: Option<tokio::runtime::Handle>) -> Result<Self> {
         arg.validate_security()
             .map_err(|msg| Error::IllegalArgument { message: msg })?;
         arg.validate_scanner()
@@ -49,18 +68,17 @@ impl FlussConnection {
         let timeout = Duration::from_millis(arg.connect_timeout_ms);
         // connect_timeout_ms: no lower-bound validation to match Java behavior.
         // Java allows 0 — tracked in https://github.com/apache/fluss/issues/3068
-        let connections = if arg.is_sasl_enabled() {
-            Arc::new(
-                RpcClient::new()
-                    .with_sasl(
-                        arg.security_sasl_username.clone(),
-                        arg.security_sasl_password.clone(),
-                    )
-                    .with_timeout(timeout),
-            )
-        } else {
-            Arc::new(RpcClient::new().with_timeout(timeout))
-        };
+        let mut client = RpcClient::new().with_timeout(timeout);
+        if arg.is_sasl_enabled() {
+            client = client.with_sasl(
+                arg.security_sasl_username.clone(),
+                arg.security_sasl_password.clone(),
+            );
+        }
+        if let Some(h) = io_handle {
+            client = client.with_io_handle(h);
+        }
+        let connections = Arc::new(client);
         let metadata = Metadata::new(arg.bootstrap_servers.as_str(), connections.clone()).await?;
 
         Ok(FlussConnection {

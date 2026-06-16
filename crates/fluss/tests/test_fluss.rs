@@ -22,6 +22,7 @@ extern crate fluss;
 mod integration {
     mod admin;
     mod batch_scanner;
+    mod connection_io_handle;
     mod fluss_cluster;
     mod kv_table;
     mod log_table;

@@ -33,21 +33,16 @@ use crate::rpc::message::{
     ResponseHeader, WriteType,
 };
 use crate::rpc::transport::Transport;
-use futures::future::BoxFuture;
-use log::warn;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
-use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::task::Poll;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream, WriteHalf};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::oneshot::{Sender, channel};
-use tokio::task::JoinHandle;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufStream};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot::{self, Sender};
 
 pub type MessengerTransport = ServerConnectionInner<BufStream<Transport>>;
 
@@ -183,6 +178,9 @@ pub struct RpcClient {
     timeout: Option<Duration>,
     max_message_size: usize,
     sasl_config: Option<SaslConfig>,
+    /// Optional injected I/O runtime handle. `None` falls back to the
+    /// process-global `fluss-io` runtime via [`io_runtime_handle`].
+    io_handle: Option<tokio::runtime::Handle>,
 }
 
 impl RpcClient {
@@ -193,6 +191,7 @@ impl RpcClient {
             timeout: None,
             max_message_size: usize::MAX,
             sasl_config: None,
+            io_handle: None,
         }
     }
 
@@ -204,6 +203,29 @@ impl RpcClient {
     pub fn with_sasl(mut self, username: String, password: String) -> Self {
         self.sasl_config = Some(SaslConfig { username, password });
         self
+    }
+
+    /// Inject the runtime that drives every connection's socket I/O.
+    ///
+    /// The handle MUST point to a single, long-lived runtime — never a
+    /// per-request or otherwise transient runtime — because the socket's
+    /// reactor (where its fd is registered) lives on that runtime. If that
+    /// runtime is dropped, the connection's I/O stops and any in-flight or
+    /// subsequent request fails. When not set, connections fall back to the
+    /// process-global `fluss-io` runtime.
+    pub fn with_io_handle(mut self, handle: tokio::runtime::Handle) -> Self {
+        self.io_handle = Some(handle);
+        self
+    }
+
+    /// Resolve the I/O runtime handle used for both establishing the socket and
+    /// running its I/O task: the injected handle if present, otherwise the
+    /// process-global `fluss-io` runtime.
+    ///
+    /// The resolved handle must reference a single, long-lived runtime — the
+    /// socket's reactor lives there for the connection's whole lifetime.
+    fn io_handle(&self) -> tokio::runtime::Handle {
+        self.io_handle.clone().unwrap_or_else(io_runtime_handle)
     }
 
     pub async fn get_connection(
@@ -234,12 +256,24 @@ impl RpcClient {
     }
 
     async fn connect(&self, server_node: &ServerNode) -> Result<ServerConnection, Error> {
+        // Resolve a single I/O runtime handle and use it for BOTH establishing
+        // the socket and running the connection's I/O task. Creating the
+        // `TcpStream` on this handle registers the socket's fd with that
+        // runtime's reactor (instead of the caller's), so the connection's
+        // liveness no longer depends on whichever runtime first called
+        // `connect`.
+        let io_handle = self.io_handle();
+
         let url = server_node.url();
-        let transport = Transport::connect(&url, self.timeout)
+        let timeout = self.timeout;
+        let transport = io_handle
+            .spawn(async move { Transport::connect(&url, timeout).await })
             .await
+            .map_err(|e| ConnectionError(format!("I/O runtime join error: {e}")))?
             .map_err(|error| ConnectionError(error.to_string()))?;
 
-        let messenger = ServerConnectionInner::new(
+        let messenger = ServerConnectionInner::new_on(
+            io_handle,
             BufStream::new(transport),
             self.max_message_size,
             self.client_id.clone(),
@@ -339,9 +373,35 @@ struct Response {
     data: Cursor<Vec<u8>>,
 }
 
-#[derive(Debug)]
-struct ActiveRequest {
-    channel: Sender<Result<Response, RpcError>>,
+/// An outbound request handed to the dedicated I/O task. The task writes
+/// `bytes` to the socket and, on success, parks `resp_tx` keyed by `request_id`
+/// until the matching response is read back.
+struct Outgoing {
+    request_id: i32,
+    bytes: Vec<u8>,
+    resp_tx: Sender<Result<Response, RpcError>>,
+}
+
+/// Process-global dedicated I/O runtime that drives every connection's I/O task.
+///
+/// The connection actor must run on a stable, long-lived runtime that is
+/// independent of whichever runtime constructed the connection or which runtime
+/// later calls [`request`](ServerConnectionInner::request). Spawning the I/O
+/// task on the caller's runtime (e.g. via bare `tokio::spawn`) splits the
+/// socket's read/write halves across runtimes and deadlocks when a connection
+/// is reused across runtimes.
+fn io_runtime_handle() -> tokio::runtime::Handle {
+    static IO_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    IO_RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("fluss-io")
+                .build()
+                .expect("failed to build fluss dedicated I/O runtime")
+        })
+        .handle()
+        .clone()
 }
 
 /// Tracks per-request connection metrics and ensures in-flight gauge cleanup on drop.
@@ -397,91 +457,154 @@ impl Drop for RequestMetricsLifecycle {
     }
 }
 
-#[derive(Debug)]
-enum ConnectionState {
-    /// Currently active requests by request ID.
-    ///
-    /// An active request is one that got prepared or send but the response wasn't received yet.
-    RequestMap(HashMap<i32, ActiveRequest>),
+/// Shared poison cell. `None` while the connection is healthy; set to the
+/// terminal error once the I/O task observes an unrecoverable read/write error.
+///
+/// The request map is now owned task-locally by the I/O task, so the only shared
+/// state between callers and the I/O task is this poison error.
+type PoisonCell = Arc<Mutex<Option<Arc<RpcError>>>>;
 
-    /// One or our streams died and we are unable to process any more requests.
-    Poison(Arc<RpcError>),
+/// Record the terminal error into the shared cell (first writer wins) and return
+/// the effective poison error.
+fn set_poison(cell: &PoisonCell, err: RpcError) -> Arc<RpcError> {
+    let mut guard = cell.lock();
+    if let Some(existing) = guard.as_ref() {
+        return Arc::clone(existing);
+    }
+    let err = Arc::new(err);
+    *guard = Some(Arc::clone(&err));
+    err
 }
 
-impl ConnectionState {
-    fn poison(&mut self, err: RpcError) -> Arc<RpcError> {
-        match self {
-            Self::RequestMap(map) => {
-                let err = Arc::new(err);
-
-                // inform all active requests
-                for (_request_id, active_request) in map.drain() {
-                    // it's OK if the other side is gone
-                    active_request
-                        .channel
-                        .send(Err(RpcError::Poisoned(Arc::clone(&err))))
-                        .ok();
-                }
-                *self = Self::Poison(Arc::clone(&err));
-                err
-            }
-            Self::Poison(e) => {
-                // already poisoned, used existing error
-                Arc::clone(e)
-            }
-        }
-    }
+fn read_poison(cell: &PoisonCell) -> Option<Arc<RpcError>> {
+    cell.lock().as_ref().map(Arc::clone)
 }
 
 #[derive(Debug)]
 pub struct ServerConnectionInner<RW> {
-    /// The half of the stream that we use to send data TO the broker.
-    ///
-    /// This will be used by [`request`](Self::request) to queue up messages.
-    stream_write: Arc<AsyncMutex<WriteHalf<RW>>>,
+    /// Outbound queue feeding the dedicated I/O task. Sending an [`Outgoing`]
+    /// here hands the framed request to the task, which owns both halves of the
+    /// socket and routes the response back via the embedded oneshot.
+    outgoing_tx: mpsc::UnboundedSender<Outgoing>,
 
     client_id: Arc<str>,
 
     request_id: AtomicI32,
 
-    state: Arc<Mutex<ConnectionState>>,
+    /// Shared poison error, set by the I/O task on socket failure.
+    poison: PoisonCell,
 
     /// Negotiated API versions for this connection.
     /// `None` until the ApiVersions handshake completes.
     api_versions: Mutex<Option<ServerApiVersions>>,
 
-    join_handle: JoinHandle<()>,
+    /// Phantom so the type parameter remains meaningful after the socket halves
+    /// moved into the I/O task.
+    _marker: std::marker::PhantomData<RW>,
 }
 
 impl<RW> ServerConnectionInner<RW>
 where
     RW: AsyncRead + AsyncWrite + Send + 'static,
 {
+    /// Construct a connection whose I/O task runs on the process-global
+    /// `fluss-io` runtime. Equivalent to [`new_on`](Self::new_on) with
+    /// [`io_runtime_handle`].
     pub fn new(stream: RW, max_message_size: usize, client_id: Arc<str>) -> Self {
+        Self::new_on(
+            io_runtime_handle(),
+            stream,
+            max_message_size,
+            client_id,
+        )
+    }
+
+    /// Construct a connection whose I/O task is spawned on the given
+    /// `io_handle`.
+    ///
+    /// The handle MUST reference a single, long-lived runtime — never a
+    /// per-request or transient runtime — because the socket's reactor lives on
+    /// that runtime for the connection's entire lifetime. For the seam to be
+    /// fully closed, the socket should also have been *created* on this same
+    /// handle (see `RpcClient::connect`), so that both halves of the socket and
+    /// its I/O task share one reactor.
+    pub fn new_on(
+        io_handle: tokio::runtime::Handle,
+        stream: RW,
+        max_message_size: usize,
+        client_id: Arc<str>,
+    ) -> Self {
         let (stream_read, stream_write) = tokio::io::split(stream);
-        let state = Arc::new(Mutex::new(ConnectionState::RequestMap(HashMap::default())));
-        let state_captured = Arc::clone(&state);
+        let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Outgoing>();
+        let poison: PoisonCell = Arc::new(Mutex::new(None));
+        let poison_captured = Arc::clone(&poison);
 
-        let join_handle = tokio::spawn(async move {
+        let io_task = async move {
             let mut stream_read = stream_read;
-            loop {
-                match stream_read.read_message(max_message_size).await {
-                    Ok(msg) => {
-                        // message was read, so all subsequent errors should not poison the whole stream
-                        let mut cursor = Cursor::new(msg);
-                        let header = match ResponseHeader::read(&mut cursor) {
-                            Ok(header) => header,
-                            Err(err) => {
-                                log::warn!("Cannot read message header, ignoring message: {err:?}");
-                                continue;
-                            }
-                        };
+            let mut stream_write = stream_write;
+            let mut outgoing_rx = outgoing_rx;
+            // In-flight requests awaiting a response, keyed by request id.
+            // Task-local: only this task touches it, so no lock is needed.
+            let mut in_flight: HashMap<i32, Sender<Result<Response, RpcError>>> = HashMap::new();
 
-                        let active_request = match state_captured.lock().deref_mut() {
-                            ConnectionState::RequestMap(map) => {
-                                match map.remove(&header.request_id) {
-                                    Some(active_request) => active_request,
-                                    _ => {
+            loop {
+                tokio::select! {
+                    outgoing = outgoing_rx.recv() => {
+                        match outgoing {
+                            Some(Outgoing { request_id, bytes, resp_tx }) => {
+                                let write_result: Result<(), RpcError> = async {
+                                    stream_write.write_message(&bytes).await?;
+                                    stream_write.flush().await?;
+                                    Ok(())
+                                }
+                                .await;
+                                match write_result {
+                                    Ok(()) => {
+                                        in_flight.insert(request_id, resp_tx);
+                                    }
+                                    Err(e) => {
+                                        // Framing may be out-of-sync; poison and fail everyone.
+                                        let err = set_poison(&poison_captured, e);
+                                        resp_tx
+                                            .send(Err(RpcError::Poisoned(Arc::clone(&err))))
+                                            .ok();
+                                        for (_id, tx) in in_flight.drain() {
+                                            tx.send(Err(RpcError::Poisoned(Arc::clone(&err)))).ok();
+                                        }
+                                        return;
+                                    }
+                                }
+                            }
+                            None => {
+                                // All senders dropped: connection is being torn down.
+                                return;
+                            }
+                        }
+                    }
+                    read = stream_read.read_message(max_message_size) => {
+                        match read {
+                            Ok(msg) => {
+                                // Message was read, so a malformed header should not
+                                // poison the whole stream (matches prior behaviour).
+                                let mut cursor = Cursor::new(msg);
+                                let header = match ResponseHeader::read(&mut cursor) {
+                                    Ok(header) => header,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "Cannot read message header, ignoring message: {err:?}"
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                match in_flight.remove(&header.request_id) {
+                                    Some(resp_tx) => {
+                                        // We don't care if the caller is gone (cancelled).
+                                        resp_tx
+                                            .send(Ok(Response { header, data: cursor }))
+                                            .ok();
+                                    }
+                                    None => {
                                         log::warn!(
                                             request_id:% = header.request_id;
                                             "Got response for unknown request",
@@ -490,36 +613,35 @@ where
                                     }
                                 }
                             }
-                            ConnectionState::Poison(_) => {
-                                // stream is poisoned, no need to anything
+                            Err(e) => {
+                                let err =
+                                    set_poison(&poison_captured, RpcError::ReadMessageError(e));
+                                for (_id, tx) in in_flight.drain() {
+                                    tx.send(Err(RpcError::Poisoned(Arc::clone(&err)))).ok();
+                                }
                                 return;
                             }
-                        };
-
-                        // we don't care if the other side is gone
-                        active_request
-                            .channel
-                            .send(Ok(Response {
-                                header,
-                                data: cursor,
-                            }))
-                            .ok();
-                    }
-                    Err(e) => {
-                        state_captured.lock().poison(RpcError::ReadMessageError(e));
-                        return;
+                        }
                     }
                 }
             }
-        });
+        };
+
+        // Spawn on the provided long-lived I/O handle — NOT the caller's
+        // runtime. This is the same handle that created the socket, so both
+        // socket halves and their I/O task share one reactor. It decouples the
+        // connection's socket I/O from whichever runtime constructed it or
+        // later calls `request`, and means `new` no longer requires an ambient
+        // tokio runtime.
+        io_handle.spawn(io_task);
 
         Self {
-            stream_write: Arc::new(AsyncMutex::new(stream_write)),
+            outgoing_tx,
             client_id,
             request_id: AtomicI32::new(0),
-            state,
+            poison,
             api_versions: Mutex::new(None),
-            join_handle,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -529,8 +651,7 @@ where
     }
 
     fn is_poisoned(&self) -> bool {
-        let guard = self.state.lock();
-        matches!(*guard, ConnectionState::Poison(_))
+        self.poison.lock().is_some()
     }
 
     pub async fn request<R>(&self, msg: R) -> Result<R::ResponseBody, Error>
@@ -555,36 +676,51 @@ where
         // write message body
         msg.write(&mut buf).map_err(RpcError::WriteMessageError)?;
 
-        let (tx, rx) = channel();
-
-        // to prevent stale data in inner state, ensure that we would remove the request again if we are cancelled while
-        // sending the request
-        let _cleanup_on_cancel =
-            CleanupRequestStateOnCancel::new(Arc::clone(&self.state), request_id);
-
-        match self.state.lock().deref_mut() {
-            ConnectionState::RequestMap(map) => {
-                map.insert(request_id, ActiveRequest { channel: tx });
-            }
-            ConnectionState::Poison(e) => return Err(RpcError::Poisoned(Arc::clone(e)).into()),
-        }
-
         // count only the API message body, excluding the protocol header.
         let request_body_bytes = buf.len().saturating_sub(REQUEST_HEADER_LENGTH) as u64;
         let mut request_metrics = RequestMetricsLifecycle::begin(R::API_KEY, request_body_bytes);
 
-        self.send_message(buf)
-            .await
-            .inspect_err(|_| request_metrics.complete(0))?;
-        _cleanup_on_cancel.message_sent();
-        let mut response = rx
-            .await
-            .map_err(|e| Error::UnexpectedError {
-                message: "Receive error: response channel closed".to_string(),
-                source: Some(Box::new(e)),
+        // Fail fast if the connection is already poisoned. A failed request
+        // still counts as a completion with zero received bytes.
+        if let Some(err) = read_poison(&self.poison) {
+            request_metrics.complete(0);
+            return Err(RpcError::Poisoned(err).into());
+        }
+
+        let (resp_tx, resp_rx) = oneshot::channel();
+
+        // Hand the framed request to the I/O task. A send error means the task
+        // is gone (poisoned or shut down).
+        if self
+            .outgoing_tx
+            .send(Outgoing {
+                request_id,
+                bytes: buf,
+                resp_tx,
             })
-            .and_then(|r| r.map_err(Error::from))
-            .inspect_err(|_| request_metrics.complete(0))?;
+            .is_err()
+        {
+            request_metrics.complete(0);
+            let err = read_poison(&self.poison)
+                .map(RpcError::Poisoned)
+                .unwrap_or_else(|| ConnectionError("connection I/O task has stopped".to_string()));
+            return Err(err.into());
+        }
+
+        // Await the response. A recv error means the I/O task dropped the
+        // sender (poisoned or closed) without replying.
+        let mut response = match resp_rx.await {
+            Ok(inner) => inner.map_err(Error::from),
+            Err(_recv_err) => {
+                let err = read_poison(&self.poison)
+                    .map(RpcError::Poisoned)
+                    .unwrap_or_else(|| {
+                        ConnectionError("connection closed before response".to_string())
+                    });
+                Err(err.into())
+            }
+        }
+        .inspect_err(|_| request_metrics.complete(0))?;
 
         // count only the API message body, excluding the response header.
         let response_bytes =
@@ -611,151 +747,6 @@ where
             .into());
         }
         Ok(body)
-    }
-
-    async fn send_message(&self, msg: Vec<u8>) -> Result<(), RpcError> {
-        match self.send_message_inner(msg).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // need to poison the stream because message framing might be out-of-sync
-                let mut state = self.state.lock();
-                Err(RpcError::Poisoned(state.poison(e)))
-            }
-        }
-    }
-
-    async fn send_message_inner(&self, msg: Vec<u8>) -> Result<(), RpcError> {
-        let mut stream_write = Arc::clone(&self.stream_write).lock_owned().await;
-
-        // use a wrapper so that cancellation doesn't cancel the send operation and leaves half-send messages on the wire
-        let fut = CancellationSafeFuture::new(async move {
-            stream_write.write_message(&msg).await?;
-            stream_write.flush().await?;
-            Ok(())
-        });
-
-        fut.await
-    }
-}
-
-impl<RW> Drop for ServerConnectionInner<RW> {
-    fn drop(&mut self) {
-        // todo: should remove from server_connections map?
-        self.join_handle.abort();
-    }
-}
-
-struct CancellationSafeFuture<F>
-where
-    F: Future + Send + 'static,
-{
-    /// Mark if the inner future finished. If not, we must spawn a helper task on drop.
-    done: bool,
-
-    /// Inner future.
-    ///
-    /// Wrapped in an `Option` so we can extract it during drop. Inside that option however we also need a pinned
-    /// box because once this wrapper is polled, it will be pinned in memory -- even during drop. Now the inner
-    /// future does not necessarily implement `Unpin`, so we need a heap allocation to pin it in memory even when we
-    /// move it out of this option.
-    inner: Option<BoxFuture<'static, F::Output>>,
-}
-
-impl<F> CancellationSafeFuture<F>
-where
-    F: Future + Send,
-{
-    fn new(fut: F) -> Self {
-        Self {
-            done: false,
-            inner: Some(Box::pin(fut)),
-        }
-    }
-}
-
-impl<F> Future for CancellationSafeFuture<F>
-where
-    F: Future + Send,
-{
-    type Output = F::Output;
-
-    fn poll(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
-        let inner = self
-            .inner
-            .as_mut()
-            .expect("CancellationSafeFuture polled after completion");
-
-        match inner.as_mut().poll(cx) {
-            Poll::Ready(res) => {
-                self.done = true;
-                self.inner = None; // Prevent re-polling
-                Poll::Ready(res)
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl<F> Drop for CancellationSafeFuture<F>
-where
-    F: Future + Send + 'static,
-{
-    fn drop(&mut self) {
-        // If the future hasn't finished yet, we must ensure it completes in the background.
-        // This prevents leaving half-sent messages on the wire if the caller cancels the request.
-        if let Some(fut) = self.inner.take() {
-            // Attempt to get a handle to the current Tokio runtime.
-            // This avoids a panic if the runtime has already shut down.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = fut.await;
-                });
-            } else {
-                // Fallback: If no runtime is active, we cannot spawn.
-                // At this point, the future 'fut' will be dropped.
-                // Since the runtime is likely shutting down anyway,
-                // the underlying connection is probably being closed.
-                warn!("Tokio runtime not found during drop; background task cancelled.");
-            }
-        }
-    }
-}
-
-/// Helper that ensures that a request is removed when a request is cancelled before it was actually sent out.
-struct CleanupRequestStateOnCancel {
-    state: Arc<Mutex<ConnectionState>>,
-    request_id: i32,
-    message_sent: bool,
-}
-
-impl CleanupRequestStateOnCancel {
-    /// Create new helper.
-    ///
-    /// You must call [`message_sent`](Self::message_sent) when the request was sent.
-    fn new(state: Arc<Mutex<ConnectionState>>, request_id: i32) -> Self {
-        Self {
-            state,
-            request_id,
-            message_sent: false,
-        }
-    }
-
-    /// Request was sent. Do NOT clean the state any longer.
-    fn message_sent(mut self) {
-        self.message_sent = true;
-    }
-}
-
-impl Drop for CleanupRequestStateOnCancel {
-    fn drop(&mut self) {
-        if !self.message_sent {
-            if let ConnectionState::RequestMap(map) = self.state.lock().deref_mut() {
-                map.remove(&self.request_id);
-            }
-        }
     }
 }
 
@@ -1169,6 +1160,208 @@ mod tests {
         assert_eq!(
             inflight_after, 0.0,
             "in-flight gauge must return to zero after API error"
+        );
+    }
+
+    /// Proves the connection's socket I/O is fully decoupled from the caller's
+    /// runtime: the connection is constructed with NO ambient runtime (plain
+    /// `#[test]`), and `request` is later driven from a freshly-created runtime.
+    /// The I/O task itself runs on the dedicated `fluss-io` runtime, so the read
+    /// and write halves are never split across the caller's runtime. Under the
+    /// old bare-`tokio::spawn` design this would have panicked (no runtime in
+    /// `new`) or deadlocked (I/O bound to a different runtime than the caller).
+    #[test]
+    fn connection_io_runs_on_dedicated_runtime_independent_of_caller() {
+        // Serialize against the other metrics tests, which share a global
+        // recorder: this test also drives a `produce_log` request.
+        let _test_guard = test_lock().blocking_lock();
+
+        // Run the echo server on the dedicated I/O runtime handle so the mock
+        // peer is also independent of the caller's runtime.
+        let (client, server) = tokio::io::duplex(4096);
+        io_runtime_handle().spawn(mock_echo_server(server));
+
+        // Construct the connection with no ambient tokio runtime present.
+        let conn = ServerConnectionInner::new(BufStream::new(client), usize::MAX, Arc::from("t"));
+        *conn.api_versions.lock() = Some(ServerApiVersions::new(&[PbApiVersion {
+            api_key: 1014,
+            min_version: 0,
+            max_version: 0,
+        }]));
+        let conn = Arc::new(conn);
+
+        // Drive `request` from a brand-new runtime, on a separate thread, with a
+        // hard timeout so a regression deadlocks the test instead of hanging it.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build caller runtime");
+            let result = rt.block_on(conn.request(TestProduceRequest));
+            done_tx.send(result.is_ok()).ok();
+        });
+
+        let ok = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request must complete without deadlocking across runtimes");
+        worker.join().expect("worker thread panicked");
+        assert!(ok, "request driven from a foreign runtime should succeed");
+    }
+
+    /// Injection works and is caller-runtime-agnostic: a connection built via
+    /// `new_on` with an explicit "host" runtime handle is driven successfully
+    /// from a completely unrelated `new_current_thread` runtime on another
+    /// thread. The socket I/O lives on the injected `host` runtime regardless of
+    /// where `request` is called.
+    #[test]
+    fn injected_io_handle_is_caller_runtime_agnostic() {
+        let _test_guard = test_lock().blocking_lock();
+
+        // A long-lived "host" runtime that will own the connection's I/O.
+        let host = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("host-injected-io")
+            .build()
+            .expect("build host runtime");
+
+        let (client, server) = tokio::io::duplex(4096);
+        // Run the echo server on the host handle too, so the peer is also
+        // independent of the caller's runtime.
+        host.handle().spawn(mock_echo_server(server));
+
+        let conn = ServerConnectionInner::new_on(
+            host.handle().clone(),
+            BufStream::new(client),
+            usize::MAX,
+            Arc::from("t"),
+        );
+        *conn.api_versions.lock() = Some(ServerApiVersions::new(&[PbApiVersion {
+            api_key: 1014,
+            min_version: 0,
+            max_version: 0,
+        }]));
+        let conn = Arc::new(conn);
+
+        // Drive `request` from a brand-new, unrelated runtime on a separate
+        // thread, with a hard timeout so a regression fails instead of hanging.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build caller runtime");
+            let result = rt.block_on(conn.request(TestProduceRequest));
+            done_tx.send(result.is_ok()).ok();
+        });
+
+        let ok = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("request via injected handle must complete without deadlocking");
+        worker.join().expect("worker thread panicked");
+        assert!(ok, "request driven from a foreign runtime should succeed");
+    }
+
+    /// The injected runtime is the one actually doing the I/O (distinct from the
+    /// global `fluss-io`): after a first successful request through the injected
+    /// `host` runtime, the host runtime is shut down. A subsequent `request`
+    /// can then no longer complete — proving the connection's I/O genuinely
+    /// lived on the injected runtime, not on the process-global default.
+    ///
+    /// Distinguishing strategy: deterministic runtime shutdown (rather than a
+    /// thread-name hook). If the I/O task had been spawned on the global
+    /// `fluss-io` runtime, shutting down `host` would not affect it and the
+    /// second request would still succeed; the assertion that it fails/times
+    /// out is therefore a precise witness that the injected handle is load-
+    /// bearing.
+    #[test]
+    fn injected_io_handle_is_the_one_doing_io() {
+        let _test_guard = test_lock().blocking_lock();
+
+        let host = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("host-injected-io")
+            .build()
+            .expect("build host runtime");
+
+        let (client, server) = tokio::io::duplex(4096);
+        host.handle().spawn(mock_echo_server(server));
+
+        let conn = ServerConnectionInner::new_on(
+            host.handle().clone(),
+            BufStream::new(client),
+            usize::MAX,
+            Arc::from("t"),
+        );
+        *conn.api_versions.lock() = Some(ServerApiVersions::new(&[PbApiVersion {
+            api_key: 1014,
+            min_version: 0,
+            max_version: 0,
+        }]));
+        let conn = Arc::new(conn);
+
+        // Helper: drive one request from a fresh, unrelated runtime on its own
+        // thread with a hard timeout. Returns Some(is_ok) or None on timeout.
+        //
+        // The worker is joined before returning so that any global-metrics
+        // mutation performed by `RequestMetricsLifecycle::complete()` finishes
+        // while `test_lock` is still held by the caller. Without the join the
+        // worker could outlive `drive_request` and race the other serialized
+        // metrics tests on the global `produce_log` counters. After a request
+        // resolves (Ok or Err) the worker's `block_on` returns promptly, so the
+        // join does not block — including the post-shutdown case, where the
+        // request errors out rather than hanging because the injected runtime's
+        // I/O task is gone. A bounded join still guards against an unexpected
+        // hang turning a flake into a deadlock.
+        fn drive_request<RW>(conn: Arc<ServerConnectionInner<RW>>) -> Option<bool>
+        where
+            RW: AsyncRead + AsyncWrite + Send + Sync + 'static,
+        {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build caller runtime");
+                let result = rt.block_on(conn.request(TestProduceRequest));
+                // Send the outcome only after `block_on` has fully returned, so
+                // the metrics lifecycle for this request has already completed.
+                tx.send(result.is_ok()).ok();
+            });
+            let outcome = rx.recv_timeout(Duration::from_secs(2)).ok();
+            // Join the worker so no thread can still be touching the global
+            // metrics recorder after this helper returns and `test_lock` is
+            // released. The send happens-before the worker's last metric write
+            // completes within `block_on`, and the channel send is the worker's
+            // final action, so the join returns immediately once `outcome` is
+            // observed; on the timeout path the worker has nonetheless finished
+            // its request (error, not hang) and is joinable.
+            worker.join().expect("drive_request worker thread panicked");
+            outcome
+        }
+
+        // First request succeeds while the host runtime is alive.
+        let first = drive_request(Arc::clone(&conn));
+        assert_eq!(
+            first,
+            Some(true),
+            "first request via injected runtime should succeed"
+        );
+
+        // Shut the injected runtime down: the I/O task lived there, so it stops.
+        host.shutdown_background();
+
+        // A subsequent request can no longer complete: it either errors (the
+        // I/O task is gone / channel closed) or times out. Either outcome proves
+        // the I/O was bound to the injected runtime, not the global default.
+        let second = drive_request(Arc::clone(&conn));
+        assert!(
+            !matches!(second, Some(true)),
+            "after shutting down the injected runtime, the request must not \
+             succeed (got {second:?}); this proves I/O lived on the injected \
+             runtime, not the global fluss-io"
         );
     }
 
