@@ -60,7 +60,7 @@ impl RealFlussSource {
 /// Narrows a scan `limit` to the `i32` the fluss scanner API expects.
 fn limit_to_i32(limit: usize) -> Result<i32> {
     i32::try_from(limit).map_err(|_| {
-        FlussDatafusionError::Internal(format!("log scan limit {limit} exceeds i32 range"))
+        FlussDatafusionError::Internal(format!("bounded scan limit {limit} exceeds i32 range"))
     })
 }
 
@@ -143,7 +143,7 @@ impl FlussSource for RealFlussSource {
             .collect())
     }
 
-    async fn log_scan(
+    async fn bounded_scan(
         &self,
         table: &TableRef,
         partition_id: Option<i64>,

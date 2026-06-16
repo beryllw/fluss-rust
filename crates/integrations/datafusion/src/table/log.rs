@@ -20,7 +20,7 @@
 //! Surfaces an append-only Fluss table to DataFusion via a bounded scan. Phase 1
 //! requires a `LIMIT`: `scan` fails clearly with `LimitRequired` when none is
 //! present rather than degrading into a full scan. Projection is pushed down to
-//! [`FlussSource::log_scan`].
+//! [`FlussSource::bounded_scan`].
 //!
 //! Partition pruning (equality-only): for a partitioned table, a
 //! `partition_col = 'value'` filter is reported as `Inexact` pushdown, partitions
@@ -193,6 +193,7 @@ impl TableProvider for FlussLogTableProvider {
             limit,
             targets,
             projected_schema,
+            "FlussLogScanExec",
         )))
     }
 }

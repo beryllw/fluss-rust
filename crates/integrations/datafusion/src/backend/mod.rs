@@ -151,7 +151,12 @@ pub trait FlussSource: Send + Sync {
     /// non-partitioned table (callers should not call it in that case).
     async fn list_partitions(&self, table: &TableRef) -> Result<Vec<FlussPartition>>;
 
-    /// Performs a bounded log scan of ONE bucket.
+    /// Performs a bounded scan of ONE bucket.
+    ///
+    /// Serves both append-only (log) and primary-keyed (KV) tables: the fluss
+    /// client's `LimitBatchScanner` decodes log vs KV batches per table type, so
+    /// the same call backs the log table's bounded scan and the KV table's
+    /// `LIMIT` scan.
     ///
     /// `partition_id` selects the partition to scan (`None` for a non-partitioned
     /// table). `bucket` is the bucket id to scan; one `(partition, bucket)` target
@@ -161,7 +166,7 @@ pub trait FlussSource: Send + Sync {
     /// `LimitBatchScanner` keeps the tail), as the batches produced by the bounded
     /// scan (possibly several). A cross-bucket final cap is applied by DataFusion
     /// above the per-bucket scans.
-    async fn log_scan(
+    async fn bounded_scan(
         &self,
         table: &TableRef,
         partition_id: Option<i64>,

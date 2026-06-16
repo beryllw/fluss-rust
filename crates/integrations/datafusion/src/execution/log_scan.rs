@@ -15,21 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Custom `ExecutionPlan` for a bounded log scan.
+//! Custom `ExecutionPlan` for a bounded scan (log or KV).
 //!
 //! A leaf plan reporting one DataFusion partition per scan target, where a target
 //! is a `(partition_id, bucket)` pair (`partition_id` is `None` for a
 //! non-partitioned table). `execute(partition)` scans exactly that target via
-//! [`FlussSource::log_scan`] with a required `limit`, so targets read in parallel.
-//! For a partitioned table the target set is the cross product of the partitions
-//! kept after pruning and the table's buckets. Each target returns its bucket's
-//! last-`limit` rows; DataFusion applies a final cross-target `LIMIT` above this
-//! plan. The display name `FlussLogScanExec` makes the bounded scan visible in
-//! `EXPLAIN`.
+//! [`FlussSource::bounded_scan`] with a required `limit`, so targets read in
+//! parallel. For a partitioned table the target set is the cross product of the
+//! partitions kept after pruning and the table's buckets. Each target returns its
+//! bucket's last-`limit` rows; DataFusion applies a final cross-target `LIMIT`
+//! above this plan.
 //!
-//! Asymmetry vs the KV path: `log_scan` already returns batches projected to
-//! `projection`, so this plan passes the projection down and must NOT re-project
-//! the returned batches.
+//! The same plan backs both the append-only (log) and primary-keyed (KV) bounded
+//! scans because the fluss client decodes log vs KV batches per table type. The
+//! `plan_name` field parameterizes the `EXPLAIN` label so the log provider shows
+//! `FlussLogScanExec` and the KV provider shows `FlussKvScanExec`.
+//!
+//! Asymmetry vs the KV point-lookup path: `bounded_scan` already returns batches
+//! projected to `projection`, so this plan passes the projection down and must NOT
+//! re-project the returned batches.
 
 use std::any::Any;
 use std::fmt::{Debug, Formatter};
@@ -45,7 +49,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Pla
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::execution::stream::bounded_batches_stream;
 
-/// Physical plan executing one bounded log scan against [`FlussSource`].
+/// Physical plan executing one bounded scan (log or KV) against [`FlussSource`].
 pub(crate) struct FlussLogScanExec {
     source: SharedFlussSource,
     table_ref: TableRef,
@@ -57,6 +61,10 @@ pub(crate) struct FlussLogScanExec {
     targets: Vec<(Option<i64>, i32)>,
     /// Output (post-projection) schema declared to DataFusion.
     projected_schema: SchemaRef,
+    /// `EXPLAIN`/`name()` label: `"FlussLogScanExec"` for log tables,
+    /// `"FlussKvScanExec"` for KV tables. Lets one plan serve both without
+    /// changing the log table's existing `EXPLAIN` output.
+    plan_name: &'static str,
     properties: PlanProperties,
 }
 
@@ -68,6 +76,7 @@ impl FlussLogScanExec {
         limit: usize,
         targets: Vec<(Option<i64>, i32)>,
         projected_schema: SchemaRef,
+        plan_name: &'static str,
     ) -> Self {
         // One DataFusion partition per target so targets read in parallel;
         // `execute(partition)` scans `targets[partition]`.
@@ -84,6 +93,7 @@ impl FlussLogScanExec {
             limit,
             targets,
             projected_schema,
+            plan_name,
             properties,
         }
     }
@@ -93,7 +103,8 @@ impl Debug for FlussLogScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "FlussLogScanExec(table={}, limit={}, partitions={})",
+            "{}(table={}, limit={}, partitions={})",
+            self.plan_name,
             self.table_ref,
             self.limit,
             self.targets.len()
@@ -107,14 +118,15 @@ impl DisplayAs for FlussLogScanExec {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
-                    "FlussLogScanExec: table={}, limit={}, partitions={}",
+                    "{}: table={}, limit={}, partitions={}",
+                    self.plan_name,
                     self.table_ref,
                     self.limit,
                     self.targets.len()
                 )
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "FlussLogScanExec\ntable={}", self.table_ref)
+                write!(f, "{}\ntable={}", self.plan_name, self.table_ref)
             }
         }
     }
@@ -122,7 +134,7 @@ impl DisplayAs for FlussLogScanExec {
 
 impl ExecutionPlan for FlussLogScanExec {
     fn name(&self) -> &str {
-        "FlussLogScanExec"
+        self.plan_name
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -159,9 +171,9 @@ impl ExecutionPlan for FlussLogScanExec {
         let (partition_id, bucket) = self.targets[partition];
 
         let future = async move {
-            // `log_scan` already projects to `projection`; do NOT re-project.
+            // `bounded_scan` already projects to `projection`; do NOT re-project.
             let batches = source
-                .log_scan(&table_ref, partition_id, bucket, projection.as_deref(), limit)
+                .bounded_scan(&table_ref, partition_id, bucket, projection.as_deref(), limit)
                 .await?;
             Ok(batches)
         };

@@ -74,12 +74,16 @@ impl SchemaProvider for FlussSchemaProvider {
             Err(e) => return Err(e.into()),
         };
         if entry.meta.has_primary_key() {
-            // KV table: a real point-lookup provider (Task 4).
+            // KV table: point lookup (full PK equality) or bounded `LIMIT` scan.
+            // `num_buckets`/`partition_keys` drive the bounded-scan targets and
+            // partition pruning, mirroring the log provider.
             let provider = FlussKvTableProvider::new(
                 self.loader.source(),
                 table_ref,
                 entry.arrow_schema,
                 entry.meta.primary_keys.clone(),
+                entry.meta.num_buckets,
+                entry.meta.partition_keys.clone(),
             );
             Ok(Some(Arc::new(provider)))
         } else {

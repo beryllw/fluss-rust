@@ -25,8 +25,9 @@ The design is deliberately narrow:
 ### Currently supported
 
 1. Database and table discovery (list / get schema / table type).
-2. Full-primary-key equality predicate SQL pushdown for KV tables, pushed down as
-   a point lookup.
+2. KV (primary-keyed) tables support two read shapes: a full-primary-key equality
+   predicate pushed down as a point lookup, or a bounded `LIMIT` scan when no
+   complete PK equality is present.
 3. Bounded scan for log tables, which must carry a `LIMIT`, with projection
    pushdown.
 4. Reuse of the Fluss-to-Arrow schema and row conversion.
@@ -114,7 +115,7 @@ crates/integrations/datafusion/
     execution/
       mod.rs
       lookup.rs        # FlussKvLookupExec
-      log_scan.rs      # FlussLogScanExec
+      log_scan.rs      # FlussLogScanExec (bounded scan; label per log/KV)
       stream.rs        # stream adapter with cooperative cancellation
     types/
       mod.rs
@@ -176,15 +177,17 @@ through the `new()` production path against a real cluster.
 
 - The `FlussSource` trait (`pub(crate)`) covers only the atomic operations the
   crate actually uses: metadata listing/fetching, KV full-primary-key
-  `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), and log
-  bounded `log_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`.
-  `log_scan` takes an `Option<i64>` partition id (`None` for a non-partitioned
+  `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), and the
+  bounded `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`.
+  `bounded_scan` serves BOTH log and KV bounded scans — the fluss client's
+  `LimitBatchScanner` decodes log vs KV batches per table type, so one call backs
+  both. It takes an `Option<i64>` partition id (`None` for a non-partitioned
   table) so the scanner can target a partition-qualified bucket.
 - `real.rs`: the sole implementation, wrapping `FlussConnection` / `FlussAdmin` /
   lookuper / scanner, reusing Fluss's existing Arrow helpers (such as
   `LookupResult::to_record_batch`) rather than reimplementing Arrow assembly.
   `list_partitions` maps `admin.list_partition_infos` to the crate's
-  `FlussPartition` (partition id + partition-key/value string pairs); `log_scan`
+  `FlussPartition` (partition id + partition-key/value string pairs); `bounded_scan`
   builds the bucket via `TableBucket::new_with_partition`.
 - The seam returns the crate's own slim `FlussTableMeta` (schema + primary_keys +
   num_buckets + partition_keys, etc.), decoupling upper layers from
@@ -260,13 +263,22 @@ through the `new()` production path against a real cluster.
   that cannot be rendered to the partition-value string is skipped, never an
   error), and `is_partition_equality` classifies a single partition-column
   equality for the log table's pushdown decision.
-- `kv.rs`: `FlussKvTableProvider`'s `supports_filters_pushdown` marks only PK
-  equality filters as `Exact` (consumed, so no `FilterExec` is generated) and
-  everything else as `Unsupported`; `scan()` builds the lookup plan on a match
-  (correctly passing the projection), otherwise raises `UnsupportedQueryPattern`
-  directly and never silently degrades to a full scan.
+- `kv.rs`: `FlussKvTableProvider` serves two read shapes in precedence order.
+  `scan()` first tries `analyze_kv_filters`: a COMPLETE PK equality builds the
+  point-lookup plan (passing the projection); otherwise, if a `LIMIT` is present,
+  it runs a bounded KV scan reusing `FlussLogScanExec` (display name
+  `FlussKvScanExec`), computing targets and partition pruning exactly like the log
+  provider; with neither a complete PK equality nor a `LIMIT` it raises
+  `UnsupportedQueryPattern` and never degrades to an unbounded full scan.
+  `supports_filters_pushdown` is precedence-aware so it stays sound: a filter is
+  `Exact` (consumed, no `FilterExec`) ONLY when the full set forms a complete PK
+  equality that the point lookup will apply; on the bounded-scan path nothing is
+  `Exact` — partition equality is `Inexact` (drives pruning, residual `FilterExec`
+  re-applies) for a partitioned table and everything else is `Unsupported`. This
+  prevents the unsound case where a partial PK equality + `LIMIT` would be marked
+  `Exact` and silently dropped.
 - `log.rs`: `FlussLogTableProvider` cleanly returns `LimitRequired` when `limit`
-  is `None`; the projection is pushed down to `FlussSource::log_scan`, and a full
+  is `None`; the projection is pushed down to `FlussSource::bounded_scan`, and a full
   identity projection from `SELECT *` is normalized to `None`. For a
   non-partitioned table `supports_filters_pushdown` is always `Unsupported`. For a
   partitioned table it reports partition-column equality as `Inexact` (so a
@@ -287,15 +299,17 @@ through the `new()` production path against a real cluster.
   `FlussKvLookupExec`.
 - `log_scan.rs`: `FlussLogScanExec`, a leaf that reports one DataFusion partition
   per scan target (a `(partition_id, bucket)` pair); `execute(partition)` scans
-  `targets[partition]` via `source.log_scan(partition_id, bucket, projection, limit)`
-  asynchronously through `bounded_batches_stream`; `EXPLAIN` shows
-  `FlussLogScanExec`.
+  `targets[partition]` via `source.bounded_scan(partition_id, bucket, projection, limit)`
+  asynchronously through `bounded_batches_stream`. The same plan backs both log and
+  KV bounded scans; its `EXPLAIN` label is a `plan_name` field — the log provider
+  passes `FlussLogScanExec`, the KV provider passes `FlussKvScanExec`.
 - `stream.rs`: adapts the lookup / scan output into a DataFusion stream
   (`futures::stream::once` / Vec versions); dropping it is cooperative
   cancellation.
-- An asymmetry: `log_scan` is already projected on the `FlussSource` side, so the
-  log path does **not** project a second time; the KV lookup returns all columns
-  and is then trimmed by `project_batch` in `types/record_batch.rs`.
+- An asymmetry: `bounded_scan` is already projected on the `FlussSource` side, so
+  the bounded-scan path does **not** project a second time; the KV point lookup
+  returns all columns and is then trimmed by `project_batch` in
+  `types/record_batch.rs`.
 
 ### `types/`
 
@@ -313,16 +327,28 @@ through the `new()` production path against a real cluster.
 
 ### KV tables
 
-Only **full-primary-key equality** predicates are supported (`pk1 = v1 AND pk2 = v2 ...`,
-covering every PK column). A hit returns 1 row, a miss returns 0 rows (no error).
-Partial keys / prefixes / ranges / non-key filters / `IN` all fail cleanly with
-`UnsupportedQueryPattern` and never silently degrade to a full scan.
+A KV (primary-keyed) table supports two read shapes, in precedence order:
 
-Partitioned KV tables need no extra handling: for a partitioned PK table the
-partition columns are part of the primary key, so the full-PK equality already
-binds them. The Fluss `Lookuper` resolves the partition id from the lookup key
-row, so the existing point-lookup path targets the single owning partition
-automatically.
+1. **Point lookup** — a **full-primary-key equality** predicate
+   (`pk1 = v1 AND pk2 = v2 ...`, covering every PK column). A hit returns 1 row, a
+   miss returns 0 rows (no error).
+2. **Bounded scan** — any other predicate shape combined with a `LIMIT`. This runs
+   the same bounded-scan machinery as the log table (per-bucket last-`limit` rows,
+   with DataFusion applying the final cross-target `LIMIT`), shown in `EXPLAIN` as
+   `FlussKvScanExec`. For a partitioned table, partition-column equality prunes the
+   scanned partitions (`Inexact`, with a residual `FilterExec`).
+
+A query that is neither a complete PK equality nor carries a `LIMIT` (e.g. a
+partial key, a non-key filter, or a bare `SELECT *`) fails cleanly with
+`UnsupportedQueryPattern` and never silently degrades to an unbounded full scan.
+The prefix-scan pushdown (bucket-key equality without the full PK) remains a
+non-goal for now.
+
+Partitioned KV tables need no extra handling for the point lookup: for a
+partitioned PK table the partition columns are part of the primary key, so the
+full-PK equality already binds them. The Fluss `Lookuper` resolves the partition
+id from the lookup key row, so the point-lookup path targets the single owning
+partition automatically.
 
 ### Log tables
 

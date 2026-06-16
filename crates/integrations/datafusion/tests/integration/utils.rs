@@ -43,6 +43,8 @@ pub mod names {
     pub const LOG_PARTITIONED: &str = "df_log_partitioned";
     /// Partitioned KV table proving full-PK lookup resolves the partition.
     pub const KV_PARTITIONED: &str = "df_kv_partitioned";
+    /// KV table seeded with several rows to prove a bounded `LIMIT` scan.
+    pub const KV_BOUNDED: &str = "df_kv_bounded";
 }
 
 /// Shared SQL-path helpers for the real-cluster integration suite.

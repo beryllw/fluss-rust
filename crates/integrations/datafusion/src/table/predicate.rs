@@ -120,6 +120,21 @@ pub(crate) fn analyze_kv_filters(
     Ok(key)
 }
 
+/// True iff the whole borrowed filter set forms a COMPLETE primary-key equality
+/// (i.e. `analyze_kv_filters` would succeed on it).
+///
+/// `supports_filters_pushdown` receives `&[&Expr]` while [`analyze_kv_filters`]
+/// takes `&[Expr]`; this adapter clones the borrowed conjuncts and reuses
+/// `analyze_kv_filters` so the pushdown decision and the `scan` decision can never
+/// disagree about what "a complete primary key" means.
+pub(crate) fn is_complete_primary_key_equality(
+    filters: &[&Expr],
+    primary_keys: &[String],
+) -> bool {
+    let owned: Vec<Expr> = filters.iter().map(|f| (*f).clone()).collect();
+    analyze_kv_filters(&owned, primary_keys).is_ok()
+}
+
 /// True if a single filter is a `partition_column = literal` equality.
 ///
 /// Used by the log table's `supports_filters_pushdown` to mark partition-column

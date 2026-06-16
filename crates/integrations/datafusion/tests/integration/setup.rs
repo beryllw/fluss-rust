@@ -357,6 +357,55 @@ pub async fn create_kv_partitioned(connection: &FlussConnection) -> TableInfo {
     admin.get_table_info(&table_path).await.unwrap()
 }
 
+/// Creates and populates a single-bucket KV table with several rows, waits until
+/// its bucket can serve reads, and returns its `TableInfo`. Used to prove a
+/// bounded `LIMIT` scan over a primary-keyed table returns exactly `LIMIT` rows
+/// while a full-PK equality still resolves a single row.
+pub async fn create_kv_bounded(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::KV_BOUNDED);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .primary_key(vec!["id"])
+                .build()
+                .unwrap(),
+        )
+        // Single bucket keeps the bounded scan deterministic and ready-to-read.
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_upsert().unwrap().create_writer().unwrap();
+    let rows = [
+        (1, "a"),
+        (2, "b"),
+        (3, "c"),
+        (4, "d"),
+        (5, "e"),
+        (6, "f"),
+    ];
+    for (id, name) in &rows {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, *id);
+        row.set_field(1, *name);
+        writer.upsert(&row).unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    // Wait until the bucket can serve reads before any bounded scan runs.
+    wait_for_offsets(connection, &table_path).await;
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
 /// Best-effort drop of a single table under `names::DATABASE`.
 pub async fn drop_table_named(connection: &FlussConnection, table_name: &str) {
     let admin = connection.get_admin().unwrap();
@@ -476,6 +525,7 @@ pub async fn drop_phase1_tables(connection: &FlussConnection) {
         names::LOG_MULTI_BUCKET,
         names::LOG_PARTITIONED,
         names::KV_PARTITIONED,
+        names::KV_BOUNDED,
     ] {
         let _ = admin
             .drop_table(&TablePath::new(names::DATABASE, name), true)
