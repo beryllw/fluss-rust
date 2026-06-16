@@ -30,9 +30,11 @@ use std::time::Duration;
 
 use fluss::client::FlussConnection;
 use fluss::metadata::{
-    DataTypes, PartitionSpec, Schema, TableDescriptor, TableInfo, TablePath,
+    DataField, DataTypes, PartitionSpec, Schema, TableDescriptor, TableInfo, TablePath,
 };
-use fluss::row::GenericRow;
+use fluss::row::binary_array::FlussArrayWriter;
+use fluss::row::binary_map::FlussMapWriter;
+use fluss::row::{Datum, Date, Decimal, GenericRow, Time, TimestampLtz, TimestampNtz};
 use fluss::rpc::message::OffsetSpec;
 use fluss_test_cluster::{FlussTestingCluster, FlussTestingClusterBuilder};
 
@@ -511,6 +513,229 @@ pub async fn create_kv_full_scan(connection: &FlussConnection) -> TableInfo {
 
     wait_for_offsets(connection, &table_path).await;
 
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
+// ===========================================================================
+// Wide column-type-coverage tables.
+//
+// These exercise the SQL read path for EVERY scalar Fluss type (plus nested
+// types) through the three decode paths that matter:
+//   * KV point lookup  (`WHERE id = <k>`)
+//   * KV full scan      (`SELECT *`)
+//   * Log scan          (`SELECT ... LIMIT n`)
+//
+// Seeded values are chosen so the expected Arrow integer/decimal value is easy
+// to reason about (see the per-type notes in `type_coverage.rs`).
+// ===========================================================================
+
+/// Ordered list of `(name, DataType)` value columns covering every scalar Fluss
+/// type. The wide KV and wide log tables share this column set so the same
+/// per-type assertions apply across all three decode paths. `id INT` (the PK /
+/// first column) is added separately by each table builder.
+pub fn wide_scalar_columns() -> Vec<(&'static str, fluss::metadata::DataType)> {
+    vec![
+        ("c_boolean", DataTypes::boolean()),
+        ("c_tinyint", DataTypes::tinyint()),
+        ("c_smallint", DataTypes::smallint()),
+        ("c_int", DataTypes::int()),
+        ("c_bigint", DataTypes::bigint()),
+        ("c_float", DataTypes::float()),
+        ("c_double", DataTypes::double()),
+        ("c_decimal", DataTypes::decimal(10, 2)),
+        ("c_char", DataTypes::char(8)),
+        ("c_string", DataTypes::string()),
+        ("c_bytes", DataTypes::bytes()),
+        ("c_binary", DataTypes::binary(4)),
+        ("c_date", DataTypes::date()),
+        ("c_time", DataTypes::time_with_precision(3)),
+        ("c_timestamp", DataTypes::timestamp_with_precision(6)),
+        ("c_ts_ltz", DataTypes::timestamp_ltz_with_precision(6)),
+    ]
+}
+
+/// Builds a fully-populated value row for `id` over `wide_scalar_columns()`.
+///
+/// All seeded values are deterministic and distinct per row so the full-scan and
+/// point-lookup assertions can key on `id`. The logical values are documented in
+/// `type_coverage.rs` next to the assertions that read them back.
+fn wide_value_row(id: i32) -> GenericRow<'static> {
+    // The first field is `id`; value columns follow `wide_scalar_columns()` order.
+    let mut row = GenericRow::new(1 + wide_scalar_columns().len());
+    let n = id as i64;
+    row.set_field(0, id);
+    row.set_field(1, id % 2 == 0); // c_boolean
+    row.set_field(2, (id + 1) as i8); // c_tinyint
+    row.set_field(3, (id + 2) as i16); // c_smallint
+    row.set_field(4, id + 3); // c_int
+    row.set_field(5, n + 4); // c_bigint
+    row.set_field(6, id as f32 + 0.5_f32); // c_float
+    row.set_field(7, id as f64 + 0.25_f64); // c_double
+    // c_decimal(10,2): unscaled = id*100 + 45 -> logical value id.45
+    row.set_field(
+        8,
+        Decimal::from_unscaled_long((n * 100) + 45, 10, 2).unwrap(),
+    );
+    // c_char(8): owned String kept alive via the row's lifetime.
+    row.set_field(9, Datum::from(format!("c{id}")));
+    row.set_field(10, Datum::from(format!("s{id}"))); // c_string
+    row.set_field(11, Datum::from(vec![id as u8, (id + 1) as u8])); // c_bytes
+    row.set_field(12, Datum::from(vec![id as u8; 4])); // c_binary(4)
+    row.set_field(13, Datum::Date(Date::new(20000 + id))); // c_date (epoch day)
+    // c_time(3): ms since midnight = id*1000 (whole seconds, simple to reason about).
+    row.set_field(14, Datum::Time(Time::new(id * 1000)));
+    // c_timestamp(6): millis since epoch, no sub-ms nanos -> micros = millis*1000.
+    row.set_field(
+        15,
+        Datum::TimestampNtz(TimestampNtz::new(1_700_000_000_000 + n)),
+    );
+    // c_ts_ltz(6): same instant model.
+    row.set_field(
+        16,
+        Datum::TimestampLtz(TimestampLtz::new(1_700_000_000_000 + n)),
+    );
+    row
+}
+
+/// Builds a row for `id` whose value columns are ALL null (the PK stays set).
+fn wide_null_row(id: i32) -> GenericRow<'static> {
+    let count = 1 + wide_scalar_columns().len();
+    let mut row = GenericRow::new(count);
+    row.set_field(0, id);
+    for i in 1..count {
+        row.set_field(i, Datum::Null);
+    }
+    row
+}
+
+fn wide_schema(pk: Option<&[&str]>) -> Schema {
+    let mut sb = Schema::builder().column("id", DataTypes::int());
+    for (name, dt) in wide_scalar_columns() {
+        sb = sb.column(name, dt);
+    }
+    if let Some(keys) = pk {
+        sb = sb.primary_key(keys.iter().copied());
+    }
+    sb.build().expect("wide schema build")
+}
+
+/// Creates and populates the wide KV table (PK `id INT`, one value column per
+/// scalar type). Seeds two fully-populated rows (id=1, id=2) plus one all-null
+/// row (id=3) so both the point-lookup and full-scan paths can assert per-type
+/// values AND null handling. Returns its `TableInfo`.
+pub async fn create_kv_wide_types(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::KV_WIDE_TYPES);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(wide_schema(Some(&["id"])))
+        // Single bucket keeps the full scan deterministic and ready-to-read.
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_upsert().unwrap().create_writer().unwrap();
+    writer.upsert(&wide_value_row(1)).unwrap();
+    writer.upsert(&wide_value_row(2)).unwrap();
+    writer.upsert(&wide_null_row(3)).unwrap();
+    writer.flush().await.unwrap();
+
+    wait_for_offsets(connection, &table_path).await;
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
+/// Creates and populates the wide log table (no PK, single bucket, one value
+/// column per scalar type). Seeds three rows (id=1, id=2 fully populated; id=3
+/// all-null value columns) and waits until its bucket can serve reads. Returns
+/// its `TableInfo`.
+pub async fn create_log_wide_types(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::LOG_WIDE_TYPES);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(wide_schema(None))
+        // Single bucket keeps the bounded LIMIT scan deterministic (head-first).
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_append().unwrap().create_writer().unwrap();
+    writer.append(&wide_value_row(1)).unwrap();
+    writer.append(&wide_value_row(2)).unwrap();
+    writer.append(&wide_null_row(3)).unwrap();
+    writer.flush().await.unwrap();
+
+    wait_for_offsets(connection, &table_path).await;
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
+/// Creates and populates the nested-types log table: `id INT` plus an
+/// `ARRAY<INT>`, a `MAP<STRING,INT>`, and a `ROW<seq INT, label STRING>` value
+/// column. Single bucket; waits until its bucket can serve reads. Used to prove
+/// the log-scan path decodes List / Map / Struct Arrow types.
+pub async fn create_log_nested_types(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::LOG_NESTED_TYPES);
+    let admin = connection.get_admin().unwrap();
+    let row_type = DataTypes::row(vec![
+        DataField::new("seq", DataTypes::int(), None),
+        DataField::new("label", DataTypes::string(), None),
+    ]);
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("c_array", DataTypes::array(DataTypes::int()))
+                .column("c_map", DataTypes::map(DataTypes::string(), DataTypes::int()))
+                .column("c_row", row_type)
+                .build()
+                .unwrap(),
+        )
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_append().unwrap().create_writer().unwrap();
+
+    // Row id=1: array [10,20,30], map {a:1,b:2}, row {seq:7,label:"open"}.
+    let arr = {
+        let mut w = FlussArrayWriter::new(3, &DataTypes::int());
+        w.write_int(0, 10);
+        w.write_int(1, 20);
+        w.write_int(2, 30);
+        w.complete().expect("c_array")
+    };
+    let map = {
+        let mut w = FlussMapWriter::new(2, &DataTypes::string(), &DataTypes::int());
+        w.write_entry("a".into(), 1.into()).unwrap();
+        w.write_entry("b".into(), 2.into()).unwrap();
+        w.complete().expect("c_map")
+    };
+    let mut nested = GenericRow::new(2);
+    nested.set_field(0, 7_i32);
+    nested.set_field(1, "open");
+
+    let mut row = GenericRow::new(4);
+    row.set_field(0, 1_i32);
+    row.set_field(1, arr);
+    row.set_field(2, Datum::Map(map));
+    row.set_field(3, Datum::Row(Box::new(nested)));
+    writer.append(&row).unwrap();
+    writer.flush().await.unwrap();
+
+    wait_for_offsets(connection, &table_path).await;
     admin.get_table_info(&table_path).await.unwrap()
 }
 

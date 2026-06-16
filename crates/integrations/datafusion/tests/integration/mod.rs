@@ -29,6 +29,9 @@
 //!   live in the same session (`integration_tests`).
 //! - `example_smoke`: real-cluster smoke test for the package-local runnable demo
 //!   path (`integration_tests`).
+//! - `type_coverage`: real-cluster proof that the SQL read path decodes EVERY
+//!   scalar Fluss type (plus nested array/map/row) across the KV point-lookup,
+//!   KV full-scan, and log-scan decode paths (`integration_tests`).
 
 pub mod utils;
 
@@ -52,3 +55,6 @@ pub mod live_metadata;
 
 #[cfg(feature = "integration_tests")]
 pub mod example_smoke;
+
+#[cfg(feature = "integration_tests")]
+pub mod type_coverage;

@@ -50,6 +50,15 @@ pub mod names {
     /// KV table seeded with inserts + an update + a delete, proving a full-table
     /// scan (no filter / no LIMIT) merges the changelog to current state.
     pub const KV_FULL_SCAN: &str = "df_kv_full_scan";
+    /// Wide KV table carrying one value column per scalar Fluss type, proving the
+    /// KV point-lookup and KV full-scan decode paths handle every scalar type.
+    pub const KV_WIDE_TYPES: &str = "df_kv_wide_types";
+    /// Wide log table carrying one value column per scalar Fluss type, proving the
+    /// log-scan decode path handles every scalar type.
+    pub const LOG_WIDE_TYPES: &str = "df_log_wide_types";
+    /// Log table carrying nested (array/map/row) value columns, proving the
+    /// log-scan path decodes List/Map/Struct Arrow types.
+    pub const LOG_NESTED_TYPES: &str = "df_log_nested_types";
 }
 
 /// Shared SQL-path helpers for the real-cluster integration suite.
