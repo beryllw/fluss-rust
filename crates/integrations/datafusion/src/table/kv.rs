@@ -32,17 +32,20 @@
 //!    bounded scan (the same machinery the log table uses), reading each bucket's
 //!    last-`limit` rows; DataFusion layers the final cross-target `LIMIT`. For a
 //!    partitioned table, partition-column equality prunes the scanned partitions.
-//!
-//! Anything else (no complete PK/prefix equality AND no `LIMIT`) returns a clear
-//! `UnsupportedQueryPattern` rather than degrading into an unbounded full scan.
+//! 4. **Full scan** — any other predicate shape with NO `LIMIT` runs a full-table
+//!    scan via [`FlussKvFullScanExec`], merging each target bucket's CDC changelog
+//!    into its current state (changelog-only: no kv-snapshot RPC, no RocksDB).
+//!    The same `(partition, bucket)` target computation as the bounded scan is
+//!    used, so partition-column equality prunes the scanned partitions. Its
+//!    completeness is bounded by changelog retention.
 //!
 //! `supports_filters_pushdown` is precedence-aware so it is sound: a filter is
 //! `Exact` (consumed, no residual `FilterExec`) ONLY when the matching exec will
 //! actually apply it — a complete PK equality (point lookup) or a complete
-//! bucket-key prefix equality (prefix lookup). Otherwise the bounded-scan path
-//! runs, which does NOT apply arbitrary filters, so partition equality is only
-//! `Inexact` (drives pruning, residual `FilterExec` re-applies) and everything
-//! else is `Unsupported`.
+//! bucket-key prefix equality (prefix lookup). Otherwise the bounded-scan / full-
+//! scan path runs, which does NOT apply arbitrary filters, so partition equality
+//! is only `Inexact` (drives pruning, residual `FilterExec` re-applies) and
+//! everything else is `Unsupported`.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -50,14 +53,14 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::error::{DataFusionError, Result as DfResult};
+use datafusion::error::Result as DfResult;
 use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
 use crate::backend::{SharedFlussSource, TableRef};
-use crate::error::FlussDatafusionError;
+use crate::execution::kv_full_scan::FlussKvFullScanExec;
 use crate::execution::log_scan::FlussLogScanExec;
 use crate::execution::lookup::FlussKvLookupExec;
 use crate::execution::prefix_lookup::FlussKvPrefixLookupExec;
@@ -147,11 +150,11 @@ impl TableProvider for FlussKvTableProvider {
         // 2. Else if the FULL set forms a complete bucket-key prefix equality, a
         //    prefix lookup runs and consumes exactly the prefix-key conjuncts
         //    (partition keys + bucket keys).
-        // 3. Else the bounded-scan path runs, which does NOT apply arbitrary
-        //    filters — so nothing may be `Exact`. There, partition equality is
-        //    only `Inexact` (drives pruning; the residual `FilterExec` re-applies
-        //    it), and everything else (including partial PK / prefix equality) is
-        //    `Unsupported`.
+        // 3. Else the bounded-scan / full-scan path runs, which does NOT apply
+        //    arbitrary filters — so nothing may be `Exact`. There, partition
+        //    equality is only `Inexact` (drives pruning; the residual `FilterExec`
+        //    re-applies it), and everything else (including partial PK / prefix
+        //    equality) is `Unsupported`.
         if is_complete_primary_key_equality(filters, &self.primary_keys) {
             return Ok(filters
                 .iter()
@@ -246,22 +249,12 @@ impl TableProvider for FlussKvTableProvider {
             )));
         }
 
-        // 3. Any other predicate shape + a `LIMIT` => bounded KV scan, computing
-        //    targets exactly like the log table.
-        let Some(limit) = limit else {
-            // 4. Neither a complete PK equality, nor a complete prefix equality,
-            //    nor a `LIMIT`: refuse clearly rather than falling back to an
-            //    unbounded full scan.
-            return Err(DataFusionError::from(
-                FlussDatafusionError::UnsupportedQueryPattern(format!(
-                    "KV table {} requires either a full primary-key equality (point lookup), \
-                     a complete bucket-key prefix equality (prefix lookup), or a LIMIT \
-                     (bounded scan); an unbounded scan is not supported",
-                    self.table_ref
-                )),
-            ));
-        };
-
+        // 3. & 4. Any other predicate shape => a scan across the `(partition,
+        //    bucket)` targets, computed exactly like the log table. A `LIMIT`
+        //    selects the bounded scan (each bucket's last-`limit` rows); its
+        //    absence selects the unbounded KV full scan (changelog merge to
+        //    current state).
+        //
         // Compute the scan targets: one (partition_id, bucket) per DataFusion
         // output partition (mirrors `FlussLogTableProvider::scan`).
         let buckets = 0..self.num_buckets;
@@ -298,18 +291,30 @@ impl TableProvider for FlussKvTableProvider {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
-        // Per-target pushdown of `limit` returns each bucket's last-`limit` rows;
-        // DataFusion layers a global `LIMIT` above this multi-partition scan.
-        Ok(Arc::new(FlussLogScanExec::new(
-            self.source.clone(),
-            self.table_ref.clone(),
-            projection,
-            Some(limit),
-            false,
-            targets,
-            projected_schema,
-            KV_SCAN_PLAN_NAME,
-        )))
+        match limit {
+            // 3. Per-target pushdown of `limit` returns each bucket's last-`limit`
+            //    rows; DataFusion layers a global `LIMIT` above this multi-partition
+            //    scan.
+            Some(limit) => Ok(Arc::new(FlussLogScanExec::new(
+                self.source.clone(),
+                self.table_ref.clone(),
+                projection,
+                Some(limit),
+                false,
+                targets,
+                projected_schema,
+                KV_SCAN_PLAN_NAME,
+            ))),
+            // 4. No complete PK/prefix equality and no `LIMIT`: full KV scan,
+            //    merging each target bucket's changelog into its current state.
+            None => Ok(Arc::new(FlussKvFullScanExec::new(
+                self.source.clone(),
+                self.table_ref.clone(),
+                projection,
+                targets,
+                projected_schema,
+            ))),
+        }
     }
 }
 
@@ -370,6 +375,15 @@ mod tests {
             _bucket: i32,
             _projection: Option<&[usize]>,
             _row_limit: Option<usize>,
+        ) -> CrateResult<Vec<RecordBatch>> {
+            unreachable!("not exercised by pushdown unit tests")
+        }
+        async fn kv_full_scan(
+            &self,
+            _table: &TableRef,
+            _partition_id: Option<i64>,
+            _bucket: i32,
+            _projection: Option<&[usize]>,
         ) -> CrateResult<Vec<RecordBatch>> {
             unreachable!("not exercised by pushdown unit tests")
         }

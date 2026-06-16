@@ -331,6 +331,79 @@ impl<'a> TableScan<'a> {
         })
     }
 
+    /// Create a record-mode scanner over a primary-key (KV) table's CDC
+    /// changelog.
+    ///
+    /// Unlike [`create_log_scanner`](Self::create_log_scanner), which rejects
+    /// primary-key tables, this entry point reads the changelog that the server
+    /// already materializes for a KV table and exposes via `FetchLog`. Each
+    /// emitted [`ScanRecord`] carries the correct
+    /// [`ChangeType`](crate::record::ChangeType) (`+I`/`+U`/`-U`/`-D`) decoded
+    /// from the batch's change-type vector.
+    ///
+    /// The `ARROW` log-format requirement still applies: the changelog payload
+    /// is an Arrow batch (prefixed by a per-record change-type vector for
+    /// non-append-only batches), which the decode path handles transparently.
+    pub fn create_changelog_scanner(self) -> Result<LogScanner> {
+        self.reject_limit("ChangelogScanner")?;
+        validate_scan_support_inner(&self.table_info.table_path, &self.table_info, true)?;
+        let inner = LogScannerInner::new(
+            &self.table_info,
+            self.metadata.clone(),
+            self.conn.get_connections(),
+            self.conn.config(),
+            self.projected_fields,
+        )?;
+        Ok(LogScanner {
+            inner: Arc::new(inner),
+        })
+    }
+
+    /// Builds a [`KvFullScanner`] that reads ONE bucket's CDC changelog and
+    /// merges it by primary key into the bucket's current state.
+    ///
+    /// This is the client-side entry point for the "changelog-only" KV
+    /// full-table scan (Option B): no kv-snapshot RPC and no RocksDB. Any
+    /// projection configured via [`project`](Self::project) /
+    /// [`project_by_name`](Self::project_by_name) is applied to the merged
+    /// output batch.
+    ///
+    /// See [`KvFullScanner`] for the merge semantics and the changelog-retention
+    /// completeness limitation.
+    pub fn kv_full_scanner(self) -> Result<crate::client::table::KvFullScanner<'a>> {
+        self.reject_limit("KvFullScanner")?;
+        if !self.table_info.has_primary_key() {
+            return Err(Error::UnsupportedOperation {
+                message: format!(
+                    "kv_full_scanner requires a primary-key (KV) table; {} has none",
+                    self.table_info.table_path
+                ),
+            });
+        }
+        Ok(crate::client::table::KvFullScanner::new(
+            self.conn,
+            self.metadata.clone(),
+            self.table_info,
+            self.projected_fields,
+        ))
+    }
+
+    /// Reads ONE bucket's changelog from earliest to the latest offset captured
+    /// now, merges by primary key, and returns the bucket's current-state rows
+    /// as an Arrow [`RecordBatch`] with the table's (optionally projected)
+    /// schema.
+    ///
+    /// Convenience wrapper over [`kv_full_scanner`](Self::kv_full_scanner). See
+    /// [`KvFullScanner`] for merge semantics and the changelog-retention
+    /// completeness limitation.
+    pub async fn collect_kv_current_state_batch(
+        self,
+        table_bucket: TableBucket,
+    ) -> Result<arrow::array::RecordBatch> {
+        let scanner = self.kv_full_scanner()?;
+        scanner.collect_current_state(table_bucket).await
+    }
+
     pub fn create_record_batch_log_scanner(self) -> Result<RecordBatchLogScanner> {
         self.reject_limit("RecordBatchLogScanner")?;
         validate_scan_support(&self.table_info.table_path, &self.table_info)?;
@@ -2224,7 +2297,24 @@ impl BucketScanStatus {
 }
 
 fn validate_scan_support(table_path: &TablePath, table_info: &TableInfo) -> Result<()> {
-    if table_info.schema.primary_key().is_some() {
+    validate_scan_support_inner(table_path, table_info, false)
+}
+
+/// Shared validation for the record-mode log scanners.
+///
+/// When `allow_primary_key` is `false` (the public log-scan path) a primary-key
+/// table is rejected, since its log is a CDC changelog rather than a plain
+/// append-only log. When `true` (the changelog-scan path) the primary-key
+/// rejection is bypassed so the KV table's changelog can be read; the
+/// `LogFormat::ARROW` requirement still applies in both cases because the
+/// changelog payload is an Arrow batch (optionally prefixed by a change-type
+/// vector), which the decode path handles.
+fn validate_scan_support_inner(
+    table_path: &TablePath,
+    table_info: &TableInfo,
+    allow_primary_key: bool,
+) -> Result<()> {
+    if !allow_primary_key && table_info.schema.primary_key().is_some() {
         return Err(UnsupportedOperation {
             message: format!("Table {table_path} is not a Log Table and doesn't support scan."),
         });

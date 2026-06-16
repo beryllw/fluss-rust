@@ -24,6 +24,8 @@ mod integration {
     mod batch_scanner;
     mod connection_io_handle;
     mod fluss_cluster;
+    mod kv_changelog;
+    mod kv_full_scan;
     mod kv_table;
     mod log_table;
     mod record_batch_log_reader;

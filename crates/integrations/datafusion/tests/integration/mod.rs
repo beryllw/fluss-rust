@@ -45,6 +45,9 @@ pub mod kv_bounded_scan;
 pub mod kv_prefix_lookup;
 
 #[cfg(feature = "integration_tests")]
+pub mod kv_full_scan;
+
+#[cfg(feature = "integration_tests")]
 pub mod live_metadata;
 
 #[cfg(feature = "integration_tests")]

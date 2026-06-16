@@ -47,6 +47,9 @@ pub mod names {
     pub const KV_BOUNDED: &str = "df_kv_bounded";
     /// KV table whose bucket key is a strict prefix of the PK, proving prefix lookup.
     pub const KV_PREFIX: &str = "df_kv_prefix";
+    /// KV table seeded with inserts + an update + a delete, proving a full-table
+    /// scan (no filter / no LIMIT) merges the changelog to current state.
+    pub const KV_FULL_SCAN: &str = "df_kv_full_scan";
 }
 
 /// Shared SQL-path helpers for the real-cluster integration suite.

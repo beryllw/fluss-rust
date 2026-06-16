@@ -207,6 +207,27 @@ pub trait FlussSource: Send + Sync {
         projection: Option<&[usize]>,
         row_limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>>;
+
+    /// Performs a full-table scan of ONE KV bucket by merging its CDC changelog
+    /// into the current state (changelog-only; no kv-snapshot RPC, no RocksDB).
+    ///
+    /// Reads the bucket's changelog from earliest to the latest offset captured
+    /// at call time and merges by primary key, returning the bucket's
+    /// current-state rows. `partition_id` selects the partition (`None` for a
+    /// non-partitioned table); `bucket` is the bucket id; one `(partition,
+    /// bucket)` target maps to one DataFusion partition. `projection` is column
+    /// indices into the table schema (`None` = all columns); returned batches are
+    /// already projected and must NOT be re-projected by callers.
+    ///
+    /// Completeness is bounded by changelog retention: rows already compacted out
+    /// of the retained changelog window are not included.
+    async fn kv_full_scan(
+        &self,
+        table: &TableRef,
+        partition_id: Option<i64>,
+        bucket: i32,
+        projection: Option<&[usize]>,
+    ) -> Result<Vec<RecordBatch>>;
 }
 
 /// Convenience alias for the shared, dynamically-dispatched source handle.

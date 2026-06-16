@@ -453,6 +453,67 @@ pub async fn create_kv_prefix(connection: &FlussConnection) -> TableInfo {
     admin.get_table_info(&table_path).await.unwrap()
 }
 
+/// Creates a single-bucket KV table, seeds inserts, then UPDATES some rows and
+/// DELETES one, waiting until its bucket can serve reads. Returns its
+/// `TableInfo`. Used to prove a full-table scan (no filter / no `LIMIT`) merges
+/// the CDC changelog into the correct current state.
+///
+/// Seeds ids 1..=5, then updates id=2 (name -> "bravo-v2") and id=4
+/// (name -> "delta-v2"), then deletes id=3. The expected current state is
+/// {1:alpha, 2:bravo-v2, 4:delta-v2, 5:echo}.
+pub async fn create_kv_full_scan(connection: &FlussConnection) -> TableInfo {
+    let table_path = TablePath::new(names::DATABASE, names::KV_FULL_SCAN);
+    let admin = connection.get_admin().unwrap();
+    let descriptor = TableDescriptor::builder()
+        .schema(
+            Schema::builder()
+                .column("id", DataTypes::int())
+                .column("name", DataTypes::string())
+                .primary_key(vec!["id"])
+                .build()
+                .unwrap(),
+        )
+        // Single bucket keeps the whole table on bucket 0 and the merge deterministic.
+        .distributed_by(Some(1), vec![])
+        .build()
+        .unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
+
+    let table = connection.get_table(&table_path).await.unwrap();
+    let writer = table.new_upsert().unwrap().create_writer().unwrap();
+
+    // Inserts.
+    for (id, name) in [(1, "alpha"), (2, "bravo"), (3, "charlie"), (4, "delta"), (5, "echo")] {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id);
+        row.set_field(1, name);
+        writer.upsert(&row).unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    // Updates: id=2 and id=4.
+    for (id, name) in [(2, "bravo-v2"), (4, "delta-v2")] {
+        let mut row = GenericRow::new(2);
+        row.set_field(0, id);
+        row.set_field(1, name);
+        writer.upsert(&row).unwrap();
+    }
+    writer.flush().await.unwrap();
+
+    // Delete: id=3.
+    let mut delete_row = GenericRow::new(2);
+    delete_row.set_field(0, 3);
+    writer.delete(&delete_row).unwrap();
+    writer.flush().await.unwrap();
+
+    wait_for_offsets(connection, &table_path).await;
+
+    admin.get_table_info(&table_path).await.unwrap()
+}
+
 /// Best-effort drop of a single table under `names::DATABASE`.
 pub async fn drop_table_named(connection: &FlussConnection, table_name: &str) {
     let admin = connection.get_admin().unwrap();

@@ -25,11 +25,13 @@ The design is deliberately narrow:
 ### Currently supported
 
 1. Database and table discovery (list / get schema / table type).
-2. KV (primary-keyed) tables support three read shapes in precedence order: a
+2. KV (primary-keyed) tables support four read shapes in precedence order: a
    full-primary-key equality predicate pushed down as a point lookup, a bucket-key
    prefix equality (plus all partition keys when partitioned) pushed down as a
-   prefix lookup, or a bounded `LIMIT` scan when neither equality shape is
-   present.
+   prefix lookup, a bounded `LIMIT` scan when neither equality shape is present,
+   and a full-table scan (no filter / no `LIMIT`, e.g. `SELECT *`) via a
+   changelog merge to current state. The full-table scan's completeness is bounded
+   by changelog retention.
 3. Log tables support two scan shapes: a head-first first-N scan when a `LIMIT`
    is present, or a finite earliest->latest snapshot scan when no `LIMIT` is
    present, both with projection pushdown.
@@ -119,6 +121,7 @@ crates/integrations/datafusion/
       mod.rs
       lookup.rs        # FlussKvLookupExec
       log_scan.rs      # FlussLogScanExec (bounded scan; label per log/KV)
+      kv_full_scan.rs  # FlussKvFullScanExec (KV full-table scan; changelog merge)
       stream.rs        # stream adapter with cooperative cancellation
     types/
       mod.rs
@@ -181,12 +184,16 @@ through the `new()` production path against a real cluster.
 - The `FlussSource` trait (`pub(crate)`) covers only the atomic operations the
   crate actually uses: metadata listing/fetching, KV full-primary-key
   `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), KV bounded
-  `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`, and
-  log snapshot `log_scan(partition_id, bucket, projection, row_limit) -> Vec<RecordBatch>`.
+  `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`,
+  log snapshot `log_scan(partition_id, bucket, projection, row_limit) -> Vec<RecordBatch>`,
+  and KV full scan `kv_full_scan(partition_id, bucket, projection) -> Vec<RecordBatch>`.
   `bounded_scan` remains the tail-oriented `LimitBatchScanner` path for KV only.
   `log_scan` is log-specific: it reads earliest->latest, with `Some(n)` meaning
   first-N and `None` meaning a full finite snapshot to the latest offsets captured
-  at query start. Both take an `Option<i64>` partition id (`None` for a
+  at query start. `kv_full_scan` is KV-only: it merges one bucket's CDC changelog
+  (earliest->latest at call time) into its current state via the client's
+  `collect_kv_current_state_batch`, returning the merged rows (no kv-snapshot RPC,
+  no RocksDB). All take an `Option<i64>` partition id (`None` for a
   non-partitioned table) so the scanner can target a partition-qualified bucket.
 - `real.rs`: the sole implementation, wrapping `FlussConnection` / `FlussAdmin` /
   lookuper / scanner, reusing Fluss's existing Arrow helpers (such as
@@ -271,20 +278,24 @@ through the `new()` production path against a real cluster.
   that cannot be rendered to the partition-value string is skipped, never an
   error), and `is_partition_equality` classifies a single partition-column
   equality for the log table's pushdown decision.
-- `kv.rs`: `FlussKvTableProvider` serves two read shapes in precedence order.
+- `kv.rs`: `FlussKvTableProvider` serves four read shapes in precedence order.
   `scan()` first tries `analyze_kv_filters`: a COMPLETE PK equality builds the
-  point-lookup plan (passing the projection); otherwise, if a `LIMIT` is present,
-  it runs a bounded KV scan reusing `FlussLogScanExec` (display name
-  `FlussKvScanExec`), computing targets and partition pruning exactly like the log
-  provider; with neither a complete PK equality nor a `LIMIT` it raises
-  `UnsupportedQueryPattern` and never degrades to an unbounded full scan.
-  `supports_filters_pushdown` is precedence-aware so it stays sound: a filter is
-  `Exact` (consumed, no `FilterExec`) ONLY when the full set forms a complete PK
-  equality that the point lookup will apply; on the bounded-scan path nothing is
-  `Exact` — partition equality is `Inexact` (drives pruning, residual `FilterExec`
-  re-applies) for a partitioned table and everything else is `Unsupported`. This
-  prevents the unsound case where a partial PK equality + `LIMIT` would be marked
-  `Exact` and silently dropped.
+  point-lookup plan (passing the projection); else a complete bucket-key prefix
+  equality builds the prefix-lookup plan; else it computes the `(partition,
+  bucket)` targets (partition pruning exactly like the log provider) and, if a
+  `LIMIT` is present, runs a bounded KV scan reusing `FlussLogScanExec` (display
+  name `FlussKvScanExec`); with NO `LIMIT` it runs a full-table scan via
+  `FlussKvFullScanExec`, which merges each target bucket's CDC changelog into its
+  current state (changelog-only; no kv-snapshot RPC, no RocksDB). The full-table
+  scan's completeness is bounded by changelog retention. An empty target set
+  yields an `EmptyExec`. `supports_filters_pushdown` is precedence-aware so it
+  stays sound: a filter is `Exact` (consumed, no `FilterExec`) ONLY when the full
+  set forms a complete PK equality (point lookup) or a complete bucket-key prefix
+  equality (prefix lookup) that the matching plan will apply; on the bounded-scan
+  / full-scan path nothing is `Exact` — partition equality is `Inexact` (drives
+  pruning, residual `FilterExec` re-applies) for a partitioned table and
+  everything else is `Unsupported`. This prevents the unsound case where a partial
+  PK equality would be marked `Exact` and silently dropped.
 - `log.rs`: `FlussLogTableProvider` no longer requires `LIMIT`. The projection is
   pushed down to the log source scan, and a full identity projection from
   `SELECT *` is normalized to `None`. For a non-partitioned table
@@ -314,6 +325,12 @@ through the `new()` production path against a real cluster.
   `EXPLAIN` label is a `plan_name` field — the log provider passes
   `FlussLogScanExec`, the KV provider passes `FlussKvScanExec`. Debug/display text
   now shows `limit=<n>` or `limit=None/full`.
+- `kv_full_scan.rs`: `FlussKvFullScanExec`, a leaf that reports one DataFusion
+  partition per `(partition_id, bucket)` target. `execute(partition)` calls
+  `source.kv_full_scan(partition_id, bucket, projection)` asynchronously through
+  `bounded_batches_stream`, merging that bucket's CDC changelog into its current
+  state. It is distinct from `FlussLogScanExec` (which backs log snapshot scans
+  and KV bounded `LIMIT` scans); `EXPLAIN` shows `FlussKvFullScanExec`.
 - `stream.rs`: adapts the lookup / scan output into a DataFusion stream
   (`futures::stream::once` / Vec versions); dropping it is cooperative
   cancellation.
@@ -338,7 +355,7 @@ through the `new()` production path against a real cluster.
 
 ### KV tables
 
-A KV (primary-keyed) table supports three read shapes, in precedence order:
+A KV (primary-keyed) table supports four read shapes, in precedence order:
 
 1. **Point lookup** — a **full-primary-key equality** predicate
    (`pk1 = v1 AND pk2 = v2 ...`, covering every PK column). A hit returns 1 row, a
@@ -355,11 +372,20 @@ A KV (primary-keyed) table supports three read shapes, in precedence order:
    with DataFusion applying the final cross-target `LIMIT`), shown in `EXPLAIN` as
    `FlussKvScanExec`. For a partitioned table, partition-column equality prunes the
    scanned partitions (`Inexact`, with a residual `FilterExec`).
+4. **Full scan** — any other predicate shape with NO `LIMIT` (e.g. a bare
+   `SELECT *`, a partial key, or a non-key filter). This merges each target
+   bucket's CDC changelog into its current state (changelog-only: no kv-snapshot
+   RPC, no RocksDB), shown in `EXPLAIN` as `FlussKvFullScanExec`. It uses the same
+   `(partition, bucket)` target computation as the bounded scan, so partition-column
+   equality prunes the scanned partitions; an empty target set yields an
+   `EmptyExec`. The merge applies `+I`/`+U`/`+A` as upserts and `-D` as deletes
+   (ignoring `-U`) per primary key, since a KV table's rows for a given PK live in
+   exactly one bucket.
 
-A query that is neither a complete PK equality, nor a complete bucket-key prefix
- equality, nor carries a `LIMIT` (e.g. a partial key, a non-key filter, or a bare
-`SELECT *`) fails cleanly with `UnsupportedQueryPattern` and never silently
- degrades to an unbounded full scan.
+   The full scan's completeness is bounded by changelog retention: rows whose
+   changelog has aged out of the retained window (compacted into kv snapshots and
+   dropped from the log) are not reflected. This is acceptable for the current
+   feature; full historical completeness would require a snapshot-backed reader.
 
 Partitioned KV tables need no extra handling for the point lookup: for a
 partitioned PK table the partition columns are part of the primary key, so the
