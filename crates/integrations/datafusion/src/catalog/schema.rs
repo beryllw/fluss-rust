@@ -138,6 +138,8 @@ impl SchemaProvider for FlussSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+
     use arrow::array::RecordBatch;
     use fluss::metadata::{DataLakeFormat, DataTypes, Schema as FlussSchema};
 

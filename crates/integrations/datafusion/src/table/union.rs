@@ -173,13 +173,29 @@ impl TableProvider for FlussUnionTableProvider {
             })?;
         let connection = real.connection();
         let table_path: fluss::metadata::TablePath = (&self.table_ref).into();
-        let admin = connection.get_admin().map_err(FlussDatafusionError::from)?;
-        let seam = LakeSeam::from_lake_snapshot(
-            &admin
-                .get_latest_lake_snapshot(&table_path)
-                .await
-                .map_err(FlussDatafusionError::from)?,
-        );
+        #[cfg(feature = "integration_tests")]
+        let seam = if let Some(seam) = crate::test_overrides::get_test_lake_seam_override(&table_path)
+        {
+            seam
+        } else {
+            let admin = connection.get_admin().map_err(FlussDatafusionError::from)?;
+            LakeSeam::from_lake_snapshot(
+                &admin
+                    .get_latest_lake_snapshot(&table_path)
+                    .await
+                    .map_err(FlussDatafusionError::from)?,
+            )
+        };
+        #[cfg(not(feature = "integration_tests"))]
+        let seam = {
+            let admin = connection.get_admin().map_err(FlussDatafusionError::from)?;
+            LakeSeam::from_lake_snapshot(
+                &admin
+                    .get_latest_lake_snapshot(&table_path)
+                    .await
+                    .map_err(FlussDatafusionError::from)?,
+            )
+        };
         let plan = plan_append_union(
             &self.fluss_schema,
             &self.lake_catalog_properties,

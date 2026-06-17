@@ -96,6 +96,11 @@ mod runtime;
 mod table;
 mod types;
 
+#[cfg(feature = "integration_tests")]
+mod test_overrides;
+
 pub use config::{FlussDatafusionOptions, RegisterCatalogOptions};
 pub use error::{FlussDatafusionError, Result};
 pub use install::FlussDatafusion;
+#[cfg(feature = "integration_tests")]
+pub use test_overrides::{clear_test_lake_seam_override, set_test_lake_seam_override};
