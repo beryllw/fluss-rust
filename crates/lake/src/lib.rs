@@ -37,16 +37,20 @@
 //! It is deliberately Arrow-native and free of any engine concept so that other
 //! Arrow consumers (Python / ADBC / Flight) can reuse the same union logic.
 
+pub mod append;
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod plan;
 pub mod reader;
 pub mod schema;
 pub mod snapshot;
 pub mod union;
 
+pub use append::{open_append_partition, plan_append_union};
 pub use config::LakeCatalogConfig;
 pub use error::{FlussLakeError, Result};
+pub use plan::UnionScanPlan;
 pub use reader::RecordBatchStream;
 pub use reader::log::LogTailReader;
 pub use snapshot::LakeSeam;
