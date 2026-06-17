@@ -42,7 +42,9 @@ pub mod config;
 pub mod error;
 pub mod reader;
 pub mod schema;
+pub mod snapshot;
 
 pub use config::LakeCatalogConfig;
 pub use error::{FlussLakeError, Result};
 pub use reader::RecordBatchStream;
+pub use snapshot::LakeSeam;
