@@ -37,6 +37,11 @@
 //! It is deliberately Arrow-native and free of any engine concept so that other
 //! Arrow consumers (Python / ADBC / Flight) can reuse the same union logic.
 
+pub mod config;
 pub mod error;
+pub mod reader;
+pub mod schema;
 
+pub use config::LakeCatalogConfig;
 pub use error::{FlussLakeError, Result};
+pub use reader::RecordBatchStream;
