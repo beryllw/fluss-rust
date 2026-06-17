@@ -37,6 +37,7 @@
 //! It is deliberately Arrow-native and free of any engine concept so that other
 //! Arrow consumers (Python / ADBC / Flight) can reuse the same union logic.
 
+pub mod catalog;
 pub mod config;
 pub mod error;
 pub mod reader;

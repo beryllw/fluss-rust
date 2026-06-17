@@ -26,6 +26,7 @@
 //! Primary-key cross-source merge (`merge`) lands in a later milestone.
 
 pub mod append;
+pub mod lake;
 
 use arrow::array::RecordBatch;
 use futures::stream::BoxStream;
