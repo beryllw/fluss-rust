@@ -43,8 +43,11 @@ pub mod error;
 pub mod reader;
 pub mod schema;
 pub mod snapshot;
+pub mod union;
 
 pub use config::LakeCatalogConfig;
 pub use error::{FlussLakeError, Result};
 pub use reader::RecordBatchStream;
+pub use reader::log::LogTailReader;
 pub use snapshot::LakeSeam;
+pub use union::{UnionPartition, union_append_partition};

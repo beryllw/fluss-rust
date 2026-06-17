@@ -27,6 +27,7 @@
 
 pub mod append;
 pub mod lake;
+pub mod log;
 
 use arrow::array::RecordBatch;
 use futures::stream::BoxStream;
