@@ -26,12 +26,12 @@
 //! `LIMIT`; it only resolves the per-bucket lake/log split and emits streams
 //! aligned to the projected Fluss schema.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use fluss::client::FlussConnection;
-use fluss::metadata::{Schema, TableInfo, TablePath};
+use fluss::metadata::{Schema, TablePath};
 use fluss::record::to_arrow_schema;
 
 use crate::catalog::{get_table_at_snapshot, open_catalog};
@@ -53,13 +53,13 @@ use crate::union::{UnionPartition, union_append_partition};
 /// data for this bucket yet", so the log starts at offset 0 and the lake side
 /// is empty for that bucket.
 pub fn plan_append_union(
-    table_info: &TableInfo,
-    lake_catalog_properties: &std::collections::HashMap<String, String>,
+    full_schema: &Schema,
+    lake_catalog_properties: &HashMap<String, String>,
     seam: &LakeSeam,
     projected_column_indices: Option<Vec<usize>>,
     targets: Vec<(Option<i64>, i32)>,
 ) -> Result<UnionScanPlan> {
-    let full_schema = table_info.get_schema();
+    let full_schema = full_schema;
     let projected_schema = fluss_projected_arrow_schema(full_schema, projected_column_indices.as_deref())?;
     let projected_column_names = fluss_projected_column_names(full_schema, projected_column_indices.as_deref());
 
@@ -92,8 +92,8 @@ pub fn plan_append_union(
 /// seam offset.
 pub async fn open_append_partition(
     connection: Arc<FlussConnection>,
-    table_info: &TableInfo,
-    lake_catalog_properties: &std::collections::HashMap<String, String>,
+    table_path: &TablePath,
+    lake_catalog_properties: &HashMap<String, String>,
     seam: &LakeSeam,
     plan: &UnionScanPlan,
     partition_idx: usize,
@@ -106,7 +106,6 @@ pub async fn open_append_partition(
         lake_catalog_properties,
     )?)
     .await?;
-    let table_path = table_info.get_table_path();
     let lake_table = get_table_at_snapshot(
         &catalog,
         table_path.database(),
@@ -163,32 +162,17 @@ mod tests {
     use super::*;
     use fluss::metadata::{DataTypes, TableBucket};
 
-    fn sample_table_info() -> TableInfo {
-        let table_path = TablePath::new("db", "t");
-        let schema = Schema::builder()
+    fn sample_schema() -> Schema {
+        Schema::builder()
             .column("id", DataTypes::int())
             .column("name", DataTypes::string())
             .build()
-            .unwrap();
-        TableInfo::new(
-            table_path,
-            1,
-            1,
-            schema,
-            Vec::new(),
-            Arc::from(Vec::<String>::new()),
-            2,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-            None,
-            0,
-            0,
-        )
+            .unwrap()
     }
 
     #[test]
     fn plans_targets_and_defaults_missing_seams_to_zero() {
-        let table_info = sample_table_info();
+        let table_info = sample_schema();
         let mut offsets = std::collections::HashMap::new();
         offsets.insert(TableBucket::new(1, 0), 123);
         let seam = LakeSeam::from_lake_snapshot(&fluss::metadata::LakeSnapshot::new(7, offsets));
@@ -203,7 +187,7 @@ mod tests {
 
     #[test]
     fn projection_maps_indices_to_names_and_schema() {
-        let table_info = sample_table_info();
+        let table_info = sample_schema();
         let seam = LakeSeam::from_lake_snapshot(&fluss::metadata::LakeSnapshot::new(
             1,
             std::collections::HashMap::new(),

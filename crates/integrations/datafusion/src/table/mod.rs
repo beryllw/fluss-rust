@@ -26,3 +26,4 @@
 pub(crate) mod kv;
 pub(crate) mod log;
 pub(crate) mod predicate;
+pub(crate) mod union;

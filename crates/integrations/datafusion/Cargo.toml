@@ -34,6 +34,7 @@ path = "examples/datafusion_demo.rs"
 
 [dependencies]
 fluss = { workspace = true }
+fluss-lake = { path = "../../lake" }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true }

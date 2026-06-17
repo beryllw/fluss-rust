@@ -29,3 +29,4 @@ pub(crate) mod log_scan;
 pub(crate) mod lookup;
 pub(crate) mod prefix_lookup;
 pub(crate) mod stream;
+pub(crate) mod union_scan;

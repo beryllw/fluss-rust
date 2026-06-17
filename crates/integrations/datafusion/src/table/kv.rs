@@ -335,6 +335,10 @@ mod tests {
 
     #[async_trait]
     impl FlussSource for StubSource {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
         async fn list_databases(&self) -> CrateResult<Vec<String>> {
             Ok(vec![])
         }

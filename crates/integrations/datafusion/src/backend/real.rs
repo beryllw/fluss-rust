@@ -47,6 +47,10 @@ impl RealFlussSource {
         Self { connection }
     }
 
+    pub(crate) fn connection(&self) -> Arc<FlussConnection> {
+        self.connection.clone()
+    }
+
     fn meta_from_table_info(table: &TableRef, info: &TableInfo) -> FlussTableMeta {
         let config = info.get_table_config();
         // Lake metadata is best-effort: a malformed `table.datalake.*` config must
@@ -129,6 +133,10 @@ fn build_key_row(key: &LookupKey) -> GenericRow<'_> {
 
 #[async_trait::async_trait]
 impl FlussSource for RealFlussSource {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     async fn list_databases(&self) -> Result<Vec<String>> {
         let admin = self.connection.get_admin()?;
         Ok(admin.list_databases().await?)

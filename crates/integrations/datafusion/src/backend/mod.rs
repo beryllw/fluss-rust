@@ -26,6 +26,7 @@
 //! One implementation exists:
 //! - [`real::RealFlussSource`] wraps the production fluss client.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -155,6 +156,12 @@ pub type LookupKey = Vec<KeyValue>;
 /// async metadata/lookup/scan calls dynamically.
 #[async_trait::async_trait]
 pub trait FlussSource: Send + Sync {
+    /// Runtime downcast hook for the small number of places that still need the
+    /// concrete production source (e.g. lake union needing the shared
+    /// `FlussConnection`). Keeps the general read path on the seam while avoiding
+    /// a public connection API on the trait itself.
+    fn as_any(&self) -> &dyn Any;
+
     /// Lists all database names in the cluster.
     async fn list_databases(&self) -> Result<Vec<String>>;
 
