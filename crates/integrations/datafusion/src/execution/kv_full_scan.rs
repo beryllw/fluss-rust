@@ -60,7 +60,7 @@ pub(crate) struct FlussKvFullScanExec {
     targets: Vec<(Option<i64>, i32)>,
     /// Output (post-projection) schema declared to DataFusion.
     projected_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FlussKvFullScanExec {
@@ -85,7 +85,7 @@ impl FlussKvFullScanExec {
             projection,
             targets,
             projected_schema,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -130,7 +130,7 @@ impl ExecutionPlan for FlussKvFullScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

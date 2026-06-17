@@ -28,14 +28,14 @@ keywords = ["fluss", "streaming-storage", "datalake"]
 
 [workspace]
 resolver = "2"
-members = ["crates/fluss", "crates/integrations/datafusion", "crates/fluss-test-cluster", "crates/examples", "bindings/python", "bindings/cpp", "bindings/elixir/native/fluss_nif"]
+members = ["crates/fluss", "crates/lake", "crates/integrations/datafusion", "crates/fluss-test-cluster", "crates/examples", "bindings/python", "bindings/cpp", "bindings/elixir/native/fluss_nif"]
 
 [workspace.dependencies]
 fluss = { package = "fluss-rs", version = "0.2.0", path = "crates/fluss", features = ["storage-all"] }
 tokio = { version = "1.44.2", features = ["full"] }
 clap = { version = "4.5.37", features = ["derive"] }
-arrow = { version = "57.0.0", features = ["ipc_compression", "ffi"] }
-datafusion = "52.0.0"
+arrow = { version = "58.0.0", features = ["ipc_compression", "ffi"] }
+datafusion = "53.0.0"
 bigdecimal = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

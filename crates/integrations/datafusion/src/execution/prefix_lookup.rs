@@ -51,7 +51,7 @@ pub(crate) struct FlussKvPrefixLookupExec {
     projected_schema: SchemaRef,
     /// Column indices into the full table schema; `None` means all columns.
     projection: Option<Vec<usize>>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FlussKvPrefixLookupExec {
@@ -77,7 +77,7 @@ impl FlussKvPrefixLookupExec {
             key,
             projected_schema,
             projection,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -114,7 +114,7 @@ impl ExecutionPlan for FlussKvPrefixLookupExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 

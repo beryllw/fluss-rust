@@ -69,7 +69,7 @@ pub(crate) struct FlussLogScanExec {
     /// `"FlussKvScanExec"` for KV tables. Lets one plan serve both without
     /// changing the log table's existing `EXPLAIN` output.
     plan_name: &'static str,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl FlussLogScanExec {
@@ -100,7 +100,7 @@ impl FlussLogScanExec {
             targets,
             projected_schema,
             plan_name,
-            properties,
+            properties: Arc::new(properties),
         }
     }
 }
@@ -155,7 +155,7 @@ impl ExecutionPlan for FlussLogScanExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
