@@ -23,7 +23,6 @@
 //! therefore visible in the same session.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;

@@ -58,3 +58,6 @@ pub mod example_smoke;
 
 #[cfg(feature = "integration_tests")]
 pub mod type_coverage;
+
+#[cfg(feature = "integration_tests")]
+pub mod lake_union_exec;
