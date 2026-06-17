@@ -22,7 +22,7 @@ use strum_macros::{Display, EnumString};
 /// This enum is typically used in metadata and configuration to distinguish
 /// between different table formats so that the appropriate integration and
 /// semantics can be applied.
-#[derive(Debug, EnumString, Display, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumString, Display)]
 #[strum(ascii_case_insensitive)]
 pub enum DataLakeFormat {
     #[strum(serialize = "paimon")]

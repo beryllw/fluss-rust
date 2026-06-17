@@ -48,6 +48,11 @@ impl RealFlussSource {
     }
 
     fn meta_from_table_info(table: &TableRef, info: &TableInfo) -> FlussTableMeta {
+        let config = info.get_table_config();
+        // Lake metadata is best-effort: a malformed `table.datalake.*` config must
+        // not break plain metadata loading, so a parse error degrades to "no lake".
+        let datalake_format = config.get_datalake_format().ok().flatten();
+        let lake_catalog_properties = config.get_lake_catalog_properties().ok().flatten();
         FlussTableMeta {
             table_ref: table.clone(),
             table_id: info.get_table_id(),
@@ -57,6 +62,8 @@ impl RealFlussSource {
             bucket_keys: info.get_bucket_keys().to_vec(),
             num_buckets: info.get_num_buckets(),
             partition_keys: info.get_partition_keys().to_vec(),
+            datalake_format,
+            lake_catalog_properties,
         }
     }
 }

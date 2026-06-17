@@ -1161,6 +1161,30 @@ impl TableConfig {
             .transpose()
     }
 
+    /// Extracts the lake catalog properties for the configured data lake format,
+    /// stripping the `table.datalake.<format>.` prefix so the result can be fed
+    /// directly to the lake catalog (e.g. Paimon's `warehouse` / `metastore` /
+    /// `uri`). Mirrors Fluss Java's `DataLakeUtils.extractLakeCatalogProperties`.
+    ///
+    /// Returns `Ok(None)` when no `table.datalake.format` is set. When the format
+    /// is set the returned map carries every `table.datalake.<format>.*` entry
+    /// with the prefix removed; it is empty if no catalog properties are present.
+    pub fn get_lake_catalog_properties(&self) -> Result<Option<HashMap<String, String>>> {
+        let Some(format) = self.get_datalake_format()? else {
+            return Ok(None);
+        };
+        let prefix = format!("table.datalake.{format}.");
+        let catalog_properties = self
+            .properties
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix(&prefix)
+                    .map(|stripped| (stripped.to_string(), v.clone()))
+            })
+            .collect();
+        Ok(Some(catalog_properties))
+    }
+
     pub fn get_kv_format(&self) -> Result<KvFormat> {
         // TODO: Consolidate configurations logic, constants, defaults in a single place
         const DEFAULT_KV_FORMAT: &str = "COMPACTED";
@@ -1655,5 +1679,50 @@ mod tests {
             0,
         );
         assert!(table_info.is_auto_partitioned());
+    }
+
+    #[test]
+    fn test_get_lake_catalog_properties_none_when_format_unset() {
+        let config = TableConfig::from_properties(HashMap::from([(
+            // a datalake catalog key with no format set must NOT be surfaced
+            "table.datalake.paimon.warehouse".to_string(),
+            "/wh".to_string(),
+        )]));
+        assert_eq!(config.get_lake_catalog_properties().unwrap(), None);
+    }
+
+    #[test]
+    fn test_get_lake_catalog_properties_strips_prefix() {
+        let config = TableConfig::from_properties(HashMap::from([
+            ("table.datalake.format".to_string(), "paimon".to_string()),
+            (
+                "table.datalake.paimon.metastore".to_string(),
+                "filesystem".to_string(),
+            ),
+            (
+                "table.datalake.paimon.warehouse".to_string(),
+                "/tmp/wh".to_string(),
+            ),
+            // a different-format prefix and unrelated keys must be excluded
+            (
+                "table.datalake.iceberg.warehouse".to_string(),
+                "/other".to_string(),
+            ),
+            ("table.log.format".to_string(), "ARROW".to_string()),
+        ]));
+        let props = config.get_lake_catalog_properties().unwrap().unwrap();
+        assert_eq!(props.get("metastore").map(String::as_str), Some("filesystem"));
+        assert_eq!(props.get("warehouse").map(String::as_str), Some("/tmp/wh"));
+        assert_eq!(props.len(), 2);
+    }
+
+    #[test]
+    fn test_get_lake_catalog_properties_empty_when_no_catalog_keys() {
+        let config = TableConfig::from_properties(HashMap::from([(
+            "table.datalake.format".to_string(),
+            "paimon".to_string(),
+        )]));
+        let props = config.get_lake_catalog_properties().unwrap().unwrap();
+        assert!(props.is_empty());
     }
 }

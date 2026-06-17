@@ -26,9 +26,11 @@
 //! One implementation exists:
 //! - [`real::RealFlussSource`] wraps the production fluss client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow::array::RecordBatch;
+use fluss::metadata::DataLakeFormat;
 
 use crate::error::Result;
 
@@ -94,11 +96,26 @@ pub struct FlussTableMeta {
     /// Partition-key column names, in partition-key order. Empty when the table
     /// is not partitioned.
     pub partition_keys: Vec<String>,
+    /// The configured data lake format (`table.datalake.format`), or `None` when
+    /// the table is not lake-enabled. Drives the union-read branch.
+    pub datalake_format: Option<DataLakeFormat>,
+    /// Lake catalog properties for the configured format, with the
+    /// `table.datalake.<format>.` prefix stripped (e.g. `warehouse`,
+    /// `metastore`). `None` when no format is set; possibly empty otherwise.
+    pub lake_catalog_properties: Option<HashMap<String, String>>,
 }
 
 impl FlussTableMeta {
     pub fn has_primary_key(&self) -> bool {
         !self.primary_keys.is_empty()
+    }
+
+    /// Whether this table is configured for Paimon lakehouse storage, i.e.
+    /// `table.datalake.format = paimon`. Other formats are not yet readable
+    /// through the union path. Consumed by the union-read branch (M2).
+    #[allow(dead_code)]
+    pub fn is_paimon_lake(&self) -> bool {
+        matches!(self.datalake_format, Some(DataLakeFormat::Paimon))
     }
 }
 
