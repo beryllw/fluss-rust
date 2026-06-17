@@ -45,6 +45,11 @@ pub enum FlussLakeError {
     /// An Arrow-level error (schema/array assembly).
     #[error("arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+
+    /// An internal invariant was violated (e.g. a bucket with no resolvable
+    /// offset). Should not happen for a well-formed table.
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 /// Result alias for the kernel.

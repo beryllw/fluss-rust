@@ -39,6 +39,13 @@ futures = "0.3"
 thiserror = "2.0"
 tokio = { workspace = true }
 
+[features]
+# Docker-backed integration tests against a real Fluss cluster. Requires a
+# running container runtime. The lake-read tests need no cluster and always run.
+integration_tests = []
+
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+futures = "0.3"
+fluss-test-cluster = { path = "../fluss-test-cluster" }
