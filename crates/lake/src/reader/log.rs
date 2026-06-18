@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fluss::client::FlussConnection;
+use arrow::array::RecordBatch;
 use fluss::metadata::TablePath;
 use fluss::rpc::message::OffsetSpec;
 use futures::StreamExt;
@@ -35,6 +36,23 @@ use futures::stream;
 
 use crate::error::{FlussLakeError, Result};
 use crate::reader::RecordBatchStream;
+
+/// Trims a polled log batch to the rows strictly before `snapshot_end`.
+///
+/// `snapshot_end` is the EXCLUSIVE latest offset captured at query start.
+/// `base_offset` is the batch's first record offset. A batch whose last record
+/// reaches or passes `snapshot_end` is sliced to keep only `snapshot_end -
+/// base_offset` rows; otherwise it is returned whole. Without this trim, a batch
+/// straddling the boundary would leak rows appended after the snapshot.
+fn trim_to_snapshot_end(batch: RecordBatch, base_offset: i64, snapshot_end: i64) -> RecordBatch {
+    let last_offset = base_offset + batch.num_rows() as i64 - 1;
+    if last_offset >= snapshot_end {
+        let keep = (snapshot_end - base_offset).max(0) as usize;
+        batch.slice(0, keep.min(batch.num_rows()))
+    } else {
+        batch
+    }
+}
 
 /// Reads the residual log tail of a single bucket: the records from
 /// `start_offset` (the lake seam) up to, but not including, `stop_offset`.
@@ -166,13 +184,68 @@ impl LogTailReader for FlussLogTailReader {
                 continue;
             }
             for scan_batch in polled {
-                reached_end |= scan_batch.last_offset() >= snapshot_end.saturating_sub(1);
-                let batch = scan_batch.into_batch();
+                let base_offset = scan_batch.base_offset();
+                let last_offset = scan_batch.last_offset();
+                reached_end |= last_offset >= snapshot_end.saturating_sub(1);
+                let batch =
+                    trim_to_snapshot_end(scan_batch.into_batch(), base_offset, snapshot_end);
                 if batch.num_rows() > 0 {
                     batches.push(Ok(batch));
                 }
             }
         }
         Ok(stream::iter(batches).boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    fn batch(base: i64, n: i64) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ids: Vec<i32> = (base..base + n).map(|v| v as i32).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    fn ids(b: &RecordBatch) -> Vec<i32> {
+        b.column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn batch_fully_within_bounds_is_kept_whole() {
+        // offsets 10..14, snapshot_end=20 (exclusive) -> keep all
+        let out = trim_to_snapshot_end(batch(10, 5), 10, 20);
+        assert_eq!(ids(&out), vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn batch_crossing_boundary_is_trimmed() {
+        // offsets 10..19, snapshot_end=15 (exclusive) -> keep offsets 10..14
+        let out = trim_to_snapshot_end(batch(10, 10), 10, 15);
+        assert_eq!(ids(&out), vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn batch_ending_exactly_at_boundary_minus_one_is_kept_whole() {
+        // last offset = 14, snapshot_end = 15 -> last_offset(14) < 15, keep all
+        let out = trim_to_snapshot_end(batch(10, 5), 10, 15);
+        assert_eq!(ids(&out), vec![10, 11, 12, 13, 14]);
+    }
+
+    #[test]
+    fn batch_entirely_past_boundary_is_emptied() {
+        // offsets 20..24, snapshot_end=15 -> keep 0 rows
+        let out = trim_to_snapshot_end(batch(20, 5), 20, 15);
+        assert_eq!(out.num_rows(), 0);
     }
 }

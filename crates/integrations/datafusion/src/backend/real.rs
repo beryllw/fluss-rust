@@ -329,8 +329,20 @@ impl FlussSource for RealFlussSource {
             }
 
             for scan_batch in polled {
+                let base_offset = scan_batch.base_offset();
+                let last_offset = scan_batch.last_offset();
                 reached_snapshot_end |= scan_batch_reaches_snapshot_end(&scan_batch, snapshot_end);
                 let batch = scan_batch.into_batch();
+                // `snapshot_end` is the exclusive latest offset captured at query
+                // start. Trim a boundary-crossing batch to rows with offset <
+                // snapshot_end so records appended after the snapshot do not leak
+                // into this finite scan.
+                let batch = if last_offset >= snapshot_end {
+                    let keep = (snapshot_end - base_offset).max(0) as usize;
+                    batch.slice(0, keep.min(batch.num_rows()))
+                } else {
+                    batch
+                };
                 if let Some(limit) = row_limit {
                     collect_rows_until_limit(&mut batches, batch, &mut rows_collected, limit);
                     if rows_collected >= limit {
