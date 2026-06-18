@@ -1110,20 +1110,32 @@ impl LogRecordBatch {
     /// Returns the record batch directly without creating an iterator.
     /// This is more efficient when you need the entire batch rather than
     /// iterating row-by-row.
+    ///
+    /// Like [`Self::records`], a non-append-only (KV changelog) batch prepends a
+    /// `record_count`-byte change-type vector before the Arrow payload, so the
+    /// payload starts after it. Reading from `RECORDS_OFFSET` unconditionally
+    /// would feed the change-type bytes to the Arrow parser for such batches.
     pub fn record_batch(&self, read_context: &ReadContext) -> Result<RecordBatch> {
-        if self.record_count() == 0 {
+        let record_count = self.record_count();
+        if record_count == 0 {
             // Return empty batch with correct schema
             return Ok(RecordBatch::new_empty(read_context.target_schema.clone()));
         }
 
+        let arrow_data_offset = if self.is_append_only() {
+            RECORDS_OFFSET
+        } else {
+            RECORDS_OFFSET + record_count as usize
+        };
+
         let data = self
             .data
-            .get(RECORDS_OFFSET..)
+            .get(arrow_data_offset..)
             .ok_or_else(|| Error::UnexpectedError {
                 message: format!(
-                    "Corrupt log record batch: data length {} is less than RECORDS_OFFSET {}",
+                    "Corrupt log record batch: data length {} is less than arrow data offset {}",
                     self.data.len(),
-                    RECORDS_OFFSET
+                    arrow_data_offset
                 ),
                 source: None,
             })?;
