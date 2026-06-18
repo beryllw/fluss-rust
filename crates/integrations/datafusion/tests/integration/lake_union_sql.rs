@@ -25,14 +25,13 @@ use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as
 use datafusion::execution::context::SessionContext;
 use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
 use fluss_datafusion::{
-    FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions,
-    clear_test_lake_seam_override, set_test_lake_seam_override,
+    FlussDatafusion, RegisterCatalogOptions, clear_test_lake_seam_override,
+    set_test_lake_seam_override,
 };
 use fluss_test_cluster::FlussTestingClusterBuilder;
-use futures::TryStreamExt;
 use paimon::catalog::Identifier;
 use paimon::spec::{DataType, IntType, Schema as PaimonSchema, VarCharType};
-use paimon::{Catalog, CatalogFactory, CatalogOptions, Options};
+use paimon::{CatalogFactory, CatalogOptions, Options};
 
 use fluss_lake::LakeSeam;
 

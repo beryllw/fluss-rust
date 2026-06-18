@@ -43,7 +43,6 @@ use fluss_lake::{LakeSeam, plan_append_union};
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
 use crate::execution::union_scan::FlussUnionScanExec;
-use crate::table::predicate::{analyze_partition_filters, is_partition_equality};
 use crate::types::record_batch::normalize_projection;
 
 use arrow::datatypes::SchemaRef;
@@ -107,21 +106,12 @@ impl TableProvider for FlussUnionTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        if self.partition_keys.is_empty() {
-            return Ok(filters
-                .iter()
-                .map(|_| TableProviderFilterPushDown::Unsupported)
-                .collect());
-        }
+        // Only non-partitioned lake tables are supported today (see `scan`), and
+        // value/partition filters are not pushed to the union: residual filters
+        // are re-applied by a `FilterExec` above the scan.
         Ok(filters
             .iter()
-            .map(|filter| {
-                if is_partition_equality(filter, &self.partition_keys) {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
+            .map(|_| TableProviderFilterPushDown::Unsupported)
             .collect())
     }
 
@@ -129,34 +119,22 @@ impl TableProvider for FlussUnionTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        filters: &[Expr],
+        _filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let (projection, projected_schema) = normalize_projection(projection, &self.schema)?;
 
-        let buckets = 0..self.num_buckets;
-        let targets: Vec<(Option<i64>, i32)> = if self.partition_keys.is_empty() {
-            buckets.map(|b| (None, b)).collect()
-        } else {
-            let partitions = self.source.list_partitions(&self.table_ref).await?;
-            let bindings = analyze_partition_filters(filters, &self.partition_keys);
-            partitions
-                .into_iter()
-                .filter(|partition| {
-                    bindings.iter().all(|(k, v)| {
-                        partition
-                            .values
-                            .iter()
-                            .any(|(pk, pv)| pk == k && pv == v)
-                    })
-                })
-                .flat_map(|partition| {
-                    buckets
-                        .clone()
-                        .map(move |b| (Some(partition.partition_id), b))
-                })
-                .collect()
-        };
+        // Partitioned lake union is not supported yet: the kernel filters the
+        // lake read by bucket only, so a partitioned table would mix partitions.
+        // Fail at plan time with a clear message rather than at execution.
+        if !self.partition_keys.is_empty() {
+            return Err(FlussDatafusionError::UnsupportedQueryPattern(
+                "lake union read of partitioned tables is not yet supported".to_string(),
+            )
+            .into());
+        }
+
+        let targets: Vec<(Option<i64>, i32)> = (0..self.num_buckets).map(|b| (None, b)).collect();
 
         if targets.is_empty() {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));

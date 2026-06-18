@@ -102,6 +102,15 @@ pub async fn open_append_partition(
         FlussLakeError::Internal(format!("partition index {partition_idx} out of bounds"))
     })?;
 
+    // Partitioned lake union is not supported yet: the lake read is filtered by
+    // bucket only, so a partitioned table (where buckets repeat across
+    // partitions) would mix partitions. Reject rather than return wrong rows.
+    if partition.partition_id.is_some() {
+        return Err(FlussLakeError::Internal(
+            "lake union read of partitioned tables is not yet supported".to_string(),
+        ));
+    }
+
     let catalog = open_catalog(&LakeCatalogConfig::from_catalog_properties(
         lake_catalog_properties,
     )?)
@@ -113,7 +122,14 @@ pub async fn open_append_partition(
         seam.snapshot_id(),
     )
     .await?;
-    let lake_stream = read_lake_table(&lake_table, plan.projected_column_names.as_deref()).await?;
+    // Restrict the lake read to this partition's bucket so each execution
+    // partition reads only its own lake data instead of the whole snapshot.
+    let lake_stream = read_lake_table(
+        &lake_table,
+        plan.projected_column_names.as_deref(),
+        Some(partition.bucket),
+    )
+    .await?;
 
     let log_reader = FlussLogTailReader::new(connection, TablePath::new(table_path.database(), table_path.table()));
     union_append_partition(

@@ -48,6 +48,10 @@ integration_tests = []
 
 [dev-dependencies]
 fluss-test-cluster = { path = "../../fluss-test-cluster" }
+# Gated SQL e2e seeds a Paimon warehouse directly (no tiering service in the
+# harness), so the integration tests need the Paimon writer + a temp dir.
+paimon = { path = "../../../../paimon-rust/crates/paimon" }
+tempfile = "3"
 tokio = { workspace = true }
 arrow = { workspace = true }
 futures = "0.3"

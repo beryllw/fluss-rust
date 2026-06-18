@@ -22,6 +22,11 @@
 //! projection is pushed down by Fluss column name, which also drops the lake
 //! system columns. The returned stream is `'static` (Paimon clones the splits /
 //! file IO into it), so the borrowed `Table` need not outlive it.
+//!
+//! When a `bucket` is given, the planned splits are filtered to that bucket so a
+//! per-bucket union execution partition reads ONLY its own lake data. This
+//! relies on Fluss and Paimon assigning the same bucket id to a row, which holds
+//! because a lake-enabled Fluss table buckets with the data lake's algorithm.
 
 use futures::StreamExt;
 use paimon::Table;
@@ -35,9 +40,14 @@ use crate::reader::RecordBatchStream;
 /// `projection` is the list of Fluss column names to read, in output order;
 /// `None` reads the table's full declared schema. Passing the Fluss column names
 /// is also what excludes Paimon system columns from the lake batches.
+///
+/// `bucket` restricts the read to one Paimon bucket; `None` reads every bucket.
+/// A per-bucket union partition MUST pass its target bucket, otherwise every
+/// partition would re-emit the whole lake snapshot.
 pub async fn read_lake_table(
     table: &Table,
     projection: Option<&[String]>,
+    bucket: Option<i32>,
 ) -> Result<RecordBatchStream> {
     let mut read_builder = table.new_read_builder();
     if let Some(columns) = projection {
@@ -46,6 +56,15 @@ pub async fn read_lake_table(
     }
     let plan = read_builder.new_scan().plan().await?;
     let read = read_builder.new_read()?;
-    let stream = read.to_arrow(plan.splits())?;
+    let splits = match bucket {
+        Some(target) => plan
+            .splits()
+            .iter()
+            .filter(|split| split.bucket() == target)
+            .cloned()
+            .collect(),
+        None => plan.splits().to_vec(),
+    };
+    let stream = read.to_arrow(&splits)?;
     Ok(stream.map(|item| item.map_err(FlussLakeError::from)).boxed())
 }

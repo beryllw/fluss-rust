@@ -2048,6 +2048,8 @@ dependencies = [
  "fluss-rs",
  "fluss-test-cluster",
  "futures",
+ "paimon",
+ "tempfile",
  "tokio",
 ]
 
