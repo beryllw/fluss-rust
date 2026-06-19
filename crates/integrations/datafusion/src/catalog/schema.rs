@@ -74,10 +74,31 @@ impl SchemaProvider for FlussSchemaProvider {
             Err(FlussDatafusionError::TableNotFound(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        if entry.meta.has_primary_key() {
-            // KV table: point lookup (full PK equality) or bounded `LIMIT` scan.
-            // `num_buckets`/`partition_keys` drive the bounded-scan targets and
-            // partition pruning, mirroring the log provider.
+        if entry.meta.is_paimon_lake() {
+            // Lake-enabled table (append/log OR primary-key): delegate to the
+            // fluss-lake kernel, which reads the lake snapshot unioned with the
+            // residual Fluss log tail. This MUST take precedence over the KV
+            // branch: a lake-enabled PK table tiers data into the lake, so a
+            // Fluss-only KV read would miss rows already compacted out of the
+            // changelog. The kernel picks append stitch vs PK merge internally.
+            let provider = FlussUnionTableProvider::new(
+                self.loader.source(),
+                table_ref,
+                entry.arrow_schema,
+                entry.meta.schema.clone(),
+                entry.meta.num_buckets,
+                entry.meta.partition_keys.clone(),
+                entry
+                    .meta
+                    .lake_catalog_properties
+                    .clone()
+                    .unwrap_or_default(),
+            );
+            Ok(Some(Arc::new(provider)))
+        } else if entry.meta.has_primary_key() {
+            // Non-lake KV table: point lookup (full PK equality) or bounded
+            // `LIMIT` scan. `num_buckets`/`partition_keys` drive the bounded-scan
+            // targets and partition pruning, mirroring the log provider.
             let provider = FlussKvTableProvider::new(
                 self.loader.source(),
                 table_ref,
@@ -86,23 +107,6 @@ impl SchemaProvider for FlussSchemaProvider {
                 entry.meta.bucket_keys.clone(),
                 entry.meta.num_buckets,
                 entry.meta.partition_keys.clone(),
-            );
-            Ok(Some(Arc::new(provider)))
-        } else if entry.meta.is_paimon_lake() {
-            // Lake-enabled append/log table: delegate to the fluss-lake kernel
-            // (lake snapshot + residual Fluss log tail) instead of the plain log
-            // snapshot scan.
-            let provider = FlussUnionTableProvider::new(
-                self.loader.source(),
-                table_ref,
-                entry.arrow_schema,
-                entry.meta.schema.clone(),
-                entry.meta.num_buckets,
-                entry.meta.partition_keys.clone(),
-                entry.meta
-                    .lake_catalog_properties
-                    .clone()
-                    .unwrap_or_default(),
             );
             Ok(Some(Arc::new(provider)))
         } else {
@@ -245,5 +249,68 @@ mod tests {
 
         let provider = schema_provider.table("t").await.unwrap().unwrap();
         assert!(provider.as_any().is::<FlussUnionTableProvider>());
+    }
+
+    #[tokio::test]
+    async fn lake_enabled_pk_table_uses_union_provider_not_kv() {
+        // A lake-enabled primary-key table must route to the union provider so
+        // the read covers lake-tiered rows; the Fluss-only KV provider would miss
+        // data already compacted out of the changelog.
+        let fluss_schema = FlussSchema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .unwrap();
+        let meta = FlussTableMeta {
+            table_ref: TableRef::new("db", "t"),
+            table_id: 1,
+            schema_id: 1,
+            schema: fluss_schema,
+            primary_keys: vec!["id".to_string()],
+            bucket_keys: vec!["id".to_string()],
+            num_buckets: 1,
+            partition_keys: vec![],
+            datalake_format: Some(DataLakeFormat::Paimon),
+            lake_catalog_properties: Some(HashMap::from([(
+                "warehouse".to_string(),
+                "/tmp/wh".to_string(),
+            )])),
+        };
+        let loader = Arc::new(MetadataLoader::new(Arc::new(StubSource { meta })));
+        let schema_provider = FlussSchemaProvider::new("db".to_string(), loader);
+
+        let provider = schema_provider.table("t").await.unwrap().unwrap();
+        assert!(
+            provider.as_any().is::<FlussUnionTableProvider>(),
+            "lake PK table must use the union provider, not KV"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_lake_pk_table_uses_kv_provider() {
+        let fluss_schema = FlussSchema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .primary_key(vec!["id".to_string()])
+            .build()
+            .unwrap();
+        let meta = FlussTableMeta {
+            table_ref: TableRef::new("db", "t"),
+            table_id: 1,
+            schema_id: 1,
+            schema: fluss_schema,
+            primary_keys: vec!["id".to_string()],
+            bucket_keys: vec!["id".to_string()],
+            num_buckets: 1,
+            partition_keys: vec![],
+            datalake_format: None,
+            lake_catalog_properties: None,
+        };
+        let loader = Arc::new(MetadataLoader::new(Arc::new(StubSource { meta })));
+        let schema_provider = FlussSchemaProvider::new("db".to_string(), loader);
+
+        let provider = schema_provider.table("t").await.unwrap().unwrap();
+        assert!(provider.as_any().is::<FlussKvTableProvider>());
     }
 }

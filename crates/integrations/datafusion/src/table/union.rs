@@ -45,7 +45,8 @@ use crate::types::record_batch::normalize_projection;
 
 use arrow::datatypes::SchemaRef;
 
-/// A Fluss append/log table with lakehouse storage enabled (`table.datalake.format = paimon`).
+/// A lake-enabled Fluss table (`table.datalake.format = paimon`), append/log or
+/// primary-key. The kernel selects append stitch vs PK merge internally.
 pub(crate) struct FlussUnionTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
