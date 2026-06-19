@@ -72,11 +72,6 @@ impl LakeSeam {
     pub fn seam_offset(&self, partition_id: Option<i64>, bucket: i32) -> Option<i64> {
         self.bucket_seams.get(&(partition_id, bucket)).copied()
     }
-
-    /// All seam entries, `(partition_id, bucket) -> log start offset`.
-    pub fn bucket_seams(&self) -> &HashMap<BucketKey, i64> {
-        &self.bucket_seams
-    }
 }
 
 #[cfg(test)]
@@ -100,6 +95,5 @@ mod tests {
         assert_eq!(seam.seam_offset(Some(5), 1), Some(250));
         // a bucket with no tiered data has no seam
         assert_eq!(seam.seam_offset(None, 9), None);
-        assert_eq!(seam.bucket_seams().len(), 2);
     }
 }

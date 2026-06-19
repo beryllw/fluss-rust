@@ -62,17 +62,6 @@ pub fn align_batch_to(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordB
     RecordBatch::try_new(Arc::clone(target), columns).map_err(FlussLakeError::from)
 }
 
-/// Whether `batch` already has exactly `target`'s fields in the same order (so
-/// alignment can be skipped). Compares name + data type only.
-pub fn matches_schema(batch: &RecordBatch, target: &SchemaRef) -> bool {
-    let s = batch.schema();
-    s.fields().len() == target.fields().len()
-        && s.fields()
-            .iter()
-            .zip(target.fields())
-            .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,18 +130,5 @@ mod tests {
         .unwrap();
         let err = align_batch_to(&batch, &target()).unwrap_err();
         assert!(matches!(err, FlussLakeError::SchemaMismatch(_)));
-    }
-
-    #[test]
-    fn matches_schema_detects_identity() {
-        let batch = RecordBatch::try_new(
-            target(),
-            vec![
-                Arc::new(Int32Array::from(vec![1])),
-                Arc::new(StringArray::from(vec!["a"])),
-            ],
-        )
-        .unwrap();
-        assert!(matches_schema(&batch, &target()));
     }
 }

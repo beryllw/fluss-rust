@@ -25,11 +25,13 @@
 //!
 //! Primary-key cross-source merge (`merge`) lands in a later milestone.
 
-pub mod append;
-pub mod changelog;
 pub mod lake;
 pub mod log;
-pub mod merge;
+
+// Internal per-table-kind readers; reachable only within the kernel.
+pub(crate) mod append;
+pub(crate) mod changelog;
+pub(crate) mod merge;
 
 use arrow::array::RecordBatch;
 use futures::stream::BoxStream;

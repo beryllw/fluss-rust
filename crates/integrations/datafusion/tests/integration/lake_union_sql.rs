@@ -26,14 +26,12 @@ use datafusion::execution::context::SessionContext;
 use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
 use fluss_datafusion::{
     FlussDatafusion, RegisterCatalogOptions, clear_test_lake_seam_override,
-    set_test_lake_seam_override,
+    set_test_lake_snapshot_override,
 };
 use fluss_test_cluster::FlussTestingClusterBuilder;
 use paimon::catalog::Identifier;
 use paimon::spec::{DataType, IntType, Schema as PaimonSchema, VarCharType};
 use paimon::{CatalogFactory, CatalogOptions, Options};
-
-use fluss_lake::LakeSeam;
 
 use crate::integration::utils::helpers::{collect_i32, options};
 
@@ -64,7 +62,9 @@ fn paimon_batch() -> RecordBatch {
 async fn seed_paimon_warehouse(warehouse: &str) {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
-    let catalog = CatalogFactory::create(options).await.expect("create paimon catalog");
+    let catalog = CatalogFactory::create(options)
+        .await
+        .expect("create paimon catalog");
     catalog
         .create_database(DATABASE, true, HashMap::new())
         .await
@@ -133,7 +133,10 @@ async fn sql_reads_lake_plus_log_tail_via_union_provider() {
         .property("table.datalake.paimon.warehouse", &warehouse)
         .build()
         .unwrap();
-    admin.create_table(&table_path, &descriptor, true).await.unwrap();
+    admin
+        .create_table(&table_path, &descriptor, true)
+        .await
+        .unwrap();
     let fluss_table = connection.get_table(&table_path).await.unwrap();
     let writer = fluss_table.new_append().unwrap().create_writer().unwrap();
     writer.append_arrow_batch(fluss_log_batch()).unwrap();
@@ -141,13 +144,17 @@ async fn sql_reads_lake_plus_log_tail_via_union_provider() {
     wait_for_offsets(&connection, &table_path).await;
 
     let table_info = admin.get_table_info(&table_path).await.unwrap();
-    let seam = LakeSeam::from_lake_snapshot(&fluss::metadata::LakeSnapshot::new(
-        1,
-        HashMap::from([(TableBucket::new(table_info.get_table_id(), 0), 2)]),
-    ));
-    set_test_lake_seam_override(&table_path, seam);
+    set_test_lake_snapshot_override(
+        &table_path,
+        fluss::metadata::LakeSnapshot::new(
+            1,
+            HashMap::from([(TableBucket::new(table_info.get_table_id(), 0), 2)]),
+        ),
+    );
 
-    let fd = FlussDatafusion::new(connection.clone(), options()).await.unwrap();
+    let fd = FlussDatafusion::new(connection.clone(), options())
+        .await
+        .unwrap();
     let ctx = SessionContext::new();
     fd.register_catalog(&ctx, CATALOG, RegisterCatalogOptions::default())
         .await

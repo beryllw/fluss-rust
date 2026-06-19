@@ -38,18 +38,20 @@
 //! Arrow consumers (Python / ADBC / Flight) can reuse the same union logic.
 
 pub mod api;
-pub mod append;
 pub mod catalog;
 pub mod config;
 pub mod error;
-pub mod pk;
-pub mod plan;
 pub mod reader;
-pub mod schema;
-pub mod snapshot;
+
+// Internal kernel modules: not part of the public surface. The public read API
+// is the `FlussLake*` façade re-exported below.
+mod append;
+mod pk;
+mod schema;
+mod snapshot;
 #[cfg(feature = "integration_tests")]
-pub mod test_overrides;
-pub mod union;
+mod test_overrides;
+mod union;
 
 pub use api::{
     FlussLakeFilter, FlussLakePartitionFilter, FlussLakePartitionIdentity, FlussLakePlanStatistics,
@@ -59,13 +61,6 @@ pub use api::{
 pub use config::LakeCatalogConfig;
 pub use error::{FlussLakeError, Result};
 pub use reader::RecordBatchStream;
-
-// Transitional re-exports: the previous M1/M2 surface that `fluss-datafusion`
-// still consumes until it is switched onto the `FlussLake*` façade. Scheduled to
-// become internal (DESIGN.md migration Step 5).
-pub use append::{open_append_partition, plan_append_union};
-pub use plan::UnionScanPlan;
-pub use snapshot::LakeSeam;
 #[cfg(feature = "integration_tests")]
 pub use test_overrides::{
     clear_test_lake_seam_override, set_test_lake_seam_override, set_test_lake_snapshot_override,

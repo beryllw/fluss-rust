@@ -15,18 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lake-enabled append/log `TableProvider`.
+//! Lake-enabled `TableProvider`, backed entirely by the `fluss-lake` kernel.
 //!
-//! This provider reuses the existing Fluss metadata / partition-pruning logic to
-//! compute the `(partition_id, bucket)` scan targets, then delegates execution to
-//! the `fluss-lake` kernel (`plan_append_union` + `open_append_partition`).
+//! This provider is a thin adapter: it constructs a [`FlussLakeTable`], plans the
+//! read, and hands the plan + reader to a [`FlussUnionScanExec`]. All lake+log
+//! union semantics (seam resolution, lake planning, append stitch, PK merge) live
+//! inside `fluss-lake`; the connector never sees seams, lake splits, or merge
+//! state.
 //!
-//! Phase M2 scope is intentionally narrow:
-//! - only **append/log** tables (`!has_primary_key()`), because PK cross-source
-//!   merge is an M3 concern in the kernel;
-//! - no value-filter pushdown yet — partition equality remains `Inexact` for
-//!   best-effort pruning, everything else is `Unsupported`, keeping residual
-//!   `FilterExec`s above the scan.
+//! Value-filter pushdown is not offered yet: every filter stays `Unsupported`, so
+//! residual `FilterExec`s remain above the scan.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -35,10 +33,10 @@ use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result as DfResult;
 use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
-use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::prelude::Expr;
-use fluss_lake::{LakeSeam, plan_append_union};
+use fluss_lake::FlussLakeTable;
 
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
@@ -124,19 +122,7 @@ impl TableProvider for FlussUnionTableProvider {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let (projection, projected_schema) = normalize_projection(projection, &self.schema)?;
 
-        // Partitioned lake union is not supported yet: the kernel filters the
-        // lake read by bucket only, so a partitioned table would mix partitions.
-        // Fail at plan time with a clear message rather than at execution.
-        if !self.partition_keys.is_empty() {
-            return Err(FlussDatafusionError::UnsupportedQueryPattern(
-                "lake union read of partitioned tables is not yet supported".to_string(),
-            )
-            .into());
-        }
-
-        let targets: Vec<(Option<i64>, i32)> = (0..self.num_buckets).map(|b| (None, b)).collect();
-
-        if targets.is_empty() {
+        if self.num_buckets == 0 {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
         }
 
@@ -151,44 +137,29 @@ impl TableProvider for FlussUnionTableProvider {
             })?;
         let connection = real.connection();
         let table_path: fluss::metadata::TablePath = (&self.table_ref).into();
-        #[cfg(feature = "integration_tests")]
-        let seam = if let Some(seam) = crate::test_overrides::get_test_lake_seam_override(&table_path)
-        {
-            seam
-        } else {
-            let admin = connection.get_admin().map_err(FlussDatafusionError::from)?;
-            LakeSeam::from_lake_snapshot(
-                &admin
-                    .get_latest_lake_snapshot(&table_path)
-                    .await
-                    .map_err(FlussDatafusionError::from)?,
-            )
-        };
-        #[cfg(not(feature = "integration_tests"))]
-        let seam = {
-            let admin = connection.get_admin().map_err(FlussDatafusionError::from)?;
-            LakeSeam::from_lake_snapshot(
-                &admin
-                    .get_latest_lake_snapshot(&table_path)
-                    .await
-                    .map_err(FlussDatafusionError::from)?,
-            )
-        };
-        let plan = plan_append_union(
-            &self.fluss_schema,
-            &self.lake_catalog_properties,
-            &seam,
-            projection.clone(),
-            targets,
-        )
-        .map_err(|e| FlussDatafusionError::Internal(e.to_string()))?;
 
-        Ok(Arc::new(FlussUnionScanExec::new(
+        // The kernel owns everything: seam resolution, lake planning, append
+        // stitch / PK merge. We only build the scan, plan it, and create a reader.
+        let lake_table = FlussLakeTable::new(
             connection,
             table_path,
+            self.fluss_schema.clone(),
+            self.num_buckets,
+            self.partition_keys.clone(),
             self.lake_catalog_properties.clone(),
-            seam,
-            plan,
-        )))
+        );
+        let mut scan = lake_table.new_scan();
+        if let Some(indices) = projection {
+            scan = scan.with_projection(indices);
+        }
+        let plan = scan
+            .plan()
+            .await
+            .map_err(|e| FlussDatafusionError::Internal(e.to_string()))?;
+        let read = scan
+            .new_read()
+            .map_err(|e| FlussDatafusionError::Internal(e.to_string()))?;
+
+        Ok(Arc::new(FlussUnionScanExec::new(plan, read)))
     }
 }

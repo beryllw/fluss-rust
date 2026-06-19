@@ -96,11 +96,14 @@ mod runtime;
 mod table;
 mod types;
 
-#[cfg(feature = "integration_tests")]
-mod test_overrides;
-
 pub use config::{FlussDatafusionOptions, RegisterCatalogOptions};
 pub use error::{FlussDatafusionError, Result};
 pub use install::FlussDatafusion;
+
+// The lake seam test override lives in `fluss-lake` (the kernel resolves it
+// inside `FlussLakeScan::plan()`); re-export it so gated SQL tests can seed a
+// seam without the connector owning a duplicate registry.
 #[cfg(feature = "integration_tests")]
-pub use test_overrides::{clear_test_lake_seam_override, set_test_lake_seam_override};
+pub use fluss_lake::{
+    clear_test_lake_seam_override, set_test_lake_seam_override, set_test_lake_snapshot_override,
+};

@@ -43,8 +43,9 @@ futures = "0.3"
 
 [features]
 # Docker-backed integration tests against a real Fluss cluster. Requires a
-# running container runtime.
-integration_tests = []
+# running container runtime. Enables the matching feature in fluss-lake so the
+# kernel's test-only seam override is available.
+integration_tests = ["fluss-lake/integration_tests"]
 
 [dev-dependencies]
 fluss-test-cluster = { path = "../../fluss-test-cluster" }
