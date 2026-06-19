@@ -26,9 +26,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use fluss::client::FlussConnection;
-use arrow::array::RecordBatch;
 use fluss::metadata::TablePath;
 use fluss::rpc::message::OffsetSpec;
 use futures::StreamExt;

@@ -66,5 +66,7 @@ pub async fn read_lake_table(
         None => plan.splits().to_vec(),
     };
     let stream = read.to_arrow(&splits)?;
-    Ok(stream.map(|item| item.map_err(FlussLakeError::from)).boxed())
+    Ok(stream
+        .map(|item| item.map_err(FlussLakeError::from))
+        .boxed())
 }

@@ -59,9 +59,10 @@ pub fn plan_append_union(
     projected_column_indices: Option<Vec<usize>>,
     targets: Vec<(Option<i64>, i32)>,
 ) -> Result<UnionScanPlan> {
-    let full_schema = full_schema;
-    let projected_schema = fluss_projected_arrow_schema(full_schema, projected_column_indices.as_deref())?;
-    let projected_column_names = fluss_projected_column_names(full_schema, projected_column_indices.as_deref());
+    let projected_schema =
+        fluss_projected_arrow_schema(full_schema, projected_column_indices.as_deref())?;
+    let projected_column_names =
+        fluss_projected_column_names(full_schema, projected_column_indices.as_deref());
 
     let partitions = targets
         .into_iter()
@@ -85,27 +86,30 @@ pub fn plan_append_union(
     ))
 }
 
-/// Opens one planned append-union partition as a `lake ++ log_tail` stream.
-///
-/// The table is opened in Paimon at `seam.snapshot_id()`, projected by column
-/// name, then concatenated with the Fluss log tail starting at the partition's
-/// seam offset.
-pub async fn open_append_partition(
+/// Internal append/log execution spec for one logical read split.
+#[derive(Debug, Clone)]
+pub(crate) struct AppendSplitSpec {
+    pub partition_id: Option<i64>,
+    pub bucket: i32,
+    pub snapshot_id: i64,
+    pub log_start_offset: i64,
+    pub log_stop_offset: Option<i64>,
+}
+
+/// Opens one append/log logical read split as a `lake ++ log_tail` stream.
+pub(crate) async fn open_append_split(
     connection: Arc<FlussConnection>,
     table_path: &TablePath,
     lake_catalog_properties: &HashMap<String, String>,
-    seam: &LakeSeam,
-    plan: &UnionScanPlan,
-    partition_idx: usize,
+    projected_schema: SchemaRef,
+    projected_column_names: Option<&[String]>,
+    projected_column_indices: Option<Vec<usize>>,
+    split: &AppendSplitSpec,
 ) -> Result<RecordBatchStream> {
-    let partition = plan.partitions.get(partition_idx).ok_or_else(|| {
-        FlussLakeError::Internal(format!("partition index {partition_idx} out of bounds"))
-    })?;
-
     // Partitioned lake union is not supported yet: the lake read is filtered by
     // bucket only, so a partitioned table (where buckets repeat across
     // partitions) would mix partitions. Reject rather than return wrong rows.
-    if partition.partition_id.is_some() {
+    if split.partition_id.is_some() {
         return Err(FlussLakeError::Internal(
             "lake union read of partitioned tables is not yet supported".to_string(),
         ));
@@ -119,25 +123,60 @@ pub async fn open_append_partition(
         &catalog,
         table_path.database(),
         table_path.table(),
-        seam.snapshot_id(),
+        split.snapshot_id,
     )
     .await?;
-    // Restrict the lake read to this partition's bucket so each execution
-    // partition reads only its own lake data instead of the whole snapshot.
-    let lake_stream = read_lake_table(
-        &lake_table,
-        plan.projected_column_names.as_deref(),
-        Some(partition.bucket),
-    )
-    .await?;
+    let lake_stream =
+        read_lake_table(&lake_table, projected_column_names, Some(split.bucket)).await?;
 
-    let log_reader = FlussLogTailReader::new(connection, TablePath::new(table_path.database(), table_path.table()));
+    let log_reader = FlussLogTailReader::new(
+        connection,
+        TablePath::new(table_path.database(), table_path.table()),
+    );
+    let partition = crate::union::UnionPartition {
+        partition_id: split.partition_id,
+        bucket: split.bucket,
+        log_start_offset: split.log_start_offset,
+        log_stop_offset: split.log_stop_offset,
+    };
     union_append_partition(
         lake_stream,
         &log_reader,
-        partition,
+        &partition,
+        projected_schema,
+        projected_column_indices,
+    )
+    .await
+}
+
+/// Transitional helper used by older callers until the public façade is fully
+/// switched over. Delegates to [`open_append_split`].
+pub async fn open_append_partition(
+    connection: Arc<FlussConnection>,
+    table_path: &TablePath,
+    lake_catalog_properties: &HashMap<String, String>,
+    seam: &LakeSeam,
+    plan: &UnionScanPlan,
+    partition_idx: usize,
+) -> Result<RecordBatchStream> {
+    let partition = plan.partitions.get(partition_idx).ok_or_else(|| {
+        FlussLakeError::Internal(format!("partition index {partition_idx} out of bounds"))
+    })?;
+    let split = AppendSplitSpec {
+        partition_id: partition.partition_id,
+        bucket: partition.bucket,
+        snapshot_id: seam.snapshot_id(),
+        log_start_offset: partition.log_start_offset,
+        log_stop_offset: partition.log_stop_offset,
+    };
+    open_append_split(
+        connection,
+        table_path,
+        lake_catalog_properties,
         plan.projected_schema.clone(),
+        plan.projected_column_names.as_deref(),
         plan.projected_column_indices.clone(),
+        &split,
     )
     .await
 }
@@ -155,16 +194,22 @@ fn fluss_projected_arrow_schema(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let projected = Schema::builder().with_columns(fields).build().map_err(|e| {
-            FlussLakeError::Internal(format!("failed to build projected schema: {e}"))
-        })?;
+        let projected = Schema::builder()
+            .with_columns(fields)
+            .build()
+            .map_err(|e| {
+                FlussLakeError::Internal(format!("failed to build projected schema: {e}"))
+            })?;
         Ok(to_arrow_schema(projected.row_type())?)
     } else {
         Ok(to_arrow_schema(schema.row_type())?)
     }
 }
 
-fn fluss_projected_column_names(schema: &Schema, projection: Option<&[usize]>) -> Option<Vec<String>> {
+fn fluss_projected_column_names(
+    schema: &Schema,
+    projection: Option<&[usize]>,
+) -> Option<Vec<String>> {
     projection.map(|indices| {
         indices
             .iter()
@@ -192,12 +237,17 @@ mod tests {
         let mut offsets = std::collections::HashMap::new();
         offsets.insert(TableBucket::new(1, 0), 123);
         let seam = LakeSeam::from_lake_snapshot(&fluss::metadata::LakeSnapshot::new(7, offsets));
-        let props = std::collections::HashMap::from([("warehouse".to_string(), "/tmp/wh".to_string())]);
-        let plan = plan_append_union(&table_info, &props, &seam, None, vec![(None, 0), (None, 1)]).unwrap();
+        let props =
+            std::collections::HashMap::from([("warehouse".to_string(), "/tmp/wh".to_string())]);
+        let plan = plan_append_union(&table_info, &props, &seam, None, vec![(None, 0), (None, 1)])
+            .unwrap();
 
         assert_eq!(plan.partitions.len(), 2);
         assert_eq!(plan.partitions[0].log_start_offset, 123);
-        assert_eq!(plan.partitions[1].log_start_offset, 0, "missing seam => start from earliest");
+        assert_eq!(
+            plan.partitions[1].log_start_offset, 0,
+            "missing seam => start from earliest"
+        );
         assert_eq!(plan.projected_column_names, None);
     }
 
@@ -208,7 +258,8 @@ mod tests {
             1,
             std::collections::HashMap::new(),
         ));
-        let props = std::collections::HashMap::from([("warehouse".to_string(), "/tmp/wh".to_string())]);
+        let props =
+            std::collections::HashMap::from([("warehouse".to_string(), "/tmp/wh".to_string())]);
         let plan =
             plan_append_union(&table_info, &props, &seam, Some(vec![1]), vec![(None, 0)]).unwrap();
         assert_eq!(plan.projected_column_names, Some(vec!["name".to_string()]));

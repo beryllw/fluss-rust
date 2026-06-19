@@ -106,7 +106,11 @@ async fn reads_log_tail_from_seam_offset() {
                 .to_vec()
         })
         .collect();
-    assert_eq!(ids, vec![3, 4, 5, 6], "tail must start at the seam offset 2");
+    assert_eq!(
+        ids,
+        vec![3, 4, 5, 6],
+        "tail must start at the seam offset 2"
+    );
 
     cluster.stop();
 }

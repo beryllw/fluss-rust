@@ -101,8 +101,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_warehouse() {
-        let err = LakeCatalogConfig::from_catalog_properties(&props(&[("metastore", "filesystem")]))
-            .unwrap_err();
+        let err =
+            LakeCatalogConfig::from_catalog_properties(&props(&[("metastore", "filesystem")]))
+                .unwrap_err();
         assert!(matches!(err, FlussLakeError::InvalidCatalogConfig(_)));
     }
 

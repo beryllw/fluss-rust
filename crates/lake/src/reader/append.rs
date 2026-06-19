@@ -120,8 +120,7 @@ mod tests {
     async fn empty_lake_yields_only_log() {
         let target = schema();
         let lake: RecordBatchStream = stream::iter(Vec::new()).boxed();
-        let log: RecordBatchStream =
-            stream::iter(vec![Ok(batch(target.clone(), vec![7]))]).boxed();
+        let log: RecordBatchStream = stream::iter(vec![Ok(batch(target.clone(), vec![7]))]).boxed();
         let out: Vec<RecordBatch> = append_union(lake, log, target).try_collect().await.unwrap();
         assert_eq!(total_rows(&out), 1);
     }
@@ -129,11 +128,11 @@ mod tests {
     #[tokio::test]
     async fn lake_error_propagates_before_log() {
         let target = schema();
-        let lake: RecordBatchStream =
-            stream::iter(vec![Err(crate::error::FlussLakeError::SchemaMismatch("x".into()))])
-                .boxed();
-        let log: RecordBatchStream =
-            stream::iter(vec![Ok(batch(target.clone(), vec![1]))]).boxed();
+        let lake: RecordBatchStream = stream::iter(vec![Err(
+            crate::error::FlussLakeError::SchemaMismatch("x".into()),
+        )])
+        .boxed();
+        let log: RecordBatchStream = stream::iter(vec![Ok(batch(target.clone(), vec![1]))]).boxed();
         let result: Result<Vec<RecordBatch>, _> =
             append_union(lake, log, target).try_collect().await;
         assert!(result.is_err());

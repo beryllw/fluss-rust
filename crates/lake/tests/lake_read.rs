@@ -57,7 +57,9 @@ fn seed_batch() -> RecordBatch {
 async fn seed_warehouse(warehouse: &str) {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
-    let catalog = CatalogFactory::create(options).await.expect("create catalog");
+    let catalog = CatalogFactory::create(options)
+        .await
+        .expect("create catalog");
 
     catalog
         .create_database(DB, true, HashMap::new())
@@ -135,7 +137,9 @@ async fn projection_selects_named_columns() {
     let table = get_table_at_snapshot(&catalog, DB, TABLE, 1).await.unwrap();
 
     let projection = vec!["id".to_string()];
-    let stream = read_lake_table(&table, Some(&projection), None).await.unwrap();
+    let stream = read_lake_table(&table, Some(&projection), None)
+        .await
+        .unwrap();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
     assert_eq!(batches[0].num_columns(), 1);
@@ -150,7 +154,9 @@ const MULTI_BUCKETS: i32 = 4;
 async fn seed_multi_bucket_warehouse(warehouse: &str, ids: &[i32]) {
     let mut options = Options::new();
     options.set(CatalogOptions::WAREHOUSE, warehouse);
-    let catalog = CatalogFactory::create(options).await.expect("create catalog");
+    let catalog = CatalogFactory::create(options)
+        .await
+        .expect("create catalog");
     catalog
         .create_database(MULTI_DB, true, HashMap::new())
         .await
@@ -163,7 +169,10 @@ async fn seed_multi_bucket_warehouse(warehouse: &str, ids: &[i32]) {
         .build()
         .expect("build schema");
     let identifier = Identifier::new(MULTI_DB, MULTI_TABLE);
-    catalog.create_table(&identifier, schema, false).await.unwrap();
+    catalog
+        .create_table(&identifier, schema, false)
+        .await
+        .unwrap();
 
     let batch = {
         let arrow_schema = Arc::new(ArrowSchema::new(vec![
@@ -221,7 +230,9 @@ async fn per_bucket_read_partitions_snapshot_without_overlap() {
     )]))
     .unwrap();
     let catalog = open_catalog(&config).await.unwrap();
-    let table = get_table_at_snapshot(&catalog, MULTI_DB, MULTI_TABLE, 1).await.unwrap();
+    let table = get_table_at_snapshot(&catalog, MULTI_DB, MULTI_TABLE, 1)
+        .await
+        .unwrap();
 
     // Full read (no bucket filter) is the ground truth.
     let full: Vec<RecordBatch> = read_lake_table(&table, None, None)
@@ -238,7 +249,9 @@ async fn per_bucket_read_partitions_snapshot_without_overlap() {
     let mut union_ids = Vec::new();
     let mut nonempty_buckets = 0;
     for bucket in 0..MULTI_BUCKETS {
-        let table = get_table_at_snapshot(&catalog, MULTI_DB, MULTI_TABLE, 1).await.unwrap();
+        let table = get_table_at_snapshot(&catalog, MULTI_DB, MULTI_TABLE, 1)
+            .await
+            .unwrap();
         let batches: Vec<RecordBatch> = read_lake_table(&table, None, Some(bucket))
             .await
             .unwrap()

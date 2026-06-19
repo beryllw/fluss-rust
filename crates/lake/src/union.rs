@@ -114,13 +114,7 @@ mod tests {
                 stop_offset,
                 projection,
             ));
-            let batches: Vec<_> = self
-                .tail
-                .lock()
-                .unwrap()
-                .drain(..)
-                .map(Ok)
-                .collect();
+            let batches: Vec<_> = self.tail.lock().unwrap().drain(..).map(Ok).collect();
             Ok(stream::iter(batches).boxed())
         }
     }

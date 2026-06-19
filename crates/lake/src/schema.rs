@@ -67,9 +67,10 @@ pub fn align_batch_to(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordB
 pub fn matches_schema(batch: &RecordBatch, target: &SchemaRef) -> bool {
     let s = batch.schema();
     s.fields().len() == target.fields().len()
-        && s.fields().iter().zip(target.fields()).all(|(a, b)| {
-            a.name() == b.name() && a.data_type() == b.data_type()
-        })
+        && s.fields()
+            .iter()
+            .zip(target.fields())
+            .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
 }
 
 #[cfg(test)]
@@ -118,11 +119,8 @@ mod tests {
     #[test]
     fn errors_on_missing_column() {
         let lake_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            lake_schema,
-            vec![Arc::new(Int32Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(lake_schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
         let err = align_batch_to(&batch, &target()).unwrap_err();
         assert!(matches!(err, FlussLakeError::SchemaMismatch(_)));
     }
