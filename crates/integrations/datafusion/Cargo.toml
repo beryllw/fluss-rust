@@ -34,7 +34,11 @@ path = "examples/datafusion_demo.rs"
 
 [dependencies]
 fluss = { workspace = true }
-fluss-lake = { path = "../../lake" }
+# Optional so downstream can consume fluss-datafusion as a git dependency without
+# the lake stack: fluss-lake pulls `paimon` via an out-of-repo path dependency
+# that does not resolve over git. The default feature set excludes lake, giving a
+# self-contained SQL-catalog build; enable `lake` for lake+log union read.
+fluss-lake = { path = "../../lake", optional = true }
 datafusion = { workspace = true }
 arrow = { workspace = true }
 tokio = { workspace = true }
@@ -43,16 +47,21 @@ futures = "0.3"
 arc-swap = "1"
 
 [features]
+# Lake + log union read for lake-enabled (Paimon) tables. Pulls in fluss-lake
+# (and transitively `paimon`). Off by default so the crate stays a self-contained
+# git dependency; downstreams that need union read opt in explicitly.
+lake = ["dep:fluss-lake"]
 # Docker-backed integration tests against a real Fluss cluster. Requires a
-# running container runtime. Enables the matching feature in fluss-lake so the
-# kernel's test-only seam override is available.
-integration_tests = ["fluss-lake/integration_tests"]
+# running container runtime. Implies `lake` and enables the matching feature in
+# fluss-lake so the kernel's test-only seam override is available.
+integration_tests = ["lake", "fluss-lake/integration_tests"]
 
 [dev-dependencies]
 fluss-test-cluster = { path = "../../fluss-test-cluster" }
 # Gated SQL e2e seeds a Paimon warehouse directly (no tiering service in the
-# harness), so the integration tests need the Paimon writer + a temp dir.
-paimon = { path = "../../../../paimon-rust/crates/paimon" }
+# harness), so the integration tests need the Paimon writer + a temp dir. Pinned
+# to the same git tag as fluss-lake's paimon so the workspace resolves one paimon.
+paimon = { git = "https://github.com/beryllw/paimon-rust", tag = "v0.3.0-fluss.1" }
 tempfile = "3"
 tokio = { workspace = true }
 arrow = { workspace = true }

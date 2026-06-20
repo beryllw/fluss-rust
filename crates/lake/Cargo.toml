@@ -29,13 +29,15 @@ publish = false
 
 [dependencies]
 fluss = { workspace = true }
-# paimon-rust is an unreleased local tree (workspace 0.3.0); crates.io lags at
-# 0.2.0 with a different API, so depend on the sibling checkout by path. CI /
-# packaging will need this pinned to a git rev or a vendored copy.
-# `storage-s3` adds the S3 object-store backend (opendal services-s3) so lake
-# warehouses on `s3://` (e.g. the tiering e2e against RustFS) are readable; the
-# default features only cover memory/fs/oss.
-paimon = { path = "../../../paimon-rust/crates/paimon", features = ["storage-s3"] }
+# paimon-rust is not on crates.io (crates.io lags at 0.2.0 with a different API),
+# so depend on the beryllw fork by git tag. Using a tag (not a local path) keeps
+# fluss-lake — and any crate that enables it — self-contained as a git dependency.
+# The `v0.3.0-fluss.1` tag is paimon 0.3.0 plus the object-store-safe filesystem
+# catalog existence fix required to read an S3 lake warehouse. `storage-s3` adds
+# the S3 backend (opendal services-s3); default features only cover memory/fs/oss.
+paimon = { git = "https://github.com/beryllw/paimon-rust", tag = "v0.3.0-fluss.1", features = [
+    "storage-s3",
+] }
 arrow = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"

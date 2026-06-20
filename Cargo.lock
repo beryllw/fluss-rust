@@ -3508,6 +3508,7 @@ dependencies = [
 [[package]]
 name = "paimon"
 version = "0.3.0"
+source = "git+https://github.com/beryllw/paimon-rust?tag=v0.3.0-fluss.1#e5042e78a616b81496d9dd57e5775a8398cee5b6"
 dependencies = [
  "apache-avro",
  "arrow-array",

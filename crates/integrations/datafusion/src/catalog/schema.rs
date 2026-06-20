@@ -35,6 +35,7 @@ use crate::metadata::MetadataLoader;
 use crate::runtime::{block_on_with_runtime, ACCESS_PANIC};
 use crate::table::kv::FlussKvTableProvider;
 use crate::table::log::FlussLogTableProvider;
+#[cfg(feature = "lake")]
 use crate::table::union::FlussUnionTableProvider;
 
 /// One Fluss database surfaced as a DataFusion schema, listing tables live.
@@ -74,13 +75,18 @@ impl SchemaProvider for FlussSchemaProvider {
             Err(FlussDatafusionError::TableNotFound(_)) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
+        // Lake-enabled table (append/log OR primary-key): delegate to the
+        // fluss-lake kernel, which reads the lake snapshot unioned with the
+        // residual Fluss log tail. This MUST take precedence over the KV branch:
+        // a lake-enabled PK table tiers data into the lake, so a Fluss-only KV
+        // read would miss rows already compacted out of the changelog. The kernel
+        // picks append stitch vs PK merge internally.
+        //
+        // Only available under the `lake` feature; without it a lake-enabled
+        // table degrades to a Fluss-only read (KV/log below) — it cannot union
+        // the tiered lake data.
+        #[cfg(feature = "lake")]
         if entry.meta.is_paimon_lake() {
-            // Lake-enabled table (append/log OR primary-key): delegate to the
-            // fluss-lake kernel, which reads the lake snapshot unioned with the
-            // residual Fluss log tail. This MUST take precedence over the KV
-            // branch: a lake-enabled PK table tiers data into the lake, so a
-            // Fluss-only KV read would miss rows already compacted out of the
-            // changelog. The kernel picks append stitch vs PK merge internally.
             let provider = FlussUnionTableProvider::new(
                 self.loader.source(),
                 table_ref,
@@ -94,8 +100,10 @@ impl SchemaProvider for FlussSchemaProvider {
                     .clone()
                     .unwrap_or_default(),
             );
-            Ok(Some(Arc::new(provider)))
-        } else if entry.meta.has_primary_key() {
+            return Ok(Some(Arc::new(provider)));
+        }
+
+        if entry.meta.has_primary_key() {
             // Non-lake KV table: point lookup (full PK equality) or bounded
             // `LIMIT` scan. `num_buckets`/`partition_keys` drive the bounded-scan
             // targets and partition pruning, mirroring the log provider.
@@ -142,10 +150,14 @@ impl SchemaProvider for FlussSchemaProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the lake-routing tests need these; gated to match.
+    #[cfg(feature = "lake")]
     use std::collections::HashMap;
 
     use arrow::array::RecordBatch;
-    use fluss::metadata::{DataLakeFormat, DataTypes, Schema as FlussSchema};
+    #[cfg(feature = "lake")]
+    use fluss::metadata::DataLakeFormat;
+    use fluss::metadata::{DataTypes, Schema as FlussSchema};
 
     use crate::backend::{FlussPartition, FlussSource, FlussTableMeta, LookupKey};
     use crate::error::Result as CrateResult;
@@ -222,6 +234,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "lake")]
     #[tokio::test]
     async fn lake_enabled_append_table_uses_union_provider() {
         let fluss_schema = FlussSchema::builder()
@@ -251,6 +264,7 @@ mod tests {
         assert!(provider.as_any().is::<FlussUnionTableProvider>());
     }
 
+    #[cfg(feature = "lake")]
     #[tokio::test]
     async fn lake_enabled_pk_table_uses_union_provider_not_kv() {
         // A lake-enabled primary-key table must route to the union provider so
