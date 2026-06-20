@@ -46,6 +46,17 @@ impl LakeCatalogConfig {
     /// validation is that `warehouse` is present, since the catalog cannot be
     /// opened without it.
     pub fn from_catalog_properties(props: &HashMap<String, String>) -> Result<Self> {
+        // Integration tests that drive a real tiering job behind an S3-compatible
+        // store rewrite the container-internal S3 endpoint to the host-mapped one
+        // here, the single point every catalog config flows through. No-op (and
+        // not compiled) outside the `integration_tests` feature.
+        #[cfg(feature = "integration_tests")]
+        let props = &{
+            let mut props = props.clone();
+            crate::test_overrides::apply_s3_endpoint_override(&mut props);
+            props
+        };
+
         let mut options = Options::new();
         for (key, value) in props {
             options.set(key.clone(), value.clone());

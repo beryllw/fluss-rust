@@ -32,7 +32,10 @@ fluss = { workspace = true }
 # paimon-rust is an unreleased local tree (workspace 0.3.0); crates.io lags at
 # 0.2.0 with a different API, so depend on the sibling checkout by path. CI /
 # packaging will need this pinned to a git rev or a vendored copy.
-paimon = { path = "../../../paimon-rust/crates/paimon" }
+# `storage-s3` adds the S3 object-store backend (opendal services-s3) so lake
+# warehouses on `s3://` (e.g. the tiering e2e against RustFS) are readable; the
+# default features only cover memory/fs/oss.
+paimon = { path = "../../../paimon-rust/crates/paimon", features = ["storage-s3"] }
 arrow = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"

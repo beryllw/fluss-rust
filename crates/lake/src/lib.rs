@@ -63,5 +63,7 @@ pub use error::{FlussLakeError, Result};
 pub use reader::RecordBatchStream;
 #[cfg(feature = "integration_tests")]
 pub use test_overrides::{
-    clear_test_lake_seam_override, set_test_lake_seam_override, set_test_lake_snapshot_override,
+    clear_test_lake_s3_endpoint_override, clear_test_lake_seam_override,
+    set_test_lake_s3_endpoint_override, set_test_lake_seam_override,
+    set_test_lake_snapshot_override,
 };

@@ -105,5 +105,7 @@ pub use install::FlussDatafusion;
 // seam without the connector owning a duplicate registry.
 #[cfg(feature = "integration_tests")]
 pub use fluss_lake::{
-    clear_test_lake_seam_override, set_test_lake_seam_override, set_test_lake_snapshot_override,
+    clear_test_lake_s3_endpoint_override, clear_test_lake_seam_override,
+    set_test_lake_s3_endpoint_override, set_test_lake_seam_override,
+    set_test_lake_snapshot_override,
 };
