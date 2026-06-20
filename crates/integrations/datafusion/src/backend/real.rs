@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use arrow::array::RecordBatch;
 use fluss::client::FlussConnection;
 use fluss::error::FlussError;
@@ -38,17 +39,33 @@ use super::{FlussPartition, FlussSource, FlussTableMeta, KeyValue, LookupKey, Ta
 use crate::error::{FlussDatafusionError, Result};
 
 /// Wraps a shared [`FlussConnection`] and adapts it to the [`FlussSource`] seam.
+///
+/// The connection is held in an [`ArcSwap`] so it can be hot-swapped at runtime
+/// (see [`Self::swap_connection`]) without rebuilding the source, the
+/// `MetadataLoader`, or any registered catalog. Each access loads the current
+/// connection, so an in-flight call uses one consistent snapshot while a
+/// concurrent swap only affects calls that start after it.
 pub(crate) struct RealFlussSource {
-    connection: Arc<FlussConnection>,
+    connection: ArcSwap<FlussConnection>,
 }
 
 impl RealFlussSource {
     pub(crate) fn new(connection: Arc<FlussConnection>) -> Self {
-        Self { connection }
+        Self {
+            connection: ArcSwap::from(connection),
+        }
     }
 
+    /// The connection currently in use. Each call snapshots the live value.
     pub(crate) fn connection(&self) -> Arc<FlussConnection> {
-        self.connection.clone()
+        self.connection.load_full()
+    }
+
+    /// Atomically replaces the underlying connection. Calls already in flight
+    /// keep the connection they loaded; calls started after this use `new`.
+    /// Closing the old connection is the caller's responsibility.
+    pub(crate) fn swap_connection(&self, new: Arc<FlussConnection>) {
+        self.connection.store(new);
     }
 
     fn meta_from_table_info(table: &TableRef, info: &TableInfo) -> FlussTableMeta {
@@ -138,17 +155,17 @@ impl FlussSource for RealFlussSource {
     }
 
     async fn list_databases(&self) -> Result<Vec<String>> {
-        let admin = self.connection.get_admin()?;
+        let admin = self.connection().get_admin()?;
         Ok(admin.list_databases().await?)
     }
 
     async fn list_tables(&self, database: &str) -> Result<Vec<String>> {
-        let admin = self.connection.get_admin()?;
+        let admin = self.connection().get_admin()?;
         Ok(admin.list_tables(database).await?)
     }
 
     async fn get_table_meta(&self, table: &TableRef) -> Result<FlussTableMeta> {
-        let admin = self.connection.get_admin()?;
+        let admin = self.connection().get_admin()?;
         let path: TablePath = table.into();
         let info = admin.get_table_info(&path).await.map_err(|err| {
             // Translate the source's "table does not exist" API error into the
@@ -165,7 +182,8 @@ impl FlussSource for RealFlussSource {
 
     async fn lookup(&self, table: &TableRef, key: &LookupKey) -> Result<RecordBatch> {
         let path: TablePath = table.into();
-        let table_handle = self.connection.get_table(&path).await?;
+        let connection = self.connection();
+        let table_handle = connection.get_table(&path).await?;
         let mut lookuper = table_handle.new_lookup()?.create_lookuper()?;
         let key_row = build_key_row(key);
         let result = lookuper.lookup(&key_row).await?;
@@ -180,7 +198,8 @@ impl FlussSource for RealFlussSource {
         key: &LookupKey,
     ) -> Result<RecordBatch> {
         let path: TablePath = table.into();
-        let table_handle = self.connection.get_table(&path).await?;
+        let connection = self.connection();
+        let table_handle = connection.get_table(&path).await?;
         // `lookup_by` switches the builder into bucket-key prefix mode; the column
         // list (partition keys + bucket keys, in order) is validated by
         // `create_lookuper`. The key row carries one field per lookup column, in
@@ -196,7 +215,7 @@ impl FlussSource for RealFlussSource {
     }
 
     async fn list_partitions(&self, table: &TableRef) -> Result<Vec<FlussPartition>> {
-        let admin = self.connection.get_admin()?;
+        let admin = self.connection().get_admin()?;
         let path: TablePath = table.into();
         let infos = admin.list_partition_infos(&path).await?;
         Ok(infos
@@ -226,7 +245,8 @@ impl FlussSource for RealFlussSource {
         limit: usize,
     ) -> Result<Vec<RecordBatch>> {
         let path: TablePath = table.into();
-        let table_handle = self.connection.get_table(&path).await?;
+        let connection = self.connection();
+        let table_handle = connection.get_table(&path).await?;
         let table_id = table_handle.get_table_info().get_table_id();
         let limit_i32 = limit_to_i32(limit)?;
 
@@ -253,8 +273,9 @@ impl FlussSource for RealFlussSource {
         row_limit: Option<usize>,
     ) -> Result<Vec<RecordBatch>> {
         let path: TablePath = table.into();
-        let table_handle = self.connection.get_table(&path).await?;
-        let admin = self.connection.get_admin()?;
+        let connection = self.connection();
+        let table_handle = connection.get_table(&path).await?;
+        let admin = self.connection().get_admin()?;
 
         let start_offset = if let Some(partition_id) = partition_id {
             let partition_infos = admin.list_partition_infos(&path).await?;
@@ -365,7 +386,8 @@ impl FlussSource for RealFlussSource {
         projection: Option<&[usize]>,
     ) -> Result<Vec<RecordBatch>> {
         let path: TablePath = table.into();
-        let table_handle = self.connection.get_table(&path).await?;
+        let connection = self.connection();
+        let table_handle = connection.get_table(&path).await?;
         let table_id = table_handle.get_table_info().get_table_id();
 
         let mut scan = table_handle.new_scan();

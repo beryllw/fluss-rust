@@ -64,3 +64,6 @@ pub mod lake_union_sql;
 
 #[cfg(feature = "integration_tests")]
 pub mod lake_tiering_sql;
+
+#[cfg(feature = "integration_tests")]
+pub mod swap_connection;

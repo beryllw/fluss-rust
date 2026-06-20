@@ -24,7 +24,7 @@ use crate::backend::SharedFlussSource;
 use crate::backend::real::RealFlussSource;
 use crate::catalog::build_catalog_provider;
 use crate::config::{FlussDatafusionOptions, RegisterCatalogOptions};
-use crate::error::Result;
+use crate::error::{FlussDatafusionError, Result};
 use crate::metadata::MetadataLoader;
 
 /// Shared, stateless installer for Fluss DataFusion integration.
@@ -63,6 +63,29 @@ impl FlussDatafusion {
         Self {
             inner: Arc::new(Inner { loader }),
         }
+    }
+
+    /// Atomically replaces the underlying Fluss connection.
+    ///
+    /// Already-registered catalogs and existing `SessionContext`s keep working
+    /// and transparently use `new` on their next access — no re-`register_catalog`
+    /// and no rebuild of this installer. Calls already in flight finish on the
+    /// old connection; closing it is the caller's responsibility.
+    ///
+    /// Errors only if this installer was not built over the production source
+    /// (the only path today; mock-source test installers cannot be swapped).
+    pub fn swap_connection(&self, new: Arc<FlussConnection>) -> Result<()> {
+        let source = self.inner.loader.source();
+        let real = source
+            .as_any()
+            .downcast_ref::<RealFlussSource>()
+            .ok_or_else(|| {
+                FlussDatafusionError::Internal(
+                    "swap_connection requires the production RealFlussSource".to_string(),
+                )
+            })?;
+        real.swap_connection(new);
+        Ok(())
     }
 
     /// Registers the Fluss catalog into a session context.

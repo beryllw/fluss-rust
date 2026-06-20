@@ -40,6 +40,7 @@ arrow = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
+arc-swap = "1"
 
 [features]
 # Docker-backed integration tests against a real Fluss cluster. Requires a
