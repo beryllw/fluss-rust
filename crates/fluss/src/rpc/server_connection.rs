@@ -236,7 +236,11 @@ impl RpcClient {
         {
             let connections = self.connections.read();
             if let Some(conn) = connections.get(server_id).cloned() {
-                if !conn.is_poisoned() {
+                // Reuse only a healthy connection. A poisoned OR stopped-I/O-task
+                // connection is rebuilt below; the latter (stopped without poison)
+                // is what `is_poisoned()` alone missed, leaving a dead connection
+                // cached forever after a scan stopped its I/O task.
+                if conn.is_healthy() {
                     return Ok(conn);
                 }
             }
@@ -245,11 +249,12 @@ impl RpcClient {
         {
             let mut connections = self.connections.write();
             if let Some(race_conn) = connections.get(server_id) {
-                if !race_conn.is_poisoned() {
+                if race_conn.is_healthy() {
                     return Ok(race_conn.clone());
                 }
             }
 
+            // Replaces a dead/poisoned entry (if any) with the fresh connection.
             connections.insert(server_id.to_owned(), new_server.clone());
         }
         Ok(new_server)
@@ -652,6 +657,20 @@ where
 
     fn is_poisoned(&self) -> bool {
         self.poison.lock().is_some()
+    }
+
+    /// Whether this connection is still usable. A connection is healthy only if
+    /// it is not poisoned AND its I/O task is still running.
+    ///
+    /// The I/O task owns the receiving half of `outgoing_tx`; if the task has
+    /// stopped for ANY reason — a socket error (which also poisons), a clean
+    /// teardown, or its runtime being dropped/cancelled (which cannot run the
+    /// poison path) — the channel is closed. Checking `outgoing_tx.is_closed()`
+    /// therefore detects a dead I/O task even when poison was never set, which is
+    /// the case `is_poisoned()` alone misses and the reason a scan that stops the
+    /// task could leave a permanently-unusable cached connection.
+    fn is_healthy(&self) -> bool {
+        !self.is_poisoned() && !self.outgoing_tx.is_closed()
     }
 
     pub async fn request<R>(&self, msg: R) -> Result<R::ResponseBody, Error>
@@ -1362,6 +1381,47 @@ mod tests {
             "after shutting down the injected runtime, the request must not \
              succeed (got {second:?}); this proves I/O lived on the injected \
              runtime, not the global fluss-io"
+        );
+    }
+
+    /// `is_healthy()` must detect an I/O task that stopped WITHOUT poisoning.
+    ///
+    /// When the runtime hosting the I/O task is dropped, the task is cancelled and
+    /// can never run its poison path, so `is_poisoned()` stays false — exactly the
+    /// case `get_connection` used to miss, leaving a dead connection cached
+    /// forever. The peer (`_server`) is kept open so the only thing that stops the
+    /// task is the runtime teardown, not a socket EOF (which would poison).
+    #[test]
+    fn is_healthy_detects_io_task_stopped_without_poison() {
+        let host = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .thread_name("host-healthcheck-io")
+            .build()
+            .expect("build host I/O runtime");
+
+        let (client, _server) = tokio::io::duplex(4096);
+        let conn = ServerConnectionInner::new_on(
+            host.handle().clone(),
+            BufStream::new(client),
+            usize::MAX,
+            Arc::from("t"),
+        );
+
+        assert!(conn.is_healthy(), "a fresh connection should be healthy");
+        assert!(!conn.is_poisoned());
+
+        // Drop the runtime: the I/O task is cancelled, dropping the receiving half
+        // of the outgoing channel. Cancellation cannot run the poison path.
+        drop(host);
+
+        assert!(
+            !conn.is_poisoned(),
+            "a runtime-cancelled I/O task cannot set poison"
+        );
+        assert!(
+            !conn.is_healthy(),
+            "is_healthy must detect the stopped I/O task via the closed outgoing channel"
         );
     }
 

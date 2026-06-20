@@ -1199,7 +1199,17 @@ struct LogFetcher {
     fetch_min_bytes: i32,
     fetch_wait_max_time_ms: i32,
     fetch_max_bytes_for_bucket: i32,
+    /// Consecutive metadata-update rounds that failed with a connection/poison
+    /// error. Reset on any success; once it exceeds
+    /// [`MAX_METADATA_CONN_ERROR_RETRIES`] the error is surfaced instead of being
+    /// swallowed, so a persistently unreachable cluster fails the scan with a
+    /// clear error rather than looping forever.
+    metadata_conn_error_streak: std::sync::atomic::AtomicU32,
 }
+
+/// Upper bound on consecutive connection/poison errors tolerated while refreshing
+/// metadata during a scan before the error is surfaced to the caller.
+const MAX_METADATA_CONN_ERROR_RETRIES: u32 = 10;
 
 struct FetchResponseContext {
     metadata: Arc<Metadata>,
@@ -1291,6 +1301,7 @@ impl LogFetcher {
             fetch_min_bytes: config.scanner_log_fetch_min_bytes,
             fetch_wait_max_time_ms: config.scanner_log_fetch_wait_max_time_ms,
             fetch_max_bytes_for_bucket: config.scanner_log_fetch_max_bytes_for_bucket,
+            metadata_conn_error_streak: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -1422,17 +1433,37 @@ impl LogFetcher {
         };
 
         // TODO: Handle PartitionNotExist error like java side
-        update_result.or_else(|e| {
-            if let Error::RpcError { source, .. } = &e
-                && matches!(source, RpcError::ConnectionError(_) | RpcError::Poisoned(_))
-            {
-                warn!("Retrying after encountering error while updating table metadata: {e}");
+        use std::sync::atomic::Ordering;
+        match update_result {
+            Ok(()) => {
+                self.metadata_conn_error_streak.store(0, Ordering::Relaxed);
                 Ok(())
-            } else {
-                Err(e)
             }
-        })?;
-        Ok(())
+            // Connection/poison errors are transient and retriable while the
+            // client self-heals (get_connection rebuilds a dead connection), so
+            // swallow them and let the next poll round retry — but only up to a
+            // bound, so a persistently unreachable cluster surfaces a clear error
+            // instead of the scan looping forever.
+            Err(e)
+                if matches!(
+                    &e,
+                    Error::RpcError { source, .. }
+                        if matches!(source, RpcError::ConnectionError(_) | RpcError::Poisoned(_))
+                ) =>
+            {
+                let streak = self.metadata_conn_error_streak.fetch_add(1, Ordering::Relaxed) + 1;
+                if streak > MAX_METADATA_CONN_ERROR_RETRIES {
+                    self.metadata_conn_error_streak.store(0, Ordering::Relaxed);
+                    return Err(e);
+                }
+                warn!(
+                    "Retrying after error updating table metadata \
+                     (attempt {streak}/{MAX_METADATA_CONN_ERROR_RETRIES}): {e}"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Send fetch requests asynchronously without waiting for responses
