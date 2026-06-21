@@ -168,6 +168,8 @@ impl FlussSchemaProvider {
             entry.meta.schema.clone(),
             entry.meta.num_buckets,
             entry.meta.partition_keys.clone(),
+            entry.meta.primary_keys.clone(),
+            entry.meta.bucket_keys.clone(),
             entry.meta.lake_catalog_properties.clone().unwrap_or_default(),
             true,
         );
@@ -242,6 +244,8 @@ impl SchemaProvider for FlussSchemaProvider {
                 entry.meta.schema.clone(),
                 entry.meta.num_buckets,
                 entry.meta.partition_keys.clone(),
+                entry.meta.primary_keys.clone(),
+                entry.meta.bucket_keys.clone(),
                 entry
                     .meta
                     .lake_catalog_properties

@@ -46,7 +46,7 @@ use fluss::row::GenericRow;
 use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
 use fluss_test_cluster::{FlussTestingClusterBuilder, PaimonLakeConfig};
 
-use crate::integration::utils::helpers::{collect_i32, collect_strings};
+use crate::integration::utils::helpers::{collect_i32, collect_strings, render_explain, total_rows};
 
 const DATABASE: &str = "fluss";
 const TABLE: &str = "df_lake_tiering_sql";
@@ -347,6 +347,36 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         vec![1, 2, 3],
         "PK $lake returns only the tiered lake snapshot"
     );
+
+    // PK point lookup on a lake table: an exact primary-key equality is served by
+    // a Fluss point lookup (the KV store holds the current state), NOT a full
+    // union read — and it reflects the changelog tail (id 2 -> v2b, id 3 deleted).
+    let pk_point_sql = format!("SELECT name FROM {CATALOG}.{DATABASE}.{PK_TABLE} WHERE id = 2");
+    let pk_point = ctx.sql(&pk_point_sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(total_rows(&pk_point), 1, "point lookup returns one row for id=2");
+    assert_eq!(
+        collect_strings(&pk_point, 0),
+        vec!["v2b".to_string()],
+        "point lookup returns the current value (updated by the log tail)"
+    );
+
+    // The point lookup must use the Fluss KV lookup plan, bypassing the lake.
+    let pk_point_explain = format!("EXPLAIN SELECT name FROM {CATALOG}.{DATABASE}.{PK_TABLE} WHERE id = 2");
+    let explained = ctx.sql(&pk_point_explain).await.unwrap().collect().await.unwrap();
+    let rendered = render_explain(&explained);
+    assert!(
+        rendered.contains("FlussKvLookupExec"),
+        "lake PK point lookup must use FlussKvLookupExec (not a union scan), got:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("FlussUnionScanExec"),
+        "lake PK point lookup must NOT open the lake (no FlussUnionScanExec), got:\n{rendered}"
+    );
+
+    // A deleted key returns no rows via the same point-lookup fast path.
+    let pk_deleted_sql = format!("SELECT name FROM {CATALOG}.{DATABASE}.{PK_TABLE} WHERE id = 3");
+    let pk_deleted = ctx.sql(&pk_deleted_sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(total_rows(&pk_deleted), 0, "deleted key id=3 returns no rows");
 
     // `<table>$options` reports the table is lake-enabled (湖流一体) and its format.
     let opt_value = |key: &str| {

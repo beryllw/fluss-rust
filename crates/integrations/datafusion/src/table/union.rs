@@ -40,7 +40,13 @@ use fluss_lake::FlussLakeTable;
 
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
+use crate::execution::lookup::FlussKvLookupExec;
+use crate::execution::prefix_lookup::FlussKvPrefixLookupExec;
 use crate::execution::union_scan::FlussUnionScanExec;
+use crate::table::predicate::{
+    analyze_kv_filters, analyze_kv_prefix_filters, is_complete_prefix_key_equality,
+    is_complete_primary_key_equality, is_prefix_key_equality, is_primary_key_equality,
+};
 use crate::types::record_batch::normalize_projection;
 
 use arrow::datatypes::SchemaRef;
@@ -50,6 +56,13 @@ use arrow::datatypes::SchemaRef;
 ///
 /// `lake_only` selects the `<table>$lake` read shape: only the Paimon lake
 /// snapshot (current state) is returned, with no Fluss log tail union.
+///
+/// For a primary-key lake table, an exact primary-key equality (point lookup) or
+/// a complete bucket-key prefix equality (prefix lookup) is served directly from
+/// Fluss — the KV store holds the current state, so the lake is not needed and a
+/// full union read is avoided. Everything else (full scan, `LIMIT`, other
+/// predicates) falls through to the lake+log union read. `lake_only` skips this
+/// routing (it must read the Paimon snapshot regardless).
 pub(crate) struct FlussUnionTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
@@ -57,6 +70,12 @@ pub(crate) struct FlussUnionTableProvider {
     fluss_schema: fluss::metadata::Schema,
     num_buckets: i32,
     partition_keys: Vec<String>,
+    /// Primary-key column names; empty for an append/log lake table. Drives the
+    /// point-lookup fast path.
+    primary_keys: Vec<String>,
+    /// Bucket-key column names; a strict prefix of the primary key enables the
+    /// prefix-lookup fast path.
+    bucket_keys: Vec<String>,
     lake_catalog_properties: std::collections::HashMap<String, String>,
     lake_only: bool,
 }
@@ -70,6 +89,7 @@ impl std::fmt::Debug for FlussUnionTableProvider {
 }
 
 impl FlussUnionTableProvider {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         source: SharedFlussSource,
         table_ref: TableRef,
@@ -77,6 +97,8 @@ impl FlussUnionTableProvider {
         fluss_schema: fluss::metadata::Schema,
         num_buckets: i32,
         partition_keys: Vec<String>,
+        primary_keys: Vec<String>,
+        bucket_keys: Vec<String>,
         lake_catalog_properties: std::collections::HashMap<String, String>,
     ) -> Self {
         Self::with_lake_only(
@@ -86,13 +108,16 @@ impl FlussUnionTableProvider {
             fluss_schema,
             num_buckets,
             partition_keys,
+            primary_keys,
+            bucket_keys,
             lake_catalog_properties,
             false,
         )
     }
 
     /// Builds the provider in lake-only mode (`<table>$lake`): only the Paimon
-    /// lake snapshot is read, with no Fluss log tail union.
+    /// lake snapshot is read, with no Fluss log tail union (and no lookup fast
+    /// path).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_lake_only(
         source: SharedFlussSource,
@@ -101,6 +126,8 @@ impl FlussUnionTableProvider {
         fluss_schema: fluss::metadata::Schema,
         num_buckets: i32,
         partition_keys: Vec<String>,
+        primary_keys: Vec<String>,
+        bucket_keys: Vec<String>,
         lake_catalog_properties: std::collections::HashMap<String, String>,
         lake_only: bool,
     ) -> Self {
@@ -111,9 +138,17 @@ impl FlussUnionTableProvider {
             fluss_schema,
             num_buckets,
             partition_keys,
+            primary_keys,
+            bucket_keys,
             lake_catalog_properties,
             lake_only,
         }
+    }
+
+    /// Whether the point/prefix-lookup fast path applies to this provider: a
+    /// primary-key table read in normal (not lake-only) mode.
+    fn lookup_fast_path_enabled(&self) -> bool {
+        !self.lake_only && !self.primary_keys.is_empty()
     }
 }
 
@@ -135,8 +170,42 @@ impl TableProvider for FlussUnionTableProvider {
         &self,
         filters: &[&Expr],
     ) -> DfResult<Vec<TableProviderFilterPushDown>> {
-        // Only non-partitioned lake tables are supported today (see `scan`), and
-        // value/partition filters are not pushed to the union: residual filters
+        // For a primary-key lake table, an exact PK / bucket-key-prefix equality
+        // is served by a point/prefix lookup (the fast path in `scan`), which
+        // consumes exactly those conjuncts — mark them `Exact` so the planner
+        // drops the matching `FilterExec`, mirroring the non-lake KV provider.
+        if self.lookup_fast_path_enabled() {
+            if is_complete_primary_key_equality(filters, &self.primary_keys) {
+                return Ok(filters
+                    .iter()
+                    .map(|f| {
+                        if is_primary_key_equality(f, &self.primary_keys) {
+                            TableProviderFilterPushDown::Exact
+                        } else {
+                            TableProviderFilterPushDown::Unsupported
+                        }
+                    })
+                    .collect());
+            }
+            if is_complete_prefix_key_equality(
+                filters,
+                &self.bucket_keys,
+                &self.partition_keys,
+                &self.primary_keys,
+            ) {
+                return Ok(filters
+                    .iter()
+                    .map(|f| {
+                        if is_prefix_key_equality(f, &self.bucket_keys, &self.partition_keys) {
+                            TableProviderFilterPushDown::Exact
+                        } else {
+                            TableProviderFilterPushDown::Unsupported
+                        }
+                    })
+                    .collect());
+            }
+        }
+        // Otherwise the union read runs and applies no filters: residual filters
         // are re-applied by a `FilterExec` above the scan.
         Ok(filters
             .iter()
@@ -148,10 +217,41 @@ impl TableProvider for FlussUnionTableProvider {
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         _limit: Option<usize>,
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         let (projection, projected_schema) = normalize_projection(projection, &self.schema)?;
+
+        // Fast path for a primary-key lake table: an exact PK equality is a point
+        // lookup and a complete bucket-key prefix equality is a prefix lookup,
+        // both served directly from Fluss (the KV store holds the current state),
+        // so the lake is not opened and a full union read is avoided.
+        if self.lookup_fast_path_enabled() {
+            if let Ok(key) = analyze_kv_filters(filters, &self.primary_keys) {
+                return Ok(Arc::new(FlussKvLookupExec::new(
+                    self.source.clone(),
+                    self.table_ref.clone(),
+                    key,
+                    projected_schema.clone(),
+                    projection.clone(),
+                )));
+            }
+            if let Some(prefix) = analyze_kv_prefix_filters(
+                filters,
+                &self.bucket_keys,
+                &self.partition_keys,
+                &self.primary_keys,
+            ) {
+                return Ok(Arc::new(FlussKvPrefixLookupExec::new(
+                    self.source.clone(),
+                    self.table_ref.clone(),
+                    prefix.lookup_columns,
+                    prefix.key,
+                    projected_schema.clone(),
+                    projection.clone(),
+                )));
+            }
+        }
 
         if self.num_buckets == 0 {
             return Ok(Arc::new(EmptyExec::new(projected_schema)));
