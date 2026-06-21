@@ -83,6 +83,7 @@ async fn end_to_end_sql_through_real_backend() {
     kv_single_pk_equality_returns_row(&ctx).await;
     kv_absent_key_returns_no_rows(&ctx).await;
     kv_composite_pk_equality_returns_row(&ctx).await;
+    kv_options_lists_table_properties(&ctx).await;
     kv_non_primary_key_predicate_fails(&ctx).await;
     kv_partial_composite_key_fails(&ctx).await;
     kv_full_scan_without_filter_fails(&ctx).await;
@@ -276,6 +277,34 @@ async fn kv_composite_pk_equality_returns_row(ctx: &SessionContext) {
         .downcast_ref::<Int64Array>()
         .expect("score int64");
     assert_eq!(scores.value(0), 200);
+}
+
+/// `<table>$options` lists the table's metadata/properties as key/value rows.
+/// For the non-lake KV table the headline `datalake.enabled` is `false` and the
+/// primary key is reported.
+async fn kv_options_lists_table_properties(ctx: &SessionContext) {
+    let option_value = |key: &str| {
+        let sql = format!(
+            "SELECT value FROM {CATALOG}.{}.{}$options WHERE key = '{key}'",
+            names::DATABASE,
+            names::KV_SIMPLE
+        );
+        async move {
+            let batches = ctx.sql(&sql).await.expect("plan").collect().await.expect("collect");
+            collect_strings(&batches, 0)
+        }
+    };
+
+    assert_eq!(
+        option_value("datalake.enabled").await,
+        vec!["false".to_string()],
+        "a non-lake KV table reports datalake.enabled=false"
+    );
+    assert_eq!(
+        option_value("primary.keys").await,
+        vec!["id".to_string()],
+        "$options reports the primary key"
+    );
 }
 
 async fn kv_non_primary_key_predicate_fails(ctx: &SessionContext) {

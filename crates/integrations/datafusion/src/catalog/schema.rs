@@ -25,8 +25,11 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use arrow::array::{RecordBatch, StringArray};
+use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema};
 use async_trait::async_trait;
 use datafusion::catalog::{SchemaProvider, TableProvider};
+use datafusion::datasource::MemTable;
 use datafusion::error::Result as DfResult;
 
 use crate::backend::TableRef;
@@ -45,9 +48,97 @@ pub(crate) struct FlussSchemaProvider {
     loader: Arc<MetadataLoader>,
 }
 
+/// Redacts secret-like lake property values (credentials, passwords) so the
+/// `$options` system table never surfaces them.
+fn redact_property(key: &str, value: &str) -> String {
+    let k = key.to_ascii_lowercase();
+    if k.contains("secret")
+        || k.contains("password")
+        || k.contains("access-key")
+        || k.contains("access.key")
+        || k.contains("access_key")
+        || k.contains("token")
+    {
+        "<redacted>".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 impl FlussSchemaProvider {
     pub(crate) fn new(database: String, loader: Arc<MetadataLoader>) -> Self {
         Self { database, loader }
+    }
+
+    /// Builds the `<base>$options` system table: a two-column (`key`, `value`)
+    /// listing of `base`'s metadata/properties. Works for any table type; a
+    /// missing `base` is `Ok(None)`. Secret-like lake property values are
+    /// redacted by [`redact_property`].
+    async fn options_table(
+        &self,
+        base: &str,
+    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        let base_ref = TableRef::new(self.database.clone(), base.to_string());
+        let entry = match self.loader.table_entry(&base_ref).await {
+            Ok(entry) => entry,
+            Err(FlussDatafusionError::TableNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let meta = &entry.meta;
+
+        let format = meta
+            .datalake_format
+            .map(|f| f.to_string())
+            .unwrap_or_default();
+
+        let mut rows: Vec<(String, String)> = vec![
+            ("table.id".to_string(), meta.table_id.to_string()),
+            ("schema.id".to_string(), meta.schema_id.to_string()),
+            ("num.buckets".to_string(), meta.num_buckets.to_string()),
+            ("primary.keys".to_string(), meta.primary_keys.join(",")),
+            ("bucket.keys".to_string(), meta.bucket_keys.join(",")),
+            ("partition.keys".to_string(), meta.partition_keys.join(",")),
+            (
+                "partitioned".to_string(),
+                (!meta.partition_keys.is_empty()).to_string(),
+            ),
+            (
+                "datalake.enabled".to_string(),
+                meta.datalake_format.is_some().to_string(),
+            ),
+            ("datalake.format".to_string(), format.clone()),
+        ];
+
+        // Lake catalog properties (warehouse, metastore, s3.endpoint, ...) in a
+        // stable order, with secret-like values redacted.
+        if let Some(props) = &meta.lake_catalog_properties {
+            let mut keys: Vec<&String> = props.keys().collect();
+            keys.sort();
+            for k in keys {
+                let prop_key = if format.is_empty() {
+                    format!("datalake.{k}")
+                } else {
+                    format!("datalake.{format}.{k}")
+                };
+                rows.push((prop_key, redact_property(k, &props[k])));
+            }
+        }
+
+        let keys: Vec<&str> = rows.iter().map(|(k, _)| k.as_str()).collect();
+        let values: Vec<&str> = rows.iter().map(|(_, v)| v.as_str()).collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("key", ArrowDataType::Utf8, false),
+            ArrowField::new("value", ArrowDataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(keys)),
+                Arc::new(StringArray::from(values)),
+            ],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        Ok(Some(Arc::new(table)))
     }
 
     /// Builds the lake-only provider for `<base>$lake`: reads only the Paimon
@@ -101,6 +192,13 @@ impl SchemaProvider for FlussSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        // `<table>$options` lists the table's metadata/properties as key/value
+        // rows (datalake enablement & format, primary/bucket/partition keys,
+        // bucket count, lake catalog props). Available for ANY table.
+        if let Some(base) = name.strip_suffix("$options") {
+            return self.options_table(base).await;
+        }
+
         // `<table>$lake` reads ONLY the Paimon lake snapshot (no Fluss log tail);
         // `<table>$lake$<system>` (e.g. `$snapshots`) is a Paimon system table,
         // not supported yet. Both are only meaningful under the `lake` feature.

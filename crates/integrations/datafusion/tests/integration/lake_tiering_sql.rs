@@ -42,7 +42,7 @@ use fluss_datafusion::{
 };
 use fluss_test_cluster::{FlussTestingClusterBuilder, PaimonLakeConfig};
 
-use crate::integration::utils::helpers::{collect_i32, options};
+use crate::integration::utils::helpers::{collect_i32, collect_strings, options};
 
 const DATABASE: &str = "fluss";
 const TABLE: &str = "df_lake_tiering_sql";
@@ -204,6 +204,28 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         lake_ids,
         vec![1, 2, 3],
         "$lake returns only the tiered lake snapshot, excluding the log tail"
+    );
+
+    // `<table>$options` reports the table is lake-enabled (湖流一体) and its format.
+    let opt_value = |key: &str| {
+        let sql = format!(
+            "SELECT value FROM {CATALOG}.{DATABASE}.{TABLE}$options WHERE key = '{key}'"
+        );
+        let ctx = &ctx;
+        async move {
+            let batches = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            collect_strings(&batches, 0)
+        }
+    };
+    assert_eq!(
+        opt_value("datalake.enabled").await,
+        vec!["true".to_string()],
+        "$options reports datalake.enabled=true for a lake table"
+    );
+    assert_eq!(
+        opt_value("datalake.format").await,
+        vec!["paimon".to_string()],
+        "$options reports datalake.format=paimon"
     );
 
     clear_test_lake_s3_endpoint_override();
