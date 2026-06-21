@@ -43,7 +43,7 @@ use fluss_datafusion::{FlussDatafusion, RegisterCatalogOptions};
 
 use crate::integration::setup;
 use crate::integration::utils::helpers::{
-    CATALOG, collect_i32, collect_strings, options, render_explain, total_rows,
+    CATALOG, collect_i32, collect_strings, expect_query_error, options, render_explain, total_rows,
 };
 use crate::integration::utils::names;
 
@@ -83,10 +83,10 @@ async fn end_to_end_sql_through_real_backend() {
     kv_single_pk_equality_returns_row(&ctx).await;
     kv_absent_key_returns_no_rows(&ctx).await;
     kv_composite_pk_equality_returns_row(&ctx).await;
-    kv_non_primary_key_predicate_full_scans(&ctx).await;
-    kv_partial_composite_key_full_scans(&ctx).await;
-    kv_full_scan_returns_all_rows(&ctx).await;
-    kv_in_list_predicate_full_scans(&ctx).await;
+    kv_non_primary_key_predicate_fails(&ctx).await;
+    kv_partial_composite_key_fails(&ctx).await;
+    kv_full_scan_without_filter_fails(&ctx).await;
+    kv_in_list_predicate_fails(&ctx).await;
     log_head_first_limit_returns_rows(&ctx).await;
     log_multi_bucket_scan_returns_limited_rows(&ctx).await;
     log_projection_keeps_only_projected_column(&ctx).await;
@@ -278,83 +278,68 @@ async fn kv_composite_pk_equality_returns_row(ctx: &SessionContext) {
     assert_eq!(scores.value(0), 200);
 }
 
-// A non-PK predicate cannot route a lookup, so the KV table is read via a full
-// changelog-merge scan and DataFusion applies the residual filter on top. (Before
-// KV full-table scan landed this query was rejected; it is now supported.)
-async fn kv_non_primary_key_predicate_full_scans(ctx: &SessionContext) {
-    let batches = ctx
-        .sql(&format!(
-            "SELECT id, name FROM {CATALOG}.{}.{} WHERE name = 'Noco'",
+async fn kv_non_primary_key_predicate_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{} WHERE name = 'x'",
             names::DATABASE,
             names::KV_SIMPLE
-        ))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-    assert_eq!(total_rows(&batches), 1, "only one row has name='Noco'");
-    assert_eq!(collect_i32(&batches, 0), vec![2], "name='Noco' -> id 2");
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
 }
 
-// A partial composite-PK predicate (leading key only) cannot route a lookup, so
-// it runs as a full scan with the residual `region` filter applied on top.
-async fn kv_partial_composite_key_full_scans(ctx: &SessionContext) {
-    let batches = ctx
-        .sql(&format!(
-            "SELECT region, id FROM {CATALOG}.{}.{} WHERE region = 'us'",
+async fn kv_partial_composite_key_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{} WHERE region = 'us'",
             names::DATABASE,
             names::KV_COMPOSITE
-        ))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-    assert_eq!(total_rows(&batches), 2, "region='us' has two rows");
-    let mut ids = collect_i32(&batches, 1);
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2]);
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
 }
 
-// `SELECT *` with no predicate is a full changelog-merge scan returning the KV
-// table's current state.
-async fn kv_full_scan_returns_all_rows(ctx: &SessionContext) {
-    let batches = ctx
-        .sql(&format!(
-            "SELECT id FROM {CATALOG}.{}.{}",
+async fn kv_full_scan_without_filter_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{}",
             names::DATABASE,
             names::KV_SIMPLE
-        ))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-    assert_eq!(total_rows(&batches), 3, "full scan returns all current-state rows");
-    let mut ids = collect_i32(&batches, 0);
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2, 3]);
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
 }
 
-// An IN-list on the PK is not a single equality lookup, so it runs as a full
-// scan with the residual `IN` filter applied by DataFusion.
-async fn kv_in_list_predicate_full_scans(ctx: &SessionContext) {
-    let batches = ctx
-        .sql(&format!(
-            "SELECT id FROM {CATALOG}.{}.{} WHERE id IN (1, 2)",
+async fn kv_in_list_predicate_fails(ctx: &SessionContext) {
+    let err = expect_query_error(
+        ctx,
+        &format!(
+            "SELECT * FROM {CATALOG}.{}.{} WHERE id IN (1, 2)",
             names::DATABASE,
             names::KV_SIMPLE
-        ))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-    assert_eq!(total_rows(&batches), 2, "id IN (1,2) keeps two rows");
-    let mut ids = collect_i32(&batches, 0);
-    ids.sort_unstable();
-    assert_eq!(ids, vec![1, 2]);
+        ),
+    )
+    .await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
 }
 
 async fn log_head_first_limit_returns_rows(ctx: &SessionContext) {

@@ -223,15 +223,6 @@ mod tests {
             unreachable!()
         }
 
-        async fn kv_full_scan(
-            &self,
-            _table: &TableRef,
-            _partition_id: Option<i64>,
-            _bucket: i32,
-            _projection: Option<&[usize]>,
-        ) -> CrateResult<Vec<RecordBatch>> {
-            unreachable!()
-        }
     }
 
     #[cfg(feature = "lake")]

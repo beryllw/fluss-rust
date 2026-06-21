@@ -15,13 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! FINAL acceptance: real-cluster proof that a primary-keyed (KV) table supports
-//! a full-table scan with NO filter and NO `LIMIT`.
+//! Real-cluster proof that a NON-lake KV table does NOT support an unbounded
+//! full-table scan (`SELECT * FROM kv` with no filter and no `LIMIT`).
 //!
-//! `SELECT * FROM kv` must return the table's correct CURRENT state — merging the
-//! CDC changelog so a deleted PK is absent, updated PKs carry their new values,
-//! and the row count is correct. `EXPLAIN` must show the dedicated
-//! `FlussKvFullScanExec` plan, and a column-subset projection must work.
+//! The supported read shapes are:
+//! - complete PK equality => point lookup,
+//! - complete bucket-key prefix equality => prefix lookup,
+//! - any other predicate shape + LIMIT => bounded scan.
+//!
+//! With no `LIMIT` and no complete lookup key, the provider must fail
+//! conservatively with `unsupported query pattern` instead of attempting to read
+//! the KV table's current state from its changelog.
 //!
 //! Gated by `integration_tests` (needs a container runtime). Run with:
 //!   cargo test -p fluss-datafusion --features integration_tests -- kv_full_scan
@@ -30,13 +34,12 @@
 
 use std::sync::Arc;
 
-use arrow::array::{Int32Array, StringArray};
 use datafusion::execution::context::SessionContext;
 
 use fluss_datafusion::{FlussDatafusion, RegisterCatalogOptions};
 
 use crate::integration::setup;
-use crate::integration::utils::helpers::{options, render_explain, total_rows, CATALOG};
+use crate::integration::utils::helpers::{expect_query_error, options, CATALOG};
 use crate::integration::utils::names;
 
 /// Dedicated name/port so this suite never collides with the other clusters in
@@ -46,7 +49,7 @@ const CLUSTER_NAME: &str = "df-kv-full-scan";
 const CLUSTER_PORT: u16 = 9145;
 
 #[tokio::test]
-async fn kv_full_scan_returns_current_state_through_real_backend() {
+async fn kv_full_scan_without_limit_is_rejected_through_real_backend() {
     let cluster = setup::start_cluster(CLUSTER_NAME, CLUSTER_PORT).await;
     let connection = Arc::new(cluster.get_fluss_connection().await);
 
@@ -60,9 +63,11 @@ async fn kv_full_scan_returns_current_state_through_real_backend() {
         .await
         .expect("register_catalog");
 
-    full_scan_returns_merged_current_state(&ctx).await;
-    full_scan_shows_in_explain(&ctx).await;
-    full_scan_projection_returns_subset_columns(&ctx).await;
+    let err = expect_query_error(&ctx, &format!("SELECT * FROM {}", table())).await;
+    assert!(
+        err.contains("unsupported query pattern"),
+        "expected unsupported-query error, got: {err}"
+    );
 
     setup::drop_table_named(&connection, names::KV_FULL_SCAN).await;
     cluster.stop();
@@ -70,90 +75,4 @@ async fn kv_full_scan_returns_current_state_through_real_backend() {
 
 fn table() -> String {
     format!("{CATALOG}.{}.{}", names::DATABASE, names::KV_FULL_SCAN)
-}
-
-/// `SELECT * FROM kv` (no filter, no LIMIT) returns the merged CURRENT state:
-/// id=3 deleted, id=2 and id=4 carry their updated names, count is correct.
-async fn full_scan_returns_merged_current_state(ctx: &SessionContext) {
-    let batches = ctx
-        .sql(&format!("SELECT * FROM {}", table()))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-
-    assert_eq!(
-        total_rows(&batches),
-        4,
-        "full scan must return the 4 surviving rows (5 inserted, 1 deleted)"
-    );
-
-    let mut rows: Vec<(i32, String)> = Vec::new();
-    for b in &batches {
-        let ids = b
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .expect("id int32");
-        let names = b
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("name utf8");
-        for i in 0..b.num_rows() {
-            rows.push((ids.value(i), names.value(i).to_string()));
-        }
-    }
-    rows.sort_by_key(|(id, _)| *id);
-
-    let expected = vec![
-        (1, "alpha".to_string()),
-        (2, "bravo-v2".to_string()),
-        (4, "delta-v2".to_string()),
-        (5, "echo".to_string()),
-    ];
-    assert_eq!(
-        rows, expected,
-        "full scan must reflect updates (2,4) and the delete (3)"
-    );
-}
-
-/// The full-table KV scan surfaces its dedicated custom plan in `EXPLAIN`,
-/// distinct from the log table's `FlussLogScanExec` and the KV bounded
-/// `FlussKvScanExec`.
-async fn full_scan_shows_in_explain(ctx: &SessionContext) {
-    let explained = ctx
-        .sql(&format!("EXPLAIN SELECT * FROM {}", table()))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-    let rendered = render_explain(&explained);
-    assert!(
-        rendered.contains("FlussKvFullScanExec"),
-        "EXPLAIN should show the KV full-scan plan, got:\n{rendered}"
-    );
-}
-
-/// `SELECT name FROM kv` (projection, still no filter / no LIMIT) returns just the
-/// projected column for every surviving row.
-async fn full_scan_projection_returns_subset_columns(ctx: &SessionContext) {
-    let batches = ctx
-        .sql(&format!("SELECT name FROM {}", table()))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("collect");
-
-    assert_eq!(total_rows(&batches), 4, "projection keeps the 4 surviving rows");
-    for b in &batches {
-        assert_eq!(b.num_columns(), 1, "projection must return a single column");
-        assert!(
-            b.column(0).as_any().downcast_ref::<StringArray>().is_some(),
-            "projected column must be the name (Utf8) column"
-        );
-    }
 }

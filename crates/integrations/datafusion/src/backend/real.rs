@@ -378,33 +378,6 @@ impl FlussSource for RealFlussSource {
         Ok(batches)
     }
 
-    async fn kv_full_scan(
-        &self,
-        table: &TableRef,
-        partition_id: Option<i64>,
-        bucket: i32,
-        projection: Option<&[usize]>,
-    ) -> Result<Vec<RecordBatch>> {
-        let path: TablePath = table.into();
-        let connection = self.connection();
-        let table_handle = connection.get_table(&path).await?;
-        let table_id = table_handle.get_table_info().get_table_id();
-
-        let mut scan = table_handle.new_scan();
-        if let Some(indices) = projection {
-            scan = scan.project(indices)?;
-        }
-        // Merge ONE bucket's changelog into its current state. The client applies
-        // the projection to the merged batch, so do NOT re-project here.
-        let batch = scan
-            .collect_kv_current_state_batch(partition_bucket(table_id, partition_id, bucket))
-            .await?;
-        if batch.num_rows() == 0 {
-            Ok(Vec::new())
-        } else {
-            Ok(vec![batch])
-        }
-    }
 }
 
 #[cfg(test)]

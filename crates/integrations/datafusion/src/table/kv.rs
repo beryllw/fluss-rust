@@ -32,20 +32,19 @@
 //!    bounded scan (the same machinery the log table uses), reading each bucket's
 //!    last-`limit` rows; DataFusion layers the final cross-target `LIMIT`. For a
 //!    partitioned table, partition-column equality prunes the scanned partitions.
-//! 4. **Full scan** — any other predicate shape with NO `LIMIT` runs a full-table
-//!    scan via [`FlussKvFullScanExec`], merging each target bucket's CDC changelog
-//!    into its current state (changelog-only: no kv-snapshot RPC, no RocksDB).
-//!    The same `(partition, bucket)` target computation as the bounded scan is
-//!    used, so partition-column equality prunes the scanned partitions. Its
-//!    completeness is bounded by changelog retention.
+//! 4. **No `LIMIT` and no complete PK / bucket-key prefix lookup** — rejected as
+//!    unsupported. A non-lake KV table does NOT expose a full-table scan path;
+//!    reading its current state from the changelog is reserved for lake-enabled
+//!    tables, where the fluss-lake kernel unions the tiered lake snapshot with the
+//!    residual changelog tail.
 //!
 //! `supports_filters_pushdown` is precedence-aware so it is sound: a filter is
 //! `Exact` (consumed, no residual `FilterExec`) ONLY when the matching exec will
 //! actually apply it — a complete PK equality (point lookup) or a complete
-//! bucket-key prefix equality (prefix lookup). Otherwise the bounded-scan / full-
-//! scan path runs, which does NOT apply arbitrary filters, so partition equality
-//! is only `Inexact` (drives pruning, residual `FilterExec` re-applies) and
-//! everything else is `Unsupported`.
+//! bucket-key prefix equality (prefix lookup). Otherwise the bounded-scan /
+//! unsupported path runs, which does NOT apply arbitrary filters, so partition
+//! equality is only `Inexact` (drives pruning, residual `FilterExec` re-applies)
+//! and everything else is `Unsupported`.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -60,7 +59,6 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::Expr;
 
 use crate::backend::{SharedFlussSource, TableRef};
-use crate::execution::kv_full_scan::FlussKvFullScanExec;
 use crate::execution::log_scan::FlussLogScanExec;
 use crate::execution::lookup::FlussKvLookupExec;
 use crate::execution::prefix_lookup::FlussKvPrefixLookupExec;
@@ -305,15 +303,19 @@ impl TableProvider for FlussKvTableProvider {
                 projected_schema,
                 KV_SCAN_PLAN_NAME,
             ))),
-            // 4. No complete PK/prefix equality and no `LIMIT`: full KV scan,
-            //    merging each target bucket's changelog into its current state.
-            None => Ok(Arc::new(FlussKvFullScanExec::new(
-                self.source.clone(),
-                self.table_ref.clone(),
-                projection,
-                targets,
-                projected_schema,
-            ))),
+            // 4. No complete PK/prefix equality and no `LIMIT`: unsupported for
+            //    a non-lake KV table. Full current-state reads require the lake
+            //    kernel (lake snapshot + residual changelog tail), not the
+            //    changelog-only Fluss path.
+            None => Err(
+                crate::error::FlussDatafusionError::UnsupportedQueryPattern(
+                    format!(
+                        "KV table {} requires either a complete primary-key equality, a complete bucket-key prefix equality, or a LIMIT",
+                        self.table_ref
+                    ),
+                )
+                .into(),
+            ),
         }
     }
 }
@@ -379,15 +381,6 @@ mod tests {
             _bucket: i32,
             _projection: Option<&[usize]>,
             _row_limit: Option<usize>,
-        ) -> CrateResult<Vec<RecordBatch>> {
-            unreachable!("not exercised by pushdown unit tests")
-        }
-        async fn kv_full_scan(
-            &self,
-            _table: &TableRef,
-            _partition_id: Option<i64>,
-            _bucket: i32,
-            _projection: Option<&[usize]>,
         ) -> CrateResult<Vec<RecordBatch>> {
             unreachable!("not exercised by pushdown unit tests")
         }
