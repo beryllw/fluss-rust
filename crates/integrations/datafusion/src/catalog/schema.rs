@@ -49,6 +49,39 @@ impl FlussSchemaProvider {
     pub(crate) fn new(database: String, loader: Arc<MetadataLoader>) -> Self {
         Self { database, loader }
     }
+
+    /// Builds the lake-only provider for `<base>$lake`: reads only the Paimon
+    /// lake snapshot of `base` (no Fluss log tail). `base` must be a lake-enabled
+    /// table; a missing `base` is `Ok(None)` (table not found).
+    #[cfg(feature = "lake")]
+    async fn lake_only_table(
+        &self,
+        base: &str,
+    ) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        let base_ref = TableRef::new(self.database.clone(), base.to_string());
+        let entry = match self.loader.table_entry(&base_ref).await {
+            Ok(entry) => entry,
+            Err(FlussDatafusionError::TableNotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        if !entry.meta.is_paimon_lake() {
+            return Err(FlussDatafusionError::UnsupportedQueryPattern(format!(
+                "`{base}$lake` requires `{base}` to be a lake-enabled (Paimon) table"
+            ))
+            .into());
+        }
+        let provider = FlussUnionTableProvider::with_lake_only(
+            self.loader.source(),
+            base_ref,
+            entry.arrow_schema,
+            entry.meta.schema.clone(),
+            entry.meta.num_buckets,
+            entry.meta.partition_keys.clone(),
+            entry.meta.lake_catalog_properties.clone().unwrap_or_default(),
+            true,
+        );
+        Ok(Some(Arc::new(provider)))
+    }
 }
 
 #[async_trait]
@@ -68,6 +101,23 @@ impl SchemaProvider for FlussSchemaProvider {
     }
 
     async fn table(&self, name: &str) -> DfResult<Option<Arc<dyn TableProvider>>> {
+        // `<table>$lake` reads ONLY the Paimon lake snapshot (no Fluss log tail);
+        // `<table>$lake$<system>` (e.g. `$snapshots`) is a Paimon system table,
+        // not supported yet. Both are only meaningful under the `lake` feature.
+        #[cfg(feature = "lake")]
+        {
+            if let Some(base) = name.strip_suffix("$lake") {
+                return self.lake_only_table(base).await;
+            }
+            if name.contains("$lake$") {
+                return Err(FlussDatafusionError::UnsupportedQueryPattern(format!(
+                    "Paimon lake system table `{name}` is not supported; \
+                     only `<table>` (union read) and `<table>$lake` (lake only) are readable"
+                ))
+                .into());
+            }
+        }
+
         let table_ref = TableRef::new(self.database.clone(), name.to_string());
         let entry = match self.loader.table_entry(&table_ref).await {
             Ok(entry) => entry,

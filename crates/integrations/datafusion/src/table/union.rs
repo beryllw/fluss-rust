@@ -47,6 +47,9 @@ use arrow::datatypes::SchemaRef;
 
 /// A lake-enabled Fluss table (`table.datalake.format = paimon`), append/log or
 /// primary-key. The kernel selects append stitch vs PK merge internally.
+///
+/// `lake_only` selects the `<table>$lake` read shape: only the Paimon lake
+/// snapshot (current state) is returned, with no Fluss log tail union.
 pub(crate) struct FlussUnionTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
@@ -55,6 +58,7 @@ pub(crate) struct FlussUnionTableProvider {
     num_buckets: i32,
     partition_keys: Vec<String>,
     lake_catalog_properties: std::collections::HashMap<String, String>,
+    lake_only: bool,
 }
 
 impl std::fmt::Debug for FlussUnionTableProvider {
@@ -75,6 +79,31 @@ impl FlussUnionTableProvider {
         partition_keys: Vec<String>,
         lake_catalog_properties: std::collections::HashMap<String, String>,
     ) -> Self {
+        Self::with_lake_only(
+            source,
+            table_ref,
+            schema,
+            fluss_schema,
+            num_buckets,
+            partition_keys,
+            lake_catalog_properties,
+            false,
+        )
+    }
+
+    /// Builds the provider in lake-only mode (`<table>$lake`): only the Paimon
+    /// lake snapshot is read, with no Fluss log tail union.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_lake_only(
+        source: SharedFlussSource,
+        table_ref: TableRef,
+        schema: SchemaRef,
+        fluss_schema: fluss::metadata::Schema,
+        num_buckets: i32,
+        partition_keys: Vec<String>,
+        lake_catalog_properties: std::collections::HashMap<String, String>,
+        lake_only: bool,
+    ) -> Self {
         Self {
             source,
             table_ref,
@@ -83,6 +112,7 @@ impl FlussUnionTableProvider {
             num_buckets,
             partition_keys,
             lake_catalog_properties,
+            lake_only,
         }
     }
 }
@@ -149,7 +179,7 @@ impl TableProvider for FlussUnionTableProvider {
             self.partition_keys.clone(),
             self.lake_catalog_properties.clone(),
         );
-        let mut scan = lake_table.new_scan();
+        let mut scan = lake_table.new_scan().with_lake_only(self.lake_only);
         if let Some(indices) = projection {
             scan = scan.with_projection(indices);
         }

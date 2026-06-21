@@ -172,6 +172,7 @@ impl FlussLakeTable {
             projection: None,
             filter: None,
             options: FlussLakeReadOptions::default(),
+            lake_only: false,
         }
     }
 }
@@ -188,6 +189,11 @@ pub struct FlussLakeScan {
     projection: Option<Vec<usize>>,
     filter: Option<FlussLakeFilter>,
     options: FlussLakeReadOptions,
+    /// When true, read ONLY the lake snapshot (Paimon current state) with no
+    /// Fluss log tail — the `<table>$lake` read shape. Implemented by pinning each
+    /// split's log stop offset to its start (seam), so the tail `[seam, seam)` is
+    /// empty and the union/merge degrades to the lake side alone.
+    lake_only: bool,
 }
 
 impl FlussLakeScan {
@@ -206,6 +212,13 @@ impl FlussLakeScan {
         self
     }
 
+    /// Reads only the lake snapshot (Paimon current state), excluding the
+    /// residual Fluss log tail. Used for the `<table>$lake` read shape.
+    pub fn with_lake_only(mut self, lake_only: bool) -> Self {
+        self.lake_only = lake_only;
+        self
+    }
+
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
         let is_pk = self.schema.primary_key().is_some();
         let seam = self.snapshot_boundary().await?;
@@ -218,13 +231,27 @@ impl FlussLakeScan {
         // log offset per bucket now so the read is repeatable and does not absorb
         // rows appended between plan() and read_split(). v1 is non-partitioned, so
         // every target carries partition_id == None and one offset list suffices.
-        let stop_offsets = self.frozen_stop_offsets(&targets).await?;
+        //
+        // In lake-only mode there is no log tail to bound, so skip the
+        // `list_offsets` RPC entirely; each split's stop is pinned to its start
+        // below, yielding an empty `[seam, seam)` tail.
+        let stop_offsets = if self.lake_only {
+            HashMap::new()
+        } else {
+            self.frozen_stop_offsets(&targets).await?
+        };
 
         let splits = targets
             .iter()
             .map(|&(partition_id, bucket)| {
                 let log_start_offset = seam.seam_offset(partition_id, bucket).unwrap_or(0);
-                let log_stop_offset = stop_offsets.get(&bucket).copied();
+                // Lake-only: pin the stop to the start so the Fluss log tail is
+                // empty and only the lake snapshot is read.
+                let log_stop_offset = if self.lake_only {
+                    Some(log_start_offset)
+                } else {
+                    stop_offsets.get(&bucket).copied()
+                };
                 let task = if is_pk {
                     ReadTask::PrimaryKey(PkSplitSpec {
                         partition_id,

@@ -192,6 +192,20 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         "lake(1,2,3 tiered) ++ log_tail(4,5,6)"
     );
 
+    // `<table>$lake` reads ONLY the Paimon lake snapshot — the tiered batch 1 —
+    // and must NOT include batch 2, which is still in the Fluss log tail. `$` is a
+    // valid identifier-part char in DataFusion's dialect, so the suffix needs no
+    // quoting (same as Flink's `FROM <table>$lake`).
+    let lake_sql = format!("SELECT id FROM {CATALOG}.{DATABASE}.{TABLE}$lake");
+    let lake_batches = ctx.sql(&lake_sql).await.unwrap().collect().await.unwrap();
+    let mut lake_ids = collect_i32(&lake_batches, 0);
+    lake_ids.sort_unstable();
+    assert_eq!(
+        lake_ids,
+        vec![1, 2, 3],
+        "$lake returns only the tiered lake snapshot, excluding the log tail"
+    );
+
     clear_test_lake_s3_endpoint_override();
     cluster.stop();
 }
