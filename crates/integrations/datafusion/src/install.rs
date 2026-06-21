@@ -52,9 +52,10 @@ impl FlussDatafusion {
     /// crate never depends on `FlussConnection` outside this boundary.
     pub async fn new(
         connection: Arc<FlussConnection>,
-        _options: FlussDatafusionOptions,
+        options: FlussDatafusionOptions,
     ) -> Result<Self> {
-        let source: SharedFlussSource = Arc::new(RealFlussSource::new(connection));
+        let source: SharedFlussSource =
+            Arc::new(RealFlussSource::new(connection, options.lake_storage_options));
         Ok(Self::from_source(source))
     }
 

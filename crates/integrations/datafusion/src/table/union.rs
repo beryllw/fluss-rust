@@ -169,6 +169,13 @@ impl TableProvider for FlussUnionTableProvider {
         let connection = real.connection();
         let table_path: fluss::metadata::TablePath = (&self.table_ref).into();
 
+        // Merge caller-supplied lake storage options (e.g. S3 credentials the
+        // server strips from table properties) over the server-derived catalog
+        // properties, caller-wins, just before opening the Paimon catalog. This
+        // mirrors how the Flink Fluss catalog forwards its `paimon.*` options.
+        let lake_catalog_properties =
+            merged_lake_properties(&self.lake_catalog_properties, real.lake_storage_options());
+
         // The kernel owns everything: seam resolution, lake planning, append
         // stitch / PK merge. We only build the scan, plan it, and create a reader.
         let lake_table = FlussLakeTable::new(
@@ -177,7 +184,7 @@ impl TableProvider for FlussUnionTableProvider {
             self.fluss_schema.clone(),
             self.num_buckets,
             self.partition_keys.clone(),
-            self.lake_catalog_properties.clone(),
+            lake_catalog_properties,
         );
         let mut scan = lake_table.new_scan().with_lake_only(self.lake_only);
         if let Some(indices) = projection {
@@ -192,5 +199,61 @@ impl TableProvider for FlussUnionTableProvider {
             .map_err(|e| FlussDatafusionError::Internal(e.to_string()))?;
 
         Ok(Arc::new(FlussUnionScanExec::new(plan, read)))
+    }
+}
+
+/// Merges caller-supplied lake storage options over server-derived catalog
+/// properties, **caller-wins** (the caller may both add missing keys like
+/// credentials and override server values like the S3 endpoint/region). Returns
+/// the server properties unchanged when the caller supplies none.
+fn merged_lake_properties(
+    server: &std::collections::HashMap<String, String>,
+    caller: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    if caller.is_empty() {
+        return server.clone();
+    }
+    let mut merged = server.clone();
+    for (k, v) in caller {
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::merged_lake_properties;
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn caller_adds_missing_credentials_and_keeps_server_values() {
+        let server = map(&[("warehouse", "s3://b/wh"), ("s3.endpoint", "http://rustfs:9000")]);
+        let caller = map(&[("s3.access-key", "AK"), ("s3.secret-key", "SK")]);
+        let merged = merged_lake_properties(&server, &caller);
+        assert_eq!(merged.get("warehouse").unwrap(), "s3://b/wh");
+        assert_eq!(merged.get("s3.endpoint").unwrap(), "http://rustfs:9000");
+        assert_eq!(merged.get("s3.access-key").unwrap(), "AK");
+        assert_eq!(merged.get("s3.secret-key").unwrap(), "SK");
+    }
+
+    #[test]
+    fn caller_wins_on_key_conflicts() {
+        let server = map(&[("s3.endpoint", "http://rustfs:9000"), ("s3.region", "us-east-1")]);
+        let caller = map(&[("s3.endpoint", "http://localhost:1234")]);
+        let merged = merged_lake_properties(&server, &caller);
+        assert_eq!(merged.get("s3.endpoint").unwrap(), "http://localhost:1234");
+        assert_eq!(merged.get("s3.region").unwrap(), "us-east-1");
+    }
+
+    #[test]
+    fn empty_caller_returns_server_unchanged() {
+        let server = map(&[("warehouse", "s3://b/wh")]);
+        let merged = merged_lake_properties(&server, &HashMap::new());
+        assert_eq!(merged, server);
     }
 }

@@ -15,10 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-/// Installer-wide options. Empty placeholder for now (the catalog is fully live
-/// with no cache to tune), kept as a stable type for future global options.
+/// Installer-wide options.
 #[derive(Debug, Clone, Default)]
-pub struct FlussDatafusionOptions {}
+pub struct FlussDatafusionOptions {
+    /// Prefix-stripped lake storage options (e.g. `s3.access-key`,
+    /// `s3.secret-key`, `s3.region`, `s3.endpoint`) merged into every lake
+    /// table's server-derived catalog properties just before the Paimon catalog
+    /// is opened, with CALLER-WINS precedence.
+    ///
+    /// Use this to supply the storage credentials the Fluss server strips from
+    /// table properties by policy (the caller holds them via its own secure
+    /// config) — mirroring how the Flink Fluss catalog forwards its `paimon.*`
+    /// options into the lake catalog. Empty by default (no behavior change), and
+    /// never merged into the table's displayed `$options`.
+    pub lake_storage_options: std::collections::HashMap<String, String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct RegisterCatalogOptions {}

@@ -23,11 +23,17 @@
 //! path end to end: cluster-level Paimon datalake config behind RustFS (S3), a
 //! `table.datalake.enabled = true` table discovered via its server-derived
 //! properties (routing through the union provider), the real tiering job, and a
-//! real `get_latest_lake_snapshot` seam. The only test hook is the S3 endpoint
-//! rewrite so the in-process Paimon reader reaches the host-mapped store.
+//! real `get_latest_lake_snapshot` seam.
+//!
+//! Storage credentials are supplied through the PRODUCTION API
+//! (`FlussDatafusionOptions.lake_storage_options`), NOT the test-only override —
+//! the Fluss server strips S3 credentials from table properties, so this is the
+//! path a real gateway must use, and exercising it here guards against the gap
+//! where the test override previously masked the missing production injection.
 
 #![cfg(feature = "integration_tests")]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -37,13 +43,10 @@ use datafusion::execution::context::SessionContext;
 use fluss::client::FlussConnection;
 use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
 use fluss::row::GenericRow;
-use fluss_datafusion::{
-    FlussDatafusion, RegisterCatalogOptions, clear_test_lake_s3_endpoint_override,
-    set_test_lake_s3_endpoint_override,
-};
+use fluss_datafusion::{FlussDatafusion, FlussDatafusionOptions, RegisterCatalogOptions};
 use fluss_test_cluster::{FlussTestingClusterBuilder, PaimonLakeConfig};
 
-use crate::integration::utils::helpers::{collect_i32, collect_strings, options};
+use crate::integration::utils::helpers::{collect_i32, collect_strings};
 
 const DATABASE: &str = "fluss";
 const TABLE: &str = "df_lake_tiering_sql";
@@ -157,11 +160,28 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         .build()
         .await;
     let connection = Arc::new(cluster.get_fluss_connection().await);
-    set_test_lake_s3_endpoint_override(
-        cluster.s3_endpoint_host().unwrap(),
-        cluster.s3_access_key().unwrap(),
-        cluster.s3_secret_key().unwrap(),
-    );
+
+    // Production credential injection: the server strips S3 credentials from the
+    // table properties, so supply them (plus the host-mapped endpoint) through
+    // FlussDatafusionOptions.lake_storage_options — caller-wins over server props.
+    let df_options = FlussDatafusionOptions {
+        lake_storage_options: HashMap::from([
+            (
+                "s3.endpoint".to_string(),
+                cluster.s3_endpoint_host().unwrap().to_string(),
+            ),
+            (
+                "s3.access-key".to_string(),
+                cluster.s3_access_key().unwrap().to_string(),
+            ),
+            (
+                "s3.secret-key".to_string(),
+                cluster.s3_secret_key().unwrap().to_string(),
+            ),
+            ("s3.region".to_string(), "us-east-1".to_string()),
+            ("s3.path-style-access".to_string(), "true".to_string()),
+        ]),
+    };
 
     let table_path = TablePath::new(DATABASE, TABLE);
     let admin = connection.get_admin().unwrap();
@@ -271,7 +291,7 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
     pk_writer.flush().await.unwrap();
 
     // Read through the full SQL stack: discovery -> union provider -> union scan.
-    let fd = FlussDatafusion::new(connection.clone(), options())
+    let fd = FlussDatafusion::new(connection.clone(), df_options)
         .await
         .unwrap();
     let ctx = SessionContext::new();
@@ -349,7 +369,17 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         vec!["paimon".to_string()],
         "$options reports datalake.format=paimon"
     );
+    // The server strips S3 credentials from table properties, and the caller's
+    // lake_storage_options are merged only at lake-read time (not into the table
+    // metadata), so $options must never surface credentials.
+    assert!(
+        opt_value("datalake.paimon.s3.access-key").await.is_empty(),
+        "$options must not surface S3 credentials"
+    );
+    assert!(
+        opt_value("datalake.paimon.s3.secret-key").await.is_empty(),
+        "$options must not surface S3 credentials"
+    );
 
-    clear_test_lake_s3_endpoint_override();
     cluster.stop();
 }

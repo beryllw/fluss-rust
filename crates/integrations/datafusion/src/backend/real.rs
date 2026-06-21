@@ -23,6 +23,7 @@
 //! `FlussTable` borrows the connection by reference, so this type holds an
 //! `Arc<FlussConnection>` and rebuilds the table / lookuper / scanner per call.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,18 +48,35 @@ use crate::error::{FlussDatafusionError, Result};
 /// concurrent swap only affects calls that start after it.
 pub(crate) struct RealFlussSource {
     connection: ArcSwap<FlussConnection>,
+    /// Caller-supplied lake storage options (e.g. S3 credentials the server
+    /// strips from table properties). Merged caller-wins into a lake table's
+    /// catalog properties when the lake read opens the Paimon catalog. Empty by
+    /// default. Never surfaced via `$options`. Only read under the `lake` feature.
+    #[cfg_attr(not(feature = "lake"), allow(dead_code))]
+    lake_storage_options: HashMap<String, String>,
 }
 
 impl RealFlussSource {
-    pub(crate) fn new(connection: Arc<FlussConnection>) -> Self {
+    pub(crate) fn new(
+        connection: Arc<FlussConnection>,
+        lake_storage_options: HashMap<String, String>,
+    ) -> Self {
         Self {
             connection: ArcSwap::from(connection),
+            lake_storage_options,
         }
     }
 
     /// The connection currently in use. Each call snapshots the live value.
     pub(crate) fn connection(&self) -> Arc<FlussConnection> {
         self.connection.load_full()
+    }
+
+    /// Caller-supplied lake storage options to merge (caller-wins) into a lake
+    /// table's catalog properties before opening the Paimon catalog.
+    #[cfg_attr(not(feature = "lake"), allow(dead_code))]
+    pub(crate) fn lake_storage_options(&self) -> &HashMap<String, String> {
+        &self.lake_storage_options
     }
 
     /// Atomically replaces the underlying connection. Calls already in flight
