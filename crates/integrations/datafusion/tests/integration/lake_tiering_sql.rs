@@ -36,6 +36,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as
 use datafusion::execution::context::SessionContext;
 use fluss::client::FlussConnection;
 use fluss::metadata::{DataTypes, Schema, TableBucket, TableDescriptor, TablePath};
+use fluss::row::GenericRow;
 use fluss_datafusion::{
     FlussDatafusion, RegisterCatalogOptions, clear_test_lake_s3_endpoint_override,
     set_test_lake_s3_endpoint_override,
@@ -46,7 +47,49 @@ use crate::integration::utils::helpers::{collect_i32, collect_strings, options};
 
 const DATABASE: &str = "fluss";
 const TABLE: &str = "df_lake_tiering_sql";
+const PK_TABLE: &str = "df_lake_tiering_sql_pk";
 const CATALOG: &str = "fluss";
+
+fn pk_row(id: i32, name: &str) -> GenericRow<'static> {
+    let mut r = GenericRow::new(2);
+    r.set_field(0, id);
+    r.set_field(1, name.to_string());
+    r
+}
+
+/// Latest log offset for bucket 0 — the PK seam target, robust to how many
+/// changelog records each upsert produces.
+async fn latest_offset(connection: &FlussConnection, table_path: &TablePath) -> i64 {
+    let admin = connection.get_admin().unwrap();
+    let start = Instant::now();
+    loop {
+        let offset = admin
+            .list_offsets(table_path, &[0], fluss::rpc::message::OffsetSpec::Latest)
+            .await
+            .ok()
+            .and_then(|m| m.get(&0).copied());
+        if let Some(off) = offset {
+            return off;
+        }
+        if start.elapsed() >= Duration::from_secs(30) {
+            panic!("bucket 0 of {table_path} not ready in 30s");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+fn collect_pairs(batches: &[RecordBatch]) -> Vec<(i32, String)> {
+    let mut out = Vec::new();
+    for b in batches {
+        let ids = b.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        let names = b.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+        for i in 0..b.num_rows() {
+            out.push((ids.value(i), names.value(i).to_string()));
+        }
+    }
+    out.sort();
+    out
+}
 
 fn batch(ids: &[i32], names: &[&str]) -> RecordBatch {
     let schema = Arc::new(ArrowSchema::new(vec![
@@ -146,13 +189,53 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         .unwrap()
         .get_table_id();
 
-    // Batch 1 (1,2,3) -> real tiering -> stop to freeze the seam.
+    // A PRIMARY-KEY lake table (the shape of e.g. an orders-history table), read
+    // through the same union path but with PK merge instead of append stitch.
+    let pk_path = TablePath::new(DATABASE, PK_TABLE);
+    admin
+        .create_table(
+            &pk_path,
+            &TableDescriptor::builder()
+                .schema(
+                    Schema::builder()
+                        .column("id", DataTypes::int())
+                        .column("name", DataTypes::string())
+                        .primary_key(vec!["id".to_string()])
+                        .build()
+                        .unwrap(),
+                )
+                .distributed_by(Some(1), vec![])
+                .property("table.datalake.enabled", "true")
+                .property("table.datalake.freshness", "30s")
+                .build()
+                .unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+    let pk_table_id = admin
+        .get_table_info(&pk_path)
+        .await
+        .unwrap()
+        .get_table_id();
+
+    // Batch 1 -> real tiering -> stop to freeze the seam(s).
     write_append(
         &connection,
         &table_path,
         batch(&[1, 2, 3], &["a", "b", "c"]),
     )
     .await;
+
+    // PK batch 1: upsert ids 1,2,3.
+    let pk_table = connection.get_table(&pk_path).await.unwrap();
+    let pk_writer = pk_table.new_upsert().unwrap().create_writer().unwrap();
+    pk_writer.upsert(&pk_row(1, "v1")).unwrap();
+    pk_writer.upsert(&pk_row(2, "v2")).unwrap();
+    pk_writer.upsert(&pk_row(3, "v3")).unwrap();
+    pk_writer.flush().await.unwrap();
+    let pk_seam = latest_offset(&connection, &pk_path).await;
+
     let tiering = cluster.start_paimon_tiering().await;
     wait_for_lake_seam(
         &connection,
@@ -162,16 +245,30 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         Duration::from_secs(240),
     )
     .await;
+    wait_for_lake_seam(
+        &connection,
+        &pk_path,
+        pk_table_id,
+        pk_seam,
+        Duration::from_secs(240),
+    )
+    .await;
     tiering.stop().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // Batch 2 (4,5,6) stays in the Fluss log tail.
+    // Batch 2 stays in the Fluss log tail.
     write_append(
         &connection,
         &table_path,
         batch(&[4, 5, 6], &["d", "e", "f"]),
     )
     .await;
+
+    // PK batch 2 (log tail): update id 2, delete id 3, insert id 4.
+    pk_writer.upsert(&pk_row(2, "v2b")).unwrap();
+    pk_writer.delete(&pk_row(3, "v3")).unwrap();
+    pk_writer.upsert(&pk_row(4, "v4")).unwrap();
+    pk_writer.flush().await.unwrap();
 
     // Read through the full SQL stack: discovery -> union provider -> union scan.
     let fd = FlussDatafusion::new(connection.clone(), options())
@@ -204,6 +301,31 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         lake_ids,
         vec![1, 2, 3],
         "$lake returns only the tiered lake snapshot, excluding the log tail"
+    );
+
+    // PK lake table union read: lake current state (1,2,3) merged with the
+    // changelog tail (update 2, delete 3, insert 4) => {1:v1, 2:v2b, 4:v4}.
+    let pk_sql = format!("SELECT id, name FROM {CATALOG}.{DATABASE}.{PK_TABLE}");
+    let pk_batches = ctx.sql(&pk_sql).await.unwrap().collect().await.unwrap();
+    assert_eq!(
+        collect_pairs(&pk_batches),
+        vec![
+            (1, "v1".to_string()),
+            (2, "v2b".to_string()),
+            (4, "v4".to_string()),
+        ],
+        "PK union read: id3 deleted, id2 updated, id4 inserted, id1 from lake"
+    );
+
+    // PK `<table>$lake`: only the tiered lake snapshot (1,2,3), no changelog tail.
+    let pk_lake_sql = format!("SELECT id FROM {CATALOG}.{DATABASE}.{PK_TABLE}$lake");
+    let pk_lake_batches = ctx.sql(&pk_lake_sql).await.unwrap().collect().await.unwrap();
+    let mut pk_lake_ids = collect_i32(&pk_lake_batches, 0);
+    pk_lake_ids.sort_unstable();
+    assert_eq!(
+        pk_lake_ids,
+        vec![1, 2, 3],
+        "PK $lake returns only the tiered lake snapshot"
     );
 
     // `<table>$options` reports the table is lake-enabled (湖流一体) and its format.
