@@ -28,19 +28,24 @@ use std::sync::Arc;
 use arrow::datatypes::SchemaRef;
 use fluss::client::FlussConnection;
 use fluss::metadata::TablePath;
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{get_table_at_snapshot, open_catalog};
 use crate::config::LakeCatalogConfig;
-use crate::error::{FlussLakeError, Result};
+use crate::error::Result;
 use crate::reader::RecordBatchStream;
 use crate::reader::lake::read_lake_table;
 use crate::reader::log::FlussLogTailReader;
 use crate::union::{UnionPartition, union_append_partition};
 
-/// Internal append/log execution spec for one logical read split (one bucket).
-#[derive(Debug, Clone)]
+/// Internal append/log execution spec for one logical read split (one
+/// `(partition, bucket)`). Serialized into the public split's opaque execution
+/// descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppendSplitSpec {
     pub partition_id: Option<i64>,
+    /// Ordered partition key/value pairs; empty for a non-partitioned table.
+    pub partition_values: Vec<(String, String)>,
     pub bucket: i32,
     pub snapshot_id: i64,
     /// Inclusive log start (the lake seam).
@@ -63,15 +68,6 @@ pub(crate) async fn open_append_split(
     projected_column_indices: Option<Vec<usize>>,
     split: &AppendSplitSpec,
 ) -> Result<RecordBatchStream> {
-    // Partitioned lake union is not supported yet: the lake read is filtered by
-    // bucket only, so a partitioned table (where buckets repeat across
-    // partitions) would mix partitions. Reject rather than return wrong rows.
-    if split.partition_id.is_some() {
-        return Err(FlussLakeError::Internal(
-            "lake union read of partitioned tables is not yet supported".to_string(),
-        ));
-    }
-
     let catalog = open_catalog(&LakeCatalogConfig::from_catalog_properties(
         lake_catalog_properties,
     )?)
@@ -83,10 +79,15 @@ pub(crate) async fn open_append_split(
         split.snapshot_id,
     )
     .await?;
-    // Restrict the lake read to this split's bucket so each execution partition
-    // reads only its own lake data instead of the whole snapshot.
-    let lake_stream =
-        read_lake_table(&lake_table, projected_column_names, Some(split.bucket)).await?;
+    // Restrict the lake read to this split's partition + bucket so each execution
+    // partition reads only its own lake data.
+    let lake_stream = read_lake_table(
+        &lake_table,
+        projected_column_names,
+        Some(split.bucket),
+        &split.partition_values,
+    )
+    .await?;
 
     let log_reader = FlussLogTailReader::new(
         connection,

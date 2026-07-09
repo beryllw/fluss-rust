@@ -66,7 +66,7 @@ impl LakeCatalogConfig {
             .map(|w| w.is_empty())
             .unwrap_or(true)
         {
-            return Err(FlussLakeError::InvalidCatalogConfig(format!(
+            return Err(FlussLakeError::NotLakeReadable(format!(
                 "missing required `{}` in lake catalog properties",
                 CatalogOptions::WAREHOUSE
             )));
@@ -115,13 +115,13 @@ mod tests {
         let err =
             LakeCatalogConfig::from_catalog_properties(&props(&[("metastore", "filesystem")]))
                 .unwrap_err();
-        assert!(matches!(err, FlussLakeError::InvalidCatalogConfig(_)));
+        assert!(matches!(err, FlussLakeError::NotLakeReadable(_)));
     }
 
     #[test]
     fn rejects_empty_warehouse() {
         let err =
             LakeCatalogConfig::from_catalog_properties(&props(&[("warehouse", "")])).unwrap_err();
-        assert!(matches!(err, FlussLakeError::InvalidCatalogConfig(_)));
+        assert!(matches!(err, FlussLakeError::NotLakeReadable(_)));
     }
 }

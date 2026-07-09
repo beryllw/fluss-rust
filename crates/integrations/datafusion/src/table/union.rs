@@ -23,8 +23,9 @@
 //! inside `fluss-lake`; the connector never sees seams, lake splits, or merge
 //! state.
 //!
-//! Value-filter pushdown is not offered yet: every filter stays `Unsupported`, so
-//! residual `FilterExec`s remain above the scan.
+//! Value-filter pushdown: filters that translate to a `FlussLakePredicate` are
+//! reported `Exact` and pushed into the scan (the kernel applies them exactly);
+//! anything that does not translate stays `Unsupported` (residual `FilterExec`).
 
 use std::any::Any;
 use std::sync::Arc;
@@ -32,11 +33,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::error::Result as DfResult;
-use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
+use datafusion::logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::empty::EmptyExec;
 use datafusion::prelude::Expr;
-use fluss_lake::FlussLakeTable;
+use datafusion::scalar::ScalarValue;
+use fluss_lake::{FlussLakeComparisonOp, FlussLakeLiteral, FlussLakePredicate, FlussLakeTable};
 
 use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
@@ -205,11 +207,19 @@ impl TableProvider for FlussUnionTableProvider {
                     .collect());
             }
         }
-        // Otherwise the union read runs and applies no filters: residual filters
-        // are re-applied by a `FilterExec` above the scan.
+        // Otherwise the union read runs; the kernel applies pushed predicates
+        // exactly, so any filter we can translate to a FlussLakePredicate is
+        // `Exact` (no residual). Filters we cannot translate stay `Unsupported`
+        // and are re-applied by a `FilterExec` above the scan.
         Ok(filters
             .iter()
-            .map(|_| TableProviderFilterPushDown::Unsupported)
+            .map(|f| {
+                if expr_to_lake_predicate(f).is_some() {
+                    TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
             .collect())
     }
 
@@ -290,6 +300,9 @@ impl TableProvider for FlussUnionTableProvider {
         if let Some(indices) = projection {
             scan = scan.with_projection(indices);
         }
+        if let Some(predicate) = filters_to_lake_predicate(filters) {
+            scan = scan.with_filter(predicate);
+        }
         let plan = scan
             .plan()
             .await
@@ -320,11 +333,150 @@ fn merged_lake_properties(
     merged
 }
 
+/// Combines the DataFusion filters into a single `FlussLakePredicate` (top-level
+/// `AND`), translating each conjunct. Untranslatable conjuncts are dropped here
+/// but are reported `Unsupported` in `supports_filters_pushdown`, so they remain
+/// residual `FilterExec`s and are never silently lost.
+fn filters_to_lake_predicate(filters: &[Expr]) -> Option<FlussLakePredicate> {
+    let mut conjuncts: Vec<FlussLakePredicate> = filters
+        .iter()
+        .filter_map(expr_to_lake_predicate)
+        .collect();
+    match conjuncts.len() {
+        0 => None,
+        1 => Some(conjuncts.pop().unwrap()),
+        _ => Some(FlussLakePredicate::and(conjuncts)),
+    }
+}
+
+/// Translates a DataFusion [`Expr`] into a [`FlussLakePredicate`], or `None` when
+/// the shape is not supported (the caller keeps it as a residual filter).
+fn expr_to_lake_predicate(expr: &Expr) -> Option<FlussLakePredicate> {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            Operator::And => Some(FlussLakePredicate::and(vec![
+                expr_to_lake_predicate(left)?,
+                expr_to_lake_predicate(right)?,
+            ])),
+            Operator::Or => Some(FlussLakePredicate::or(vec![
+                expr_to_lake_predicate(left)?,
+                expr_to_lake_predicate(right)?,
+            ])),
+            Operator::Eq | Operator::NotEq | Operator::Lt | Operator::LtEq | Operator::Gt
+            | Operator::GtEq => {
+                let (column, scalar, flipped) = column_and_literal(left, right)?;
+                let op = map_comparison_op(*op, flipped)?;
+                Some(FlussLakePredicate::Comparison {
+                    column,
+                    op,
+                    value: scalar_to_literal(&scalar)?,
+                })
+            }
+            _ => None,
+        },
+        Expr::IsNull(inner) => Some(FlussLakePredicate::is_null(as_column(inner)?)),
+        Expr::IsNotNull(inner) => Some(FlussLakePredicate::is_not_null(as_column(inner)?)),
+        Expr::InList(in_list) => {
+            let column = as_column(&in_list.expr)?;
+            let mut values = Vec::with_capacity(in_list.list.len());
+            for item in &in_list.list {
+                values.push(scalar_to_literal(&as_literal(item)?)?);
+            }
+            Some(FlussLakePredicate::In {
+                column,
+                values,
+                negated: in_list.negated,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Extracts `(column_name, literal, flipped)` from a binary comparison's two
+/// sides, accepting either `col OP lit` (flipped=false) or `lit OP col`
+/// (flipped=true).
+fn column_and_literal(left: &Expr, right: &Expr) -> Option<(String, ScalarValue, bool)> {
+    match (left, right) {
+        (Expr::Column(col), Expr::Literal(scalar, _)) => {
+            Some((col.name.clone(), scalar.clone(), false))
+        }
+        (Expr::Literal(scalar, _), Expr::Column(col)) => {
+            Some((col.name.clone(), scalar.clone(), true))
+        }
+        _ => None,
+    }
+}
+
+fn as_column(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Column(col) => Some(col.name.clone()),
+        _ => None,
+    }
+}
+
+fn as_literal(expr: &Expr) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(scalar, _) => Some(scalar.clone()),
+        _ => None,
+    }
+}
+
+/// Maps a DataFusion comparison operator to a `FlussLakeComparisonOp`, flipping
+/// the direction when the column and literal were swapped (`lit OP col`).
+fn map_comparison_op(op: Operator, flipped: bool) -> Option<FlussLakeComparisonOp> {
+    Some(match (op, flipped) {
+        (Operator::Eq, _) => FlussLakeComparisonOp::Eq,
+        (Operator::NotEq, _) => FlussLakeComparisonOp::NotEq,
+        (Operator::Lt, false) | (Operator::Gt, true) => FlussLakeComparisonOp::Lt,
+        (Operator::LtEq, false) | (Operator::GtEq, true) => FlussLakeComparisonOp::LtEq,
+        (Operator::Gt, false) | (Operator::Lt, true) => FlussLakeComparisonOp::Gt,
+        (Operator::GtEq, false) | (Operator::LtEq, true) => FlussLakeComparisonOp::GtEq,
+        _ => return None,
+    })
+}
+
+/// Translates a DataFusion [`ScalarValue`] into a [`FlussLakeLiteral`], or `None`
+/// for types the kernel filter does not model.
+fn scalar_to_literal(scalar: &ScalarValue) -> Option<FlussLakeLiteral> {
+    Some(match scalar {
+        ScalarValue::Boolean(Some(v)) => FlussLakeLiteral::Boolean(*v),
+        ScalarValue::Int8(Some(v)) => FlussLakeLiteral::Int32(*v as i32),
+        ScalarValue::Int16(Some(v)) => FlussLakeLiteral::Int32(*v as i32),
+        ScalarValue::Int32(Some(v)) => FlussLakeLiteral::Int32(*v),
+        ScalarValue::Int64(Some(v)) => FlussLakeLiteral::Int64(*v),
+        ScalarValue::Float32(Some(v)) => FlussLakeLiteral::Float64(*v as f64),
+        ScalarValue::Float64(Some(v)) => FlussLakeLiteral::Float64(*v),
+        ScalarValue::Utf8(Some(v)) | ScalarValue::LargeUtf8(Some(v)) => {
+            FlussLakeLiteral::String(v.clone())
+        }
+        ScalarValue::Binary(Some(v)) | ScalarValue::LargeBinary(Some(v)) => {
+            FlussLakeLiteral::Binary(v.clone())
+        }
+        ScalarValue::Date32(Some(v)) => FlussLakeLiteral::Date(*v),
+        ScalarValue::TimestampMicrosecond(Some(v), _) => FlussLakeLiteral::Timestamp(*v),
+        ScalarValue::Boolean(None)
+        | ScalarValue::Int8(None)
+        | ScalarValue::Int16(None)
+        | ScalarValue::Int32(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::Float32(None)
+        | ScalarValue::Float64(None)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::LargeUtf8(None)
+        | ScalarValue::Binary(None)
+        | ScalarValue::LargeBinary(None)
+        | ScalarValue::Date32(None)
+        | ScalarValue::TimestampMicrosecond(None, _) => FlussLakeLiteral::Null,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use super::merged_lake_properties;
+    use super::*;
+    use datafusion::prelude::{col, lit};
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
@@ -355,5 +507,52 @@ mod tests {
         let server = map(&[("warehouse", "s3://b/wh")]);
         let merged = merged_lake_properties(&server, &HashMap::new());
         assert_eq!(merged, server);
+    }
+
+    #[test]
+    fn translates_column_op_literal() {
+        let pred = expr_to_lake_predicate(&col("age").gt(lit(18i32))).unwrap();
+        assert_eq!(
+            pred,
+            FlussLakePredicate::Comparison {
+                column: "age".to_string(),
+                op: FlussLakeComparisonOp::Gt,
+                value: FlussLakeLiteral::Int32(18),
+            }
+        );
+    }
+
+    #[test]
+    fn flips_literal_op_column() {
+        // `18 < age` is equivalent to `age > 18`.
+        let expr = lit(18i32).lt(col("age"));
+        let pred = expr_to_lake_predicate(&expr).unwrap();
+        assert_eq!(
+            pred,
+            FlussLakePredicate::Comparison {
+                column: "age".to_string(),
+                op: FlussLakeComparisonOp::Gt,
+                value: FlussLakeLiteral::Int32(18),
+            }
+        );
+    }
+
+    #[test]
+    fn translates_and_of_conjuncts() {
+        let filters = vec![
+            col("dt").eq(lit("2024")),
+            col("age").gt_eq(lit(18i32)),
+        ];
+        let pred = filters_to_lake_predicate(&filters).unwrap();
+        match pred {
+            FlussLakePredicate::And(children) => assert_eq!(children.len(), 2),
+            other => panic!("expected And, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn untranslatable_expr_returns_none() {
+        // Column-vs-column comparison is not a supported pushdown shape.
+        assert!(expr_to_lake_predicate(&col("a").eq(col("b"))).is_none());
     }
 }

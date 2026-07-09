@@ -32,6 +32,7 @@ use fluss::client::FlussConnection;
 use fluss::metadata::{Schema, TablePath};
 use fluss::record::to_arrow_schema;
 use paimon::spec::{CoreOptions, MergeEngine};
+use serde::{Deserialize, Serialize};
 
 use crate::catalog::{get_table_at_snapshot, open_catalog};
 use crate::config::LakeCatalogConfig;
@@ -41,10 +42,13 @@ use crate::reader::changelog::read_pk_changelog_tail;
 use crate::reader::lake::read_lake_table;
 use crate::reader::merge::pk_merge;
 
-/// Internal PK execution spec for one logical read split (one bucket).
-#[derive(Debug, Clone)]
+/// Internal PK execution spec for one logical read split (one `(partition,
+/// bucket)`). Serialized into the public split's opaque execution descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PkSplitSpec {
     pub partition_id: Option<i64>,
+    /// Ordered partition key/value pairs; empty for a non-partitioned table.
+    pub partition_values: Vec<(String, String)>,
     pub bucket: i32,
     pub snapshot_id: i64,
     /// Inclusive log start (the lake seam).
@@ -62,14 +66,8 @@ pub(crate) async fn open_pk_split(
     projection: Option<Vec<usize>>,
     spec: &PkSplitSpec,
 ) -> Result<RecordBatchStream> {
-    // Partitioned PK union is not supported yet: the lake read is filtered by
-    // bucket only, so a partitioned table would mix partitions.
-    if spec.partition_id.is_some() {
-        return Err(FlussLakeError::Internal(
-            "lake union read of partitioned tables is not yet supported".to_string(),
-        ));
-    }
-
+    // Partitioned PK union is now supported: the lake read is restricted to this
+    // split's partition (and bucket) via a pushed partition-equality predicate.
     let catalog = open_catalog(&LakeCatalogConfig::from_catalog_properties(
         lake_catalog_properties,
     )?)
@@ -87,8 +85,9 @@ pub(crate) async fn open_pk_split(
     validate_pk_merge_engine(lake_table.schema().options())?;
 
     // Lake side: full columns (PK columns required for the merge key), restricted
-    // to this bucket. Projection is applied after the merge.
-    let lake_stream = read_lake_table(&lake_table, None, Some(spec.bucket)).await?;
+    // to this partition + bucket. Projection is applied after the merge.
+    let lake_stream =
+        read_lake_table(&lake_table, None, Some(spec.bucket), &spec.partition_values).await?;
 
     let full_schema = to_arrow_schema(fluss_schema.row_type())?;
     let pk_indexes = fluss_schema.primary_key_indexes();

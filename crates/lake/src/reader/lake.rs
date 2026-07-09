@@ -27,9 +27,14 @@
 //! per-bucket union execution partition reads ONLY its own lake data. This
 //! relies on Fluss and Paimon assigning the same bucket id to a row, which holds
 //! because a lake-enabled Fluss table buckets with the data lake's algorithm.
+//!
+//! For a partitioned table the read is additionally restricted to one partition
+//! by pushing a partition-equality predicate to Paimon, so a `(partition,
+//! bucket)` split never mixes rows from other partitions.
 
 use futures::StreamExt;
 use paimon::Table;
+use paimon::spec::{DataType, Datum, Predicate, PredicateBuilder};
 
 use crate::error::{FlussLakeError, Result};
 use crate::reader::RecordBatchStream;
@@ -42,17 +47,22 @@ use crate::reader::RecordBatchStream;
 /// is also what excludes Paimon system columns from the lake batches.
 ///
 /// `bucket` restricts the read to one Paimon bucket; `None` reads every bucket.
-/// A per-bucket union partition MUST pass its target bucket, otherwise every
-/// partition would re-emit the whole lake snapshot.
+/// `partition_values` (empty for non-partitioned tables) restricts the read to
+/// one partition via a pushed partition-equality predicate.
 pub async fn read_lake_table(
     table: &Table,
     projection: Option<&[String]>,
     bucket: Option<i32>,
+    partition_values: &[(String, String)],
 ) -> Result<RecordBatchStream> {
     let mut read_builder = table.new_read_builder();
     if let Some(columns) = projection {
         let refs: Vec<&str> = columns.iter().map(String::as_str).collect();
         read_builder.with_projection(&refs);
+    }
+    if !partition_values.is_empty() {
+        let predicate = build_partition_predicate(table, partition_values)?;
+        read_builder.with_filter(predicate);
     }
     let plan = read_builder.new_scan().plan().await?;
     let read = read_builder.new_read()?;
@@ -69,4 +79,51 @@ pub async fn read_lake_table(
     Ok(stream
         .map(|item| item.map_err(FlussLakeError::from))
         .boxed())
+}
+
+/// Builds a conjunctive partition-equality predicate (`k1 = v1 AND ...`) so the
+/// Paimon scan prunes to exactly one partition.
+fn build_partition_predicate(
+    table: &Table,
+    partition_values: &[(String, String)],
+) -> Result<Predicate> {
+    let fields = table.schema().fields();
+    let builder = PredicateBuilder::new(fields);
+    let mut preds = Vec::with_capacity(partition_values.len());
+    for (key, value) in partition_values {
+        let field = fields.iter().find(|f| f.name() == key).ok_or_else(|| {
+            FlussLakeError::SchemaIncompatible(format!(
+                "partition key `{key}` is absent from the lake table schema"
+            ))
+        })?;
+        let datum = string_to_datum(field.data_type(), value)?;
+        preds.push(builder.equal(key, datum)?);
+    }
+    Ok(Predicate::and(preds))
+}
+
+/// Converts a canonical partition value string into a Paimon [`Datum`] of the
+/// partition column's type. Covers the scalar types allowed as partition keys.
+fn string_to_datum(dt: &DataType, value: &str) -> Result<Datum> {
+    let parse_err = |ty: &str| {
+        FlussLakeError::PlanningFailed(format!(
+            "cannot parse partition value `{value}` as {ty}"
+        ))
+    };
+    Ok(match dt {
+        DataType::Boolean(_) => Datum::Bool(value.parse().map_err(|_| parse_err("boolean"))?),
+        DataType::TinyInt(_) => Datum::TinyInt(value.parse().map_err(|_| parse_err("tinyint"))?),
+        DataType::SmallInt(_) => Datum::SmallInt(value.parse().map_err(|_| parse_err("smallint"))?),
+        DataType::Int(_) => Datum::Int(value.parse().map_err(|_| parse_err("int"))?),
+        DataType::BigInt(_) => Datum::Long(value.parse().map_err(|_| parse_err("bigint"))?),
+        DataType::Float(_) => Datum::Float(value.parse().map_err(|_| parse_err("float"))?),
+        DataType::Double(_) => Datum::Double(value.parse().map_err(|_| parse_err("double"))?),
+        DataType::Char(_) | DataType::VarChar(_) => Datum::String(value.to_string()),
+        DataType::Date(_) => Datum::Date(value.parse().map_err(|_| parse_err("date (epoch days)"))?),
+        other => {
+            return Err(FlussLakeError::SchemaIncompatible(format!(
+                "partition key type {other:?} is not supported for lake partition pruning"
+            )));
+        }
+    })
 }

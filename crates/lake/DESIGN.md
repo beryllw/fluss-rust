@@ -2,6 +2,8 @@
 
 > 本文档是 `fluss-lake` 的唯一正式设计来源。  
 > 设计讨论、接口调研、阶段性实现说明等都不构成规范；如有冲突，以本文档为准。
+>
+> 关于当前实现缺口、收敛顺序与工程推进视角，请配合阅读伴随 FIP：[`FIP.md`](./FIP.md)（English: [`FIP.en.md`](./FIP.en.md)）。
 
 ---
 
@@ -670,9 +672,9 @@ public API 必须为 partitioned table 预留，因此：
 - `LogTailReader`
 
 ### Connector naming follow-up
-当前 `FlussUnionTableProvider` / `FlussUnionScanExec` 仍是过渡名字。正式收敛后建议改为：
-- `FlussLakeTableProvider`
-- `FlussLakeScanExec`
+公共命名最终决策：`fluss-datafusion` 的 lake 表 connector 采用 `FlussLake*` 家族（与 kernel 的 `FlussLake*` 一致，且不向用户泄露 union 概念）：
+- `FlussUnionTableProvider` -> `FlussLakeTableProvider`
+- `FlussUnionScanExec` -> `FlussLakeScanExec`
 
 ---
 

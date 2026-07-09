@@ -41,6 +41,8 @@ paimon = { git = "https://github.com/beryllw/paimon-rust", tag = "v0.3.0-fluss.1
 arrow = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = "2.0"
 tokio = { workspace = true }
 

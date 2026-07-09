@@ -1,160 +1,79 @@
-# fluss-datafusion design document
+# fluss-datafusion design
 
 > For the Chinese version, see [design.zh.md](./design.zh.md).
+>
+> This document uses a FIP-style structure to describe the current `fluss-datafusion`
+> module design, its public contract, the code paths that already exist today, and
+> the convergence work that is still ahead. It is intentionally grounded in the
+> current implementation rather than describing an idealized future gateway.
 
-This document describes the design and internal structure of `fluss-datafusion`,
-aimed at maintainers of the crate and at the future `fluss-gateway` integration
-work that will consume it. For usage and the public API, see the [`README.md`](./README.md)
-in the same directory.
+For usage and quickstart, see [`README.md`](./README.md).
+For the formal FIP-style proposal of this module, see [`FIP.md`](./FIP.md) and
+[`FIP.en.md`](./FIP.en.md).
+For the lake-kernel boundary specific to lake-enabled tables, also see
+[`fip-lake-integration.md`](./fip-lake-integration.md).
 
-## Overview
+## Motivation
 
-`fluss-datafusion` is a **stateless** Rust library crate that exposes Fluss data
-to DataFusion through catalog / schema / table / execution-plan integration, so
-callers can query Fluss tables directly with `ctx.sql(...)`.
+`fluss-datafusion` exists to expose Fluss tables to Apache DataFusion through the
+standard DataFusion extension points:
 
-The design is deliberately narrow:
+- `CatalogProvider`
+- `SchemaProvider`
+- `TableProvider`
+- custom `ExecutionPlan`s
 
-- make the SQL read path of `fluss-gateway` possible;
-- keep the crate independently reusable outside the gateway;
-- reuse the existing Fluss Rust client rather than inventing a gateway-specific
-  backend abstraction.
+This solves a concrete problem in the Rust-side Fluss ecosystem: SQL-oriented
+consumers want to query Fluss tables with `ctx.sql(...)`, but Fluss itself
+natively exposes client-side KV and log read APIs rather than a DataFusion
+catalog.
 
-## Goals and scope
+The module has to bridge three different read families:
 
-### Currently supported
+1. **non-lake KV tables**
+   - point lookup by complete primary-key equality;
+   - prefix lookup by complete bucket-key prefix equality;
+   - bounded scan only when a `LIMIT` is present.
+2. **non-lake log tables**
+   - finite earliest-to-latest snapshot scan;
+   - optional `LIMIT` with head-first first-N semantics.
+3. **lake-enabled tables**
+   - unified read over lake snapshot plus residual Fluss log tail;
+   - lake-only read via `<table>$lake`;
+   - direct KV fast paths for eligible primary-key queries.
 
-1. Database and table discovery (list / get schema / table type).
-2. KV (primary-keyed) tables support four read shapes in precedence order: a
-   full-primary-key equality predicate pushed down as a point lookup, a bucket-key
-   prefix equality (plus all partition keys when partitioned) pushed down as a
-   prefix lookup, a bounded `LIMIT` scan when neither equality shape is present,
-   and a full-table scan (no filter / no `LIMIT`, e.g. `SELECT *`) via a
-   changelog merge to current state. The full-table scan's completeness is bounded
-   by changelog retention.
-3. Log tables support two scan shapes: a head-first first-N scan when a `LIMIT`
-   is present, or a finite earliest->latest snapshot scan when no `LIMIT` is
-   present, both with projection pushdown.
-4. Reuse of the Fluss-to-Arrow schema and row conversion.
-5. DataFusion integration via `CatalogProvider` / `SchemaProvider` /
-   `TableProvider` / custom `ExecutionPlan`s.
-6. A usage model of a shared installer plus per-session `register_catalog(...)`.
+The key design pressure is to keep this crate **thin and reusable**:
 
-### Non-goals
+- it should be a library, not a protocol server;
+- it should not own session/auth/protocol concerns;
+- it should not duplicate lake+log union semantics that belong in `fluss-lake`;
+- it should not hide metadata freshness behind an internal cache.
 
-Deliberately excluded (to avoid over-promising SQL semantics that are not yet
-implemented):
+In other words, `fluss-datafusion` is the DataFusion adapter layer for Fluss,
+not a second storage kernel and not yet a full query gateway.
 
-- PostgreSQL / MySQL protocols or compatibility objects (such as `pg_catalog`).
-- session / user / auth / multi-cluster awareness.
-- SQL DML writes.
-- direct-access REST / gRPC APIs.
-- batch-lookup optimizations.
-- offset pseudo-columns and offset-predicate pushdown.
-- complex filter / join / aggregate / sort pushdown.
+## Public Interfaces
 
-## Architecture and dependency direction
+The public surface of the crate is intentionally small.
 
-The dependency direction is strictly one-way: `fluss client/core -> fluss-datafusion`,
-never the reverse. The crate is unaware of caller identity, protocol, session
-variables, or auth mode, and it does not know whether it is running inside a
-gateway.
+### Rust API
 
-```
-+-----------------------------+
-|       SessionContext        |   one per SQL session
-+--------------+--------------+
-               | register_catalog(...)
-               v
-+-----------------------------+
-|       FlussDatafusion       |   shared installer (Arc, stateless)
-|     MetadataLoader (live)   |   no cache; every call hits Fluss
-+--------------+--------------+
-               | FlussSource (internal trait, crate boundary)
-               v
-+-----------------------------+
-|       RealFlussSource       |   wraps Arc<FlussConnection>
-+--------------+--------------+
-               |
-               v
-        Fluss client / core
-```
+The crate currently exports only:
 
-The core boundary is the internal trait `FlussSource`: inside the crate, Fluss is
-accessed only through it. Neither `metadata/loader.rs` nor `execution/*`
-**directly holds** a `FlussConnection` / `FlussAdmin` / `Lookuper` / scanner.
-`FlussSource` is an internal test seam (`pub(crate)`), not a public gateway
-backend abstraction, and must not be loaded with session / protocol / auth
-concepts.
+- `FlussDatafusion`
+- `FlussDatafusionOptions`
+- `RegisterCatalogOptions`
+- `FlussDatafusionError`
+- `Result`
 
-## Crate layout
-
-```text
-crates/integrations/datafusion/
-  Cargo.toml
-  docs/
-    README.md          # usage and public API
-    design.md          # this file
-  src/
-    lib.rs             # public exports
-    config.rs          # FlussDatafusionOptions / RegisterCatalogOptions
-    error.rs           # FlussDatafusionError / Result
-    install.rs         # FlussDatafusion: new / register_catalog
-    runtime.rs         # sync<->async bridge for synchronous catalog callbacks
-    backend/
-      mod.rs           # FlussSource trait (pub(crate)) + shared aliases
-      real.rs          # production implementation, wraps FlussConnection
-    metadata/
-      mod.rs
-      loader.rs        # live pass-through over FlussSource; no cache
-    catalog/
-      mod.rs
-      provider.rs      # FlussCatalogProvider (live sync schema_names / schema)
-      schema.rs        # FlussSchemaProvider (live table_names; async table())
-      register.rs      # build_catalog_provider
-    table/
-      mod.rs
-      predicate.rs     # KV predicate recognition (analyze_kv_filters)
-      kv.rs            # FlussKvTableProvider
-      log.rs           # FlussLogTableProvider
-    execution/
-      mod.rs
-      lookup.rs        # FlussKvLookupExec
-      log_scan.rs      # FlussLogScanExec (bounded scan; label per log/KV)
-      kv_full_scan.rs  # FlussKvFullScanExec (KV full-table scan; changelog merge)
-      stream.rs        # stream adapter with cooperative cancellation
-    types/
-      mod.rs
-      scalar.rs        # ScalarValue -> Fluss KeyValue
-      record_batch.rs  # projection column trimming
-  tests/
-    test_fluss_datafusion.rs
-    integration/
-      mod.rs
-      utils.rs         # shared table-name constants + SQL-path helper
-      setup.rs         # integration_tests: real-cluster bootstrap + table creation/seeding
-      e2e.rs           # integration_tests: end-to-end SQL against the real backend
-      live_metadata.rs # integration_tests: live post-DDL visibility (no cache)
-```
-
-> Note: the crate lives at `crates/integrations/datafusion/` (the package name is
-> `fluss-datafusion`). The `integrations/` directory level groups other
-> integrations that may be added in the future (such as other query engines /
-> formats).
-
-## Public API
-
-The public surface is deliberately minimal and is exported entirely from
-`lib.rs`:
-
-- `FlussDatafusion` (`install.rs`) — the shared installer.
-- `FlussDatafusionOptions` / `RegisterCatalogOptions` (`config.rs`).
-- `FlussDatafusionError` / `Result` (`error.rs`).
+The operational API is:
 
 ```rust
-pub struct FlussDatafusionOptions {}               // placeholder; the catalog is live, nothing to tune
+pub struct FlussDatafusionOptions {
+    pub lake_storage_options: std::collections::HashMap<String, String>,
+}
 
-pub struct RegisterCatalogOptions {}               // placeholder, reserved for per-catalog options
+pub struct RegisterCatalogOptions {}
 
 impl FlussDatafusion {
     pub async fn new(
@@ -168,330 +87,565 @@ impl FlussDatafusion {
         catalog_name: &str,
         options: RegisterCatalogOptions,
     ) -> Result<()>;
+
+    pub fn swap_connection(
+        &self,
+        new: Arc<fluss::client::FlussConnection>,
+    ) -> Result<()>;
 }
 ```
 
-`new()` takes a concrete `Arc<FlussConnection>`, but internally wraps it
-immediately into an `Arc<dyn FlussSource>`, after which the crate no longer
-depends on `FlussConnection`. `FlussSource` is a purely `pub(crate)` internal
-seam; it exposes no test-injection entry point. Integration tests always go
-through the `new()` production path against a real cluster.
+Important public behavior:
 
-## Internal module responsibilities
+- `new(...)` builds a shared, stateless installer over a live Fluss connection.
+- `register_catalog(...)` installs a fully live Fluss catalog into a
+  `SessionContext`.
+- `swap_connection(...)` hot-swaps the underlying connection without requiring
+  sessions to re-register the catalog.
 
-### `backend/` (internal access seam)
+### SQL-visible contract
 
-- The `FlussSource` trait (`pub(crate)`) covers only the atomic operations the
-  crate actually uses: metadata listing/fetching, KV full-primary-key
-  `lookup(key) -> RecordBatch`, partition listing (`list_partitions`), KV bounded
-  `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`,
-  log snapshot `log_scan(partition_id, bucket, projection, row_limit) -> Vec<RecordBatch>`,
-  and KV full scan `kv_full_scan(partition_id, bucket, projection) -> Vec<RecordBatch>`.
-  `bounded_scan` remains the tail-oriented `LimitBatchScanner` path for KV only.
-  `log_scan` is log-specific: it reads earliest->latest, with `Some(n)` meaning
-  first-N and `None` meaning a full finite snapshot to the latest offsets captured
-  at query start. `kv_full_scan` is KV-only: it merges one bucket's CDC changelog
-  (earliest->latest at call time) into its current state via the client's
-  `collect_kv_current_state_batch`, returning the merged rows (no kv-snapshot RPC,
-  no RocksDB). All take an `Option<i64>` partition id (`None` for a
-  non-partitioned table) so the scanner can target a partition-qualified bucket.
-- `real.rs`: the sole implementation, wrapping `FlussConnection` / `FlussAdmin` /
-  lookuper / scanner, reusing Fluss's existing Arrow helpers (such as
-  `LookupResult::to_record_batch`) rather than reimplementing Arrow assembly.
-  `list_partitions` maps `admin.list_partition_infos` to the crate's
-  `FlussPartition` (partition id + partition-key/value string pairs); both scan
-  methods build the bucket via `TableBucket::new_with_partition`. `log_scan`
-  captures `Earliest` and `Latest` offsets once per target at query start,
-  subscribes a `RecordBatchLogScanner` at the earliest offset, and polls until it
-  either reaches the captured latest offset or satisfies the requested first-N cap.
-- The seam returns the crate's own slim `FlussTableMeta` (schema + primary_keys +
-  num_buckets + partition_keys, etc.), decoupling upper layers from
-  `fluss::metadata::TableInfo` and carrying only the fields catalog wiring,
-  predicate analysis, and execution truly need.
+The SQL-facing contract exposed through DataFusion includes:
 
-### `metadata/`
+- table naming as `<catalog>.<database>.<table>`;
+- `<table>$options` as a key/value metadata table;
+- `<table>$lake` as a lake-only read shape under the `lake` feature;
+- `EXPLAIN` visibility of custom physical plans.
 
-- `loader.rs`: `MetadataLoader` depends only on `SharedFlussSource` and holds no
-  cache. `databases()` reads the whole-cluster db/table listing live every call;
-  `table_entry()` re-reads per-table meta + Arrow schema live every call. The
-  Arrow schema is converted via
-  `fluss::record::to_arrow_schema(meta.schema.row_type())`. The loader stays the
-  home for that derivation so callers do not re-implement the mapping.
+Today the main user-visible execution-plan names are:
 
-### `runtime.rs`
+- `FlussKvLookupExec`
+- `FlussKvPrefixLookupExec`
+- `FlussKvScanExec`
+- `FlussLogScanExec`
+- `FlussUnionScanExec`
 
-- The sync<->async bridge for DataFusion's synchronous catalog callbacks.
-  `block_on_with_runtime` drives an async source call to completion from a
-  synchronous callback; when already inside a tokio runtime it spawns a
-  short-lived thread that `block_on`s a global runtime handle, avoiding the
-  "cannot block within a runtime" panic. A single lazily-built global runtime
-  backs the fallback so no runtime is created per call.
-- Correctness note: this private runtime is **not** a connection-ownership
-  runtime. The upstream `fluss-rs` fix made `FlussConnection` runtime-agnostic by
-  turning the connection into a full actor: socket creation/registration, reads,
-  and writes are all pinned to one dedicated I/O runtime inside `fluss-rs`, and
-  callers interact with it only through runtime-agnostic channels. Therefore the
-  catalog bridge's private runtime is no longer a deadlock risk; it only affects
-  the cost model (one thread hop / `block_on`), not connection correctness.
-- Operational implication: if a host wants Fluss socket I/O to share its own
-  long-lived runtime (for thread budgeting or observability), it should inject
-  that runtime when constructing the underlying `FlussConnection` via
-  `FlussConnection::new_with_io_handle(...)`; `fluss-datafusion` itself does not
-  own or configure the Fluss I/O runtime.
-- Known upstream limitation (recorded, not fixed here): `fluss-rs` currently uses
-  an unbounded outbound mpsc for the connection actor. There is no evidence of
-  problematic accumulation today, but under a stalled socket plus many concurrent
-  callers that queue could grow without bound; treat this as an upstream
-  observability / backpressure follow-up rather than a `fluss-datafusion`
-  correctness issue.
+### Feature-gated behavior
 
-### `catalog/`
+The crate's behavior materially changes with features:
 
-- `provider.rs`: `FlussCatalogProvider` holds only the shared loader. The
-  synchronous `schema_names()` lists databases live (via `block_on_with_runtime`);
-  `schema()` checks the database exists live and returns `None` for an unknown
-  name (mirroring paimon's `DatabaseNotExist -> None`), otherwise hands back a
-  `FlussSchemaProvider`.
-- `schema.rs`: `FlussSchemaProvider` holds the database name + loader. Its
-  synchronous `table_names()` / `table_exist()` list tables live; its async
-  `table()` loads the entry live, maps `TableNotFound -> Ok(None)`, and branches on
-  `meta.has_primary_key()` to return either `FlussKvTableProvider` (KV) or
-  `FlussLogTableProvider` (log).
-- `register.rs`: `build_catalog_provider` simply wraps the loader in a
-  `FlussCatalogProvider`; it does no pre-listing, so registration is cheap and
-  listings never go stale.
+- default build: core DataFusion integration without `fluss-lake` dependency;
+- `lake`: enables lake-enabled table routing and `<table>$lake`;
+- `integration_tests`: enables the real-cluster integration suites and test-only
+  lake seam helpers re-exported from `fluss-lake`.
 
-> The sync/async bridge uses a live `block_on` inside the synchronous callbacks
-> (via `runtime.rs`) instead of a registration-time snapshot. This makes the
-> catalog fully live — DDL is visible in the same session immediately — at the
-> known, accepted cost of one admin RPC (plus a thread hop) per catalog call. See
-> the README's "Metadata visibility".
+## Proposed Changes
 
-### `table/`
+This section describes the intended module contract and the behavior already
+implemented today.
 
-- `predicate.rs`: `analyze_kv_filters` recognizes the top-level AND conjuncts that
-  DataFusion has split apart as a full-primary-key equality, producing
-  `LookupKey`s in primary-key order; it explicitly rejects partial PKs, non-PK
-  columns, `IN`, ranges, column-to-column comparisons, duplicate/missing PKs, and
-  empty filters, all as `UnsupportedQueryPattern`. `analyze_partition_filters`
-  extracts equality bindings on partition columns only (best-effort: a literal
-  that cannot be rendered to the partition-value string is skipped, never an
-  error), and `is_partition_equality` classifies a single partition-column
-  equality for the log table's pushdown decision.
-- `kv.rs`: `FlussKvTableProvider` serves four read shapes in precedence order.
-  `scan()` first tries `analyze_kv_filters`: a COMPLETE PK equality builds the
-  point-lookup plan (passing the projection); else a complete bucket-key prefix
-  equality builds the prefix-lookup plan; else it computes the `(partition,
-  bucket)` targets (partition pruning exactly like the log provider) and, if a
-  `LIMIT` is present, runs a bounded KV scan reusing `FlussLogScanExec` (display
-  name `FlussKvScanExec`); with NO `LIMIT` it runs a full-table scan via
-  `FlussKvFullScanExec`, which merges each target bucket's CDC changelog into its
-  current state (changelog-only; no kv-snapshot RPC, no RocksDB). The full-table
-  scan's completeness is bounded by changelog retention. An empty target set
-  yields an `EmptyExec`. `supports_filters_pushdown` is precedence-aware so it
-  stays sound: a filter is `Exact` (consumed, no `FilterExec`) ONLY when the full
-  set forms a complete PK equality (point lookup) or a complete bucket-key prefix
-  equality (prefix lookup) that the matching plan will apply; on the bounded-scan
-  / full-scan path nothing is `Exact` — partition equality is `Inexact` (drives
-  pruning, residual `FilterExec` re-applies) for a partitioned table and
-  everything else is `Unsupported`. This prevents the unsound case where a partial
-  PK equality would be marked `Exact` and silently dropped.
-- `log.rs`: `FlussLogTableProvider` no longer requires `LIMIT`. The projection is
-  pushed down to the log source scan, and a full identity projection from
-  `SELECT *` is normalized to `None`. For a non-partitioned table
-  `supports_filters_pushdown` is always `Unsupported`. For a partitioned table it
-  reports partition-column equality as `Inexact` (so a residual `FilterExec`
-  still re-applies the predicate — pruning is best-effort) and everything else as
-  `Unsupported`. `scan()` computes the scan targets (`Vec<(Option<i64>, i32)>` of
-  partition id + bucket): non-partitioned tables emit one `(None, bucket)` per
-  bucket; partitioned tables list partitions, keep those matching every equality
-  binding (no bindings => keep all), and emit the cross product of kept partitions
-  and buckets. An empty target set (no partition matched, or a partitioned table
-  with zero partitions) yields an `EmptyExec` with the projected schema rather
-  than a 0-partition scan. `LIMIT` now means head-first first-N; no `LIMIT` means
-  a finite earliest->latest snapshot.
+### 1. Scope and positioning
 
-### `execution/`
+`fluss-datafusion` is defined as a **stateless DataFusion adapter over Fluss**.
 
-- `lookup.rs`: `FlussKvLookupExec`, a single-partition leaf `ExecutionPlan` whose
-  `execute()` calls `source.lookup` asynchronously through `single_batch_stream`
-  to produce 0/1 rows; it implements `DisplayAs`, so `EXPLAIN` shows
-  `FlussKvLookupExec`.
-- `log_scan.rs`: `FlussLogScanExec`, a leaf that reports one DataFusion partition
-  per scan target (a `(partition_id, bucket)` pair). In log mode,
-  `execute(partition)` calls `source.log_scan(partition_id, bucket, projection, row_limit)`
-  asynchronously through `bounded_batches_stream`; in KV mode it still calls
-  `source.bounded_scan(...)`. The same plan shape backs both log and KV scans; its
-  `EXPLAIN` label is a `plan_name` field — the log provider passes
-  `FlussLogScanExec`, the KV provider passes `FlussKvScanExec`. Debug/display text
-  now shows `limit=<n>` or `limit=None/full`.
-- `kv_full_scan.rs`: `FlussKvFullScanExec`, a leaf that reports one DataFusion
-  partition per `(partition_id, bucket)` target. `execute(partition)` calls
-  `source.kv_full_scan(partition_id, bucket, projection)` asynchronously through
-  `bounded_batches_stream`, merging that bucket's CDC changelog into its current
-  state. It is distinct from `FlussLogScanExec` (which backs log snapshot scans
-  and KV bounded `LIMIT` scans); `EXPLAIN` shows `FlussKvFullScanExec`.
-- `stream.rs`: adapts the lookup / scan output into a DataFusion stream
-  (`futures::stream::once` / Vec versions); dropping it is cooperative
-  cancellation.
-- An asymmetry: source-side scans are already projected on the `FlussSource`
-  side, so the scan path does **not** project a second time; the KV point lookup
-  returns all columns and is then trimmed by `project_batch` in
-  `types/record_batch.rs`.
+Its responsibilities are:
 
-### `types/`
+- register live Fluss catalogs into DataFusion sessions;
+- load table metadata and Arrow schema on demand;
+- recognize supported SQL predicate shapes;
+- route reads to KV fast paths, bounded scans, log snapshot scans, or the
+  `fluss-lake` kernel;
+- adapt Fluss and `fluss-lake` output streams into DataFusion
+  `ExecutionPlan`s.
 
-- `scalar.rs`: `scalar_to_key_value` strictly converts a `ScalarValue` (`Boolean`
-  / `Int8/16/32/64` / `Utf8`) into a `KeyValue`; NULL and other types explicitly
-  return `TypeConversion`. `scalar_to_partition_string` renders the same supported
-  literal types to the Fluss partition-value string form for equality pruning,
-  with the same NULL/unsupported-type rejection.
-- `record_batch.rs`: `project_batch` centralizes per-projection column trimming
-  (`None` passes through).
-- There is no `types/schema.rs`: the Fluss->Arrow mapping reuses Fluss's
-  `to_arrow_schema` directly, with no de-duplication benefit.
+It is explicitly **not** responsible for:
 
-## Query semantics
+- PostgreSQL / Flight SQL / REST / gRPC protocol frontends;
+- session variables, user identity, or authentication;
+- SQL writes or DML;
+- generic backend abstraction for arbitrary sources;
+- lake seam interpretation, append stitching, or PK merge logic.
 
-### KV tables
+The dependency direction is therefore one-way:
 
-A KV (primary-keyed) table supports four read shapes, in precedence order:
-
-1. **Point lookup** — a **full-primary-key equality** predicate
-   (`pk1 = v1 AND pk2 = v2 ...`, covering every PK column). A hit returns 1 row, a
-   miss returns 0 rows (no error).
-2. **Prefix lookup** — a **complete bucket-key prefix equality**. For a
-   non-partitioned table this is equality on every bucket key; for a partitioned
-   table it is equality on every partition column plus every bucket key. The
-   bucket key must be a STRICT prefix of the physical primary key (the PK with the
-   partition columns removed), matching the Fluss client's `lookup_by(...)`
-   validation. This shape returns all rows whose primary key starts with that
-   prefix and is shown in `EXPLAIN` as `FlussKvPrefixLookupExec`.
-3. **Bounded scan** — any other predicate shape combined with a `LIMIT`. This runs
-   the same bounded-scan machinery as the log table (per-bucket last-`limit` rows,
-   with DataFusion applying the final cross-target `LIMIT`), shown in `EXPLAIN` as
-   `FlussKvScanExec`. For a partitioned table, partition-column equality prunes the
-   scanned partitions (`Inexact`, with a residual `FilterExec`).
-4. **Full scan** — any other predicate shape with NO `LIMIT` (e.g. a bare
-   `SELECT *`, a partial key, or a non-key filter). This merges each target
-   bucket's CDC changelog into its current state (changelog-only: no kv-snapshot
-   RPC, no RocksDB), shown in `EXPLAIN` as `FlussKvFullScanExec`. It uses the same
-   `(partition, bucket)` target computation as the bounded scan, so partition-column
-   equality prunes the scanned partitions; an empty target set yields an
-   `EmptyExec`. The merge applies `+I`/`+U`/`+A` as upserts and `-D` as deletes
-   (ignoring `-U`) per primary key, since a KV table's rows for a given PK live in
-   exactly one bucket.
-
-   The full scan's completeness is bounded by changelog retention: rows whose
-   changelog has aged out of the retained window (compacted into kv snapshots and
-   dropped from the log) are not reflected. This is acceptable for the current
-   feature; full historical completeness would require a snapshot-backed reader.
-
-Partitioned KV tables need no extra handling for the point lookup: for a
-partitioned PK table the partition columns are part of the primary key, so the
-full-PK equality already binds them. The Fluss `Lookuper` resolves the partition
-id from the lookup key row, so the point-lookup path targets the single owning
-partition automatically. For a prefix lookup, the partition columns must be part
-of the `lookup_by(...)` column list and the lookup key row so the client can
-resolve the owning partition before routing the bucket-key prefix request.
-
-### Log tables
-
-Locked-in decisions:
-
-1. `LIMIT` is optional. With `LIMIT n`, log tables return the first `n` rows from
-   the earliest offset forward (head-first first-N). Without `LIMIT`, they return
-   a finite earliest->latest snapshot.
-2. Projection pushdown is supported.
-3. No offset pseudo-column is exposed and offset predicates are not supported.
-4. The source captures the latest offset ONCE at query start for each scan
-   target, subscribes at the earliest offset, and polls until it reaches that
-   finite snapshot boundary.
-5. Multi-bucket snapshot scan is supported: one bucket maps to one DataFusion
-   partition (`FlussLogScanExec` reports `num_buckets` partitions, read in
-   parallel). With `LIMIT`, each target independently applies its own first-N cap,
-   and DataFusion applies a final cross-bucket `LIMIT` above the scan, so the
-   merged result is capped at exactly `limit` rows. There is no global cross-bucket
-   first-N coordination.
-6. `ORDER BY` pushdown is out of scope; cross-bucket global row order is not
-   guaranteed.
-7. Partition pruning is supported for partitioned log tables, equality-only.
-   Equality predicates on partition columns prune the scan to partitions matching
-   every bound partition-key value that was provided; full equality on every
-   partition key is NOT required. A partition predicate is never required, so
-   with no partition predicate all partitions are scanned. The scan targets are
-   the cross product of the kept partitions and the buckets, and each target is
-   one DataFusion partition (partition x bucket => DataFusion partitions). Pushdown
-   is `Inexact`, so DataFusion still layers a `FilterExec` that re-applies the
-   predicate: pruning is a best-effort optimization and correctness never depends
-   on it. A predicate that matches no partition yields zero rows via `EmptyExec`.
-
-## Error model
-
-`error.rs` defines the crate-local error `FlussDatafusionError` (with the alias
-`Result<T>`), which clearly distinguishes the various unsupported/failure cases:
-
-```rust
-pub enum FlussDatafusionError {
-    DatabaseNotFound(String),
-    TableNotFound(String),
-    UnsupportedQueryPattern(String),
-    LimitRequired(String),
-    SchemaMismatch(String),
-    TypeConversion(String),
-    FlussClient(String),
-    Internal(String),
-}
+```text
++-----------------------------+
+|       SessionContext        |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+|       FlussDatafusion       |
+|   live catalog installer    |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+|        MetadataLoader       |
+|         FlussSource         |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+|       RealFlussSource       |
+|   Fluss client / fluss-lake |
++-----------------------------+
 ```
 
-It bubbles up cleanly at the plan or collect stage via
-`From<FlussDatafusionError> for DataFusionError` (`External`). The `From`
-implementations map fluss / arrow errors to `FlussClient` / `SchemaMismatch`
-respectively. The type deliberately does **not** encode any PostgreSQL / gateway
-concepts.
+### 2. Architecture overview
 
-## Testing strategy
+The crate is organized around four layers.
 
-A single real-cluster layering: there is no fake/fixture mock layer, avoiding two
-copies of "cluster-free assertions" and "real assertions" drifting apart. There
-are two layers:
+#### 2.1 Installer and lifecycle layer
 
-| Layer | Feature | Containers | Purpose |
-|---|---|---|---|
-| Unit tests | default | No | schema mapping, `ScalarValue`-to-key conversion, predicate recognition, pushdown decisions, and error mapping |
-| Integration tests | `integration_tests` | Yes | real SQL against the real backend (`FlussDatafusion::new` -> `RealFlussSource`), covering catalog listing, KV point lookup (single/composite PK, missing key, and unsupported forms such as non-PK / partial PK / `IN` / no filter), log bounded scan and projection, partition pruning, `EXPLAIN` custom plans, the Arrow schema exposed by `TableProvider`, and the live no-cache contract (`register_catalog`-after DDL is visible in the same session, and drops disappear from listing / `table()` resolution) |
+- `src/install.rs`
+- `src/config.rs`
+- `src/runtime.rs`
 
-The integration tests assert sequentially against a single cluster inside one
-test function: standing up a Fluss cluster is expensive, while these assertions
-are all read-only and mutually independent, so they share one cluster to lower
-the cost (`setup.rs` provides shared table creation and seeding). Because the
-catalog holds no cache, there is no white-box cache mechanism to unit-test;
-live-visibility behaviour is verified end to end against the real backend.
+This layer owns:
 
-Verification commands:
+- the shared `FlussDatafusion` installer;
+- session-level `register_catalog(...)`;
+- connection hot-swap;
+- sync/async bridging required by DataFusion's synchronous catalog callbacks.
+
+A single `FlussDatafusion` instance is intended to be reused across many
+`SessionContext`s.
+
+#### 2.2 Metadata and catalog layer
+
+- `src/metadata/loader.rs`
+- `src/catalog/provider.rs`
+- `src/catalog/schema.rs`
+- `src/catalog/register.rs`
+
+This layer maps Fluss metadata into DataFusion's catalog model:
+
+- one DataFusion catalog contains Fluss databases as schemas;
+- one Fluss database maps to one `SchemaProvider`;
+- one Fluss table dynamically maps to one `TableProvider`.
+
+A deliberate design choice is that metadata is **live and uncached**:
+
+- `schema_names()` lists databases live;
+- `table_names()` lists tables live;
+- `table()` reloads per-table metadata and Arrow schema every time;
+- DDL after `register_catalog(...)` is visible in the same session.
+
+#### 2.3 Table-provider routing layer
+
+- `src/table/kv.rs`
+- `src/table/log.rs`
+- `src/table/union.rs`
+- `src/table/predicate.rs`
+
+This layer contains the read-shape recognition logic.
+
+It is where the crate decides whether a query should use:
+
+- point lookup;
+- prefix lookup;
+- bounded KV scan;
+- finite log snapshot scan;
+- lake+log unified read;
+- lake-only read.
+
+#### 2.4 Physical execution layer
+
+- `src/execution/lookup.rs`
+- `src/execution/prefix_lookup.rs`
+- `src/execution/log_scan.rs`
+- `src/execution/union_scan.rs`
+- `src/execution/stream.rs`
+
+This layer exposes DataFusion `ExecutionPlan`s that wrap Fluss or
+`fluss-lake` reads and adapt them into `SendableRecordBatchStream`s.
+
+### 3. Public API and lifecycle model
+
+The intended lifecycle is:
+
+1. caller constructs `FlussConnection`;
+2. caller constructs one shared `FlussDatafusion` installer;
+3. each SQL session creates its own `SessionContext`;
+4. caller invokes `register_catalog(&ctx, "fluss", ...)`;
+5. queries execute through the live catalog.
+
+Important operational properties already implemented today:
+
+- the installer is session-agnostic and reusable;
+- the catalog provider does not snapshot metadata at registration time;
+- `swap_connection(...)` allows already-registered sessions to transparently use
+  a new connection on subsequent accesses.
+
+### 4. Catalog, schema, and table mapping
+
+The current table-resolution logic is implemented in
+`src/catalog/schema.rs`.
+
+Routing precedence is:
+
+1. `<table>$options`
+2. `<table>$lake` under `lake`
+3. `<table>$lake$<system>` -> explicit unsupported error
+4. normal table name -> provider selected by metadata
+
+For normal tables, the provider routing is:
+
+| Table shape | Provider |
+| --- | --- |
+| lake-enabled Paimon table, `lake` feature on | `FlussUnionTableProvider` |
+| non-lake primary-key table | `FlussKvTableProvider` |
+| non-lake append/log table | `FlussLogTableProvider` |
+
+This precedence matters: a lake-enabled PK table must not go directly to the
+non-lake KV provider, because a Fluss-only KV read would miss rows already
+tiered into lake storage.
+
+#### `<table>$options`
+
+`<table>$options` is a formal user-visible introspection surface.
+It exposes key/value metadata such as:
+
+- table id;
+- schema id;
+- primary keys;
+- bucket keys;
+- partition keys;
+- datalake enablement and format;
+- lake catalog properties.
+
+Secret-like values are redacted before exposure.
+
+#### `<table>$lake`
+
+`<table>$lake` is a formal lake-only read shape.
+It means:
+
+- read only the Paimon lake snapshot;
+- skip the residual Fluss log tail;
+- skip KV fast-path routing even for primary-key tables.
+
+### 5. Query routing and planner behavior
+
+This is the most important part of the module contract.
+
+#### 5.1 Non-lake KV tables
+
+`FlussKvTableProvider` supports the following precedence order.
+
+| Query shape | Route | Notes |
+| --- | --- | --- |
+| complete primary-key equality | `FlussKvLookupExec` | exact point lookup |
+| complete bucket-key prefix equality | `FlussKvPrefixLookupExec` | exact prefix lookup |
+| any other shape with `LIMIT` | `FlussKvScanExec` | bounded scan over computed scan targets |
+| any other shape without `LIMIT` | unsupported | non-lake KV full current-state scan is not exposed |
+
+Important current semantics:
+
+- complete primary-key equality means every PK column is bound by equality;
+- complete bucket-key prefix equality means every required prefix column is
+  bound, including partition keys when the table is partitioned;
+- unsupported shapes fail conservatively rather than silently degrading to a
+  full scan.
+
+#### 5.2 Non-lake log tables
+
+`FlussLogTableProvider` surfaces a finite snapshot scan.
+
+| Query shape | Route | Notes |
+| --- | --- | --- |
+| `LIMIT n` present | `FlussLogScanExec` | head-first first-N from earliest offset |
+| no `LIMIT` | `FlussLogScanExec` | full earliest-to-latest snapshot captured at query start |
+
+Important current semantics:
+
+- `LIMIT` is optional in the current implementation;
+- projection is pushed down to the source scan;
+- partition equality can prune partitions, but pushdown is `Inexact` and a
+  residual `FilterExec` remains above the scan;
+- no cross-bucket global ordering guarantee is provided.
+
+#### 5.3 Lake-enabled tables
+
+Lake-enabled tables route through `FlussUnionTableProvider`, which is a thin
+adapter over `fluss-lake`.
+
+Current precedence is:
+
+| Query shape | Route | Notes |
+| --- | --- | --- |
+| PK table + full primary-key equality | `FlussKvLookupExec` | served directly from Fluss current state |
+| PK table + complete bucket-key prefix equality | `FlussKvPrefixLookupExec` | served directly from Fluss current state |
+| `<table>$lake` | lake-only `fluss-lake` path | no residual log tail |
+| any other lake-enabled read | `FlussUnionScanExec` | unified lake snapshot + residual Fluss tail |
+
+Important current behavior:
+
+- KV fast paths are enabled only when `!lake_only` and the table has primary
+  keys;
+- the union path does not currently push value filters down into the kernel;
+- residual filters remain above the scan;
+- `num_buckets == 0` returns `EmptyExec`.
+
+### 6. Filter pushdown contract
+
+The filter-pushdown contract is intentionally conservative.
+
+#### KV provider
+
+`FlussKvTableProvider::supports_filters_pushdown(...)` is precedence-aware and
+sound:
+
+- `Exact` only when the query truly becomes a point lookup or prefix lookup;
+- partition equality may be `Inexact` on scan paths;
+- everything else is `Unsupported`.
+
+This prevents unsound cases where DataFusion would drop a `FilterExec` for a
+predicate that the underlying source is not actually applying.
+
+#### Log provider
+
+`FlussLogTableProvider` reports:
+
+- `Unsupported` for all filters on non-partitioned tables;
+- `Inexact` for partition equality on partitioned tables;
+- `Unsupported` otherwise.
+
+#### Lake provider
+
+`FlussUnionTableProvider` reports:
+
+- `Exact` only for KV fast-path predicates;
+- `Unsupported` for all filters on the normal union path.
+
+This means unified lake reads currently rely on DataFusion residual filtering
+for correctness.
+
+### 7. Execution behavior
+
+The physical execution layer consists of four main plan families.
+
+#### `FlussKvLookupExec`
+
+- one logical lookup;
+- returns 0 or 1 row;
+- trims projection after fetch.
+
+#### `FlussKvPrefixLookupExec`
+
+- prefix lookup over Fluss KV state;
+- returns all matching rows.
+
+#### `FlussLogScanExec`
+
+- one DataFusion partition per `(partition_id, bucket)` target;
+- reused for log snapshot scans and bounded KV scans;
+- in log mode, reads earliest-to-latest or first-N;
+- in KV bounded-scan mode, reads the per-bucket bounded scan path.
+
+#### `FlussUnionScanExec`
+
+- one DataFusion partition per `FlussLakeReadSplit`;
+- wraps opaque `FlussLakeReadPlan` + `FlussLakeRead`;
+- does not know about seams, physical lake splits, append stitching, or PK
+  merge internals.
+
+### 8. Lake integration boundary
+
+The intended responsibility split is:
+
+| Layer | Responsibility |
+| --- | --- |
+| `fluss-rust` | metadata, KV reads, log reads, Arrow helpers |
+| `fluss-lake` | seam resolution, snapshot planning, append stitch, PK merge, logical splits |
+| `fluss-datafusion` | predicate recognition, route selection, DataFusion wrapping, config injection |
+
+The DataFusion module should therefore remain a **thin adapter** above
+`fluss-lake`.
+
+This is already largely true in code today:
+
+- `src/table/union.rs` builds `FlussLakeTable` and `FlussLakeScan`;
+- it calls `plan()` and `new_read()` on the kernel;
+- `src/execution/union_scan.rs` executes public `FlussLakeReadSplit`s;
+- the connector itself never interprets seam DTOs or performs PK merge.
+
+### 9. Configuration contract
+
+The current meaningful installer-level configuration is:
+
+- `FlussDatafusionOptions.lake_storage_options`
+
+This exists because server metadata may not retain complete lake storage
+credentials. The adapter therefore supports caller-side reinjection of storage
+properties just before opening the lake catalog.
+
+Merge rule:
+
+- server-derived `table.datalake.*` properties provide the base configuration;
+- caller-supplied `lake_storage_options` are merged over them;
+- **caller wins** on key conflicts.
+
+This is intentionally an adapter concern rather than a lake semantic concern.
+
+`RegisterCatalogOptions` is currently reserved and carries no behavior.
+
+### 10. Error model
+
+The crate-local error type is `FlussDatafusionError` with the main variants:
+
+- `DatabaseNotFound`
+- `TableNotFound`
+- `UnsupportedQueryPattern`
+- `LimitRequired`
+- `SchemaMismatch`
+- `TypeConversion`
+- `FlussClient`
+- `Internal`
+
+Design principles:
+
+- fail conservatively on unsupported SQL shapes;
+- keep storage/client failures explicit;
+- bridge cleanly into `DataFusionError::External`.
+
+Note that `LimitRequired` remains part of the error taxonomy even though log
+scans no longer require `LIMIT` in the current implementation.
+
+### 11. Current constraints and convergence items
+
+The implementation is already useful, but several parts still reflect a
+transitional or convergence state.
+
+#### 11.1 Transitional naming
+
+Current names still use `Union` terminology:
+
+- `FlussUnionTableProvider`
+- `FlussUnionScanExec`
+
+Semantically these are already the lake adapter path. A future rename to
+`FlussLake*` would improve clarity without changing behavior.
+
+#### 11.2 Lake path limit pushdown is not wired
+
+`FlussUnionTableProvider::scan(...)` currently ignores SQL `LIMIT` for the
+kernel path, so DataFusion applies the limit above the lake scan.
+This preserves correctness but may over-read.
+
+#### 11.3 Lake path filter pushdown is intentionally narrow
+
+The normal union path does not yet provide value-filter pushdown.
+Residual filtering remains a DataFusion responsibility.
+
+#### 11.4 Real-source dependency on the lake path
+
+The lake path currently downcasts to `RealFlussSource` in order to obtain the
+production Fluss connection and caller-supplied lake storage options. This is a
+pragmatic production boundary, but it also shows that the lake path is not yet
+fully abstracted behind a broader source trait.
+
+#### 11.5 Feature-gated packaging
+
+Lake support is behind the `lake` feature. That is the right current packaging
+boundary, but it means the module contract must explicitly document the feature
+flag rather than imply that unified lake reads are always available.
+
+#### 11.6 Upstream `fluss-lake` capability gaps remain visible here
+
+The DataFusion adapter inherits current `fluss-lake` limits, including:
+
+- partitioned lake reads still being a convergence area;
+- historical snapshot selection not yet being the primary supported path;
+- thin plan statistics and incomplete limit/predicate pushdown in the kernel.
+
+## Compatibility, Deprecation, and Migration Plan
+
+This design does not require Fluss server-side wire or storage changes.
+
+Compatibility notes:
+
+- existing Fluss clusters do not need a server change to use this crate;
+- the module remains additive for callers that choose to adopt it;
+- lake behavior is additive and feature-gated;
+- `<table>$lake` documents an already-existing read shape rather than adding a
+  new incompatible mode.
+
+Migration expectations:
+
+- no data migration is required;
+- no SQL migration tooling is required;
+- future internal renames from `FlussUnion*` to `FlussLake*` should be done in
+  lockstep with `EXPLAIN` expectations and docs.
+
+## Test Plan
+
+The test strategy is intentionally grounded in real behavior rather than only
+mocked unit tests.
+
+### Unit tests
+
+Current unit coverage includes:
+
+- predicate recognition and pushdown classification;
+- projection normalization;
+- scalar-to-key conversion;
+- metadata-property merging and redaction behavior.
+
+### Integration tests against a real Fluss cluster
+
+The main integration suites verify:
+
+- catalog listing and `information_schema` visibility;
+- live post-DDL metadata visibility without re-registration;
+- KV point lookup and prefix lookup behavior;
+- unsupported-query failures for non-lake KV paths;
+- bounded and full snapshot log reads;
+- partition pruning for partitioned log and KV scans;
+- hot connection swap behavior;
+- lake-enabled unified reads through both injected-seam and real-tiering paths;
+- `$options` and `$lake` behavior;
+- `EXPLAIN` showing the expected custom plans.
+
+### Verification commands
 
 ```bash
 cargo check --workspace
-cargo test -p fluss-datafusion                               # unit
-cargo test -p fluss-datafusion --features integration_tests  # containers required, real cluster
+cargo test -p fluss-datafusion
+cargo test -p fluss-datafusion --features integration_tests
 ```
 
-Boundary constraint (aligned with CLAUDE.md): `FlussSource` is an internal seam,
-kept `pub(crate)`, not part of the public API, and not shaped into a gateway-style
-backend abstraction.
+## Rejected Alternatives
 
-## Interfacing with fluss-gateway
+### 1. Make `fluss-datafusion` a full gateway backend abstraction
 
-This crate is responsible only for `SQL -> Fluss table access`. On top of it,
-`fluss-gateway` should:
+Rejected because protocol/auth/session concerns would pollute the engine adapter
+boundary and reduce standalone reuse.
 
-1. create one shared `FlussDatafusion` per cluster/proxy connection;
-2. construct the underlying `FlussConnection` with a **single long-lived I/O
-   runtime** (prefer `FlussConnection::new_with_io_handle(...)` when the gateway
-   wants to supply its own runtime; otherwise `FlussConnection::new(...)` falls
-   back to `fluss-rs`'s process-global default);
-3. call `register_catalog(&ctx, "fluss", ...)` when a SQL session builds a new
-   `SessionContext`;
-4. layer gateway-specific SQL environment setup on top of the real Fluss catalog;
-5. keep `pg_catalog`, session variables, auth, and timeout / cancel semantics in
-   the gateway, not here.
+### 2. Reimplement lake+log union semantics in the DataFusion layer
+
+Rejected because those semantics belong in `fluss-lake` and should be reusable
+across Arrow engines.
+
+### 3. Hide metadata behind a catalog cache
+
+Rejected for the current design because same-session DDL visibility is a more
+important contract than reducing admin RPCs.
+
+### 4. Route all lake-enabled PK reads through `fluss-lake`
+
+Rejected because exact PK and eligible prefix queries can be served directly from
+Fluss current state more efficiently.
+
+### 5. Silently degrade unsupported predicates into full scans
+
+Rejected because correctness and predictable behavior are more important than
+pretending every SQL shape is supported.
+
+## Future Work and Open Questions
+
+The main next-step topics are:
+
+1. rename `FlussUnion*` internals to `FlussLake*`;
+2. add limit propagation to the lake scan path;
+3. broaden pushdown only when it can be done soundly;
+4. reduce the `RealFlussSource`-specific downcast boundary on lake reads;
+5. converge with `fluss-lake` as partitioned lake reads and richer statistics
+   mature;
+6. keep this crate library-scoped even if a higher-level Fluss gateway later
+   consumes it.
+
+The key constraint for all future work is unchanged: `fluss-datafusion` should
+continue to be the DataFusion adapter for Fluss, not the semantic owner of the
+lake storage model.

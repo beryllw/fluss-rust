@@ -18,38 +18,57 @@
 //! Crate-local error type for the lake+log union read kernel.
 
 /// Errors raised while planning or executing a lake+log union read.
+///
+/// The public surface is the six FIP variants below. Underlying Fluss / Paimon /
+/// Arrow errors are mapped into these via the `From` impls so `?` still works
+/// throughout the kernel without leaking third-party error types.
 #[derive(Debug, thiserror::Error)]
 pub enum FlussLakeError {
     /// The table is not configured for a readable lake (no `table.datalake.*`),
-    /// or the configured format is not supported by this kernel.
+    /// the lake catalog config is malformed, or the format is unsupported.
     #[error("table is not lake-readable: {0}")]
     NotLakeReadable(String),
 
-    /// The lake catalog config on the table is missing a required key (e.g.
-    /// `warehouse`) or is otherwise malformed.
-    #[error("invalid lake catalog config: {0}")]
-    InvalidCatalogConfig(String),
+    /// Planning (snapshot/seam resolution, lake-side planning, split freezing)
+    /// failed.
+    #[error("planning failed: {0}")]
+    PlanningFailed(String),
+
+    /// A split references data that is no longer available (e.g. a log offset
+    /// that has been truncated below the seam).
+    #[error("data unavailable: {0}")]
+    DataUnavailable(String),
 
     /// The lake (Paimon) schema could not be aligned to the Fluss table schema.
-    #[error("lake/Fluss schema mismatch: {0}")]
-    SchemaMismatch(String),
+    #[error("schema incompatible: {0}")]
+    SchemaIncompatible(String),
 
-    /// An error surfaced by the underlying Fluss client.
-    #[error("fluss client error: {0}")]
-    Fluss(#[from] fluss::error::Error),
+    /// An error surfaced by the underlying Fluss connection / client.
+    #[error("connection error: {0}")]
+    ConnectionError(String),
 
-    /// An error surfaced by the underlying Paimon reader.
-    #[error("paimon error: {0}")]
-    Paimon(#[from] paimon::Error),
-
-    /// An Arrow-level error (schema/array assembly).
-    #[error("arrow error: {0}")]
-    Arrow(#[from] arrow::error::ArrowError),
-
-    /// An internal invariant was violated (e.g. a bucket with no resolvable
-    /// offset). Should not happen for a well-formed table.
+    /// An internal invariant was violated. Should not happen for a well-formed
+    /// table.
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl From<fluss::error::Error> for FlussLakeError {
+    fn from(e: fluss::error::Error) -> Self {
+        FlussLakeError::ConnectionError(e.to_string())
+    }
+}
+
+impl From<paimon::Error> for FlussLakeError {
+    fn from(e: paimon::Error) -> Self {
+        FlussLakeError::PlanningFailed(e.to_string())
+    }
+}
+
+impl From<arrow::error::ArrowError> for FlussLakeError {
+    fn from(e: arrow::error::ArrowError) -> Self {
+        FlussLakeError::Internal(e.to_string())
+    }
 }
 
 /// Result alias for the kernel.

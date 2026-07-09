@@ -22,88 +22,73 @@
 //!     -> new_read() -> FlussLakeRead -> read_split(...)
 //! ```
 //!
-//! This keeps the Fluss-style `table -> scan` entry while making `plan()` an
-//! explicit public boundary, following the same *value* as paimon-rust's
-//! `scan -> plan -> read` layering: once-per-query planning, inspectable split
-//! descriptors, and execute-many from a frozen plan.
+//! `FlussLakeScan` is the shared, immutable configuration source for both
+//! `plan()` and `new_read()` (mirroring Paimon's `ReadBuilder`). The public
+//! split ([`FlussLakeReadSplit`]) is the only distributable, serializable value
+//! object; it carries an opaque execution descriptor and no full scan config. In
+//! a distributed setting the engine ships the serializable [`FlussLakeScanConfig`]
+//! separately to the workers.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use fluss::client::FlussConnection;
 use fluss::metadata::{Schema, TableInfo, TablePath};
+use fluss::record::to_arrow_schema;
 use fluss::rpc::message::OffsetSpec;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 
 use crate::append::{AppendSplitSpec, open_append_split};
 use crate::config::LakeCatalogConfig;
 use crate::error::{FlussLakeError, Result};
 use crate::pk::{PkSplitSpec, open_pk_split};
+use crate::predicate::{FlussLakePredicate, apply_exact_filter, decompose};
 use crate::reader::RecordBatchStream;
 use crate::snapshot::LakeSeam;
-use fluss::record::to_arrow_schema;
+
+/// Wire-format version of the opaque execution descriptor carried in a split.
+const DESCRIPTOR_VERSION: u32 = 1;
 
 /// The internal execution task behind a public read split. append/log tables
 /// stitch lake + log tail; primary-key tables merge lake current state with the
 /// changelog tail. The public split descriptor never exposes which variant it is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum ReadTask {
     Append(AppendSplitSpec),
     PrimaryKey(PkSplitSpec),
 }
 
 /// Public partition identity for a logical read split.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlussLakePartitionIdentity {
     Unpartitioned,
     KeyValues(Vec<(String, String)>),
 }
 
-/// Batch-mode boundary selection for a lake read.
-#[derive(Debug, Clone, Default)]
-pub enum FlussLakeReadBoundaryMode {
-    /// Read the latest readable snapshot. Current implementation falls back to
-    /// the latest lake snapshot until a readable-snapshot RPC is wired in.
-    #[default]
-    LatestReadable,
-    /// Read a specific lake snapshot id.
-    SnapshotId(i64),
-}
-
-/// Public read mode. v1 only supports bounded batch reads.
-#[derive(Debug, Clone)]
-pub enum FlussLakeReadMode {
-    Batch(FlussLakeReadBoundaryMode),
-}
-
-impl Default for FlussLakeReadMode {
-    fn default() -> Self {
-        Self::Batch(FlussLakeReadBoundaryMode::LatestReadable)
-    }
-}
-
-/// Public scan options for `fluss-lake`.
-#[derive(Debug, Clone, Default)]
-pub struct FlussLakeReadOptions {
+/// Serializable scan configuration shared by `plan()` and `new_read()`.
+///
+/// Everything needed to interpret a split lives here; the runtime
+/// [`FlussConnection`] is held separately on [`FlussLakeScan`] / [`FlussLakeRead`]
+/// (it is not serializable). Engines ship this config to workers to reconstruct
+/// an equivalent scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlussLakeScanConfig {
+    pub table_path: TablePath,
+    pub schema: Schema,
+    pub num_buckets: i32,
+    pub partition_keys: Vec<String>,
+    pub lake_catalog_properties: HashMap<String, String>,
+    /// Output projection as column indices into the Fluss schema; `None` = all.
+    pub projection: Option<Vec<usize>>,
+    /// Unified predicate; `AlwaysTrue` means no filtering.
+    pub filter: FlussLakePredicate,
+    /// `RecordBatch` row-count hint; `None` = reader default.
     pub batch_size: Option<usize>,
-    pub mode: FlussLakeReadMode,
-}
-
-/// Public read filter. This is the final filter type; v1 only implements the
-/// partition / bucket subset of it (a general value predicate is a future field
-/// on this same type, not a rename).
-#[derive(Debug, Clone, Default)]
-pub struct FlussLakeFilter {
-    pub partitions: Option<Vec<FlussLakePartitionFilter>>,
-}
-
-/// One partition entry: first select this partition, then select bucket ids
-/// within it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FlussLakePartitionFilter {
-    pub partition: FlussLakePartitionIdentity,
-    pub bucket_ids: Option<Vec<i32>>,
+    /// When true, read ONLY the lake snapshot (no Fluss log tail).
+    pub lake_only: bool,
 }
 
 /// A Fluss table that is readable through the lake kernel.
@@ -136,8 +121,14 @@ impl FlussLakeTable {
         }
     }
 
-    /// Convenience constructor from Fluss `TableInfo`, extracting the lake
-    /// catalog properties from the table config.
+    /// Recommended entry: fetches table metadata and validates lake-readability.
+    pub async fn open(connection: Arc<FlussConnection>, table_path: &TablePath) -> Result<Self> {
+        let admin = connection.get_admin()?;
+        let table_info = admin.get_table_info(table_path).await?;
+        Self::try_from_table_info(connection, &table_info)
+    }
+
+    /// Low-level entry for engine adapters that already hold `TableInfo`.
     pub fn try_from_table_info(
         connection: Arc<FlussConnection>,
         table_info: &TableInfo,
@@ -164,205 +155,305 @@ impl FlussLakeTable {
     pub fn new_scan(&self) -> FlussLakeScan {
         FlussLakeScan {
             connection: self.connection.clone(),
-            table_path: self.table_path.clone(),
-            schema: self.schema.clone(),
-            num_buckets: self.num_buckets,
-            partition_keys: self.partition_keys.clone(),
-            lake_catalog_properties: self.lake_catalog_properties.clone(),
-            projection: None,
-            filter: None,
-            options: FlussLakeReadOptions::default(),
-            lake_only: false,
+            config: FlussLakeScanConfig {
+                table_path: self.table_path.clone(),
+                schema: self.schema.clone(),
+                num_buckets: self.num_buckets,
+                partition_keys: self.partition_keys.clone(),
+                lake_catalog_properties: self.lake_catalog_properties.clone(),
+                projection: None,
+                filter: FlussLakePredicate::AlwaysTrue,
+                batch_size: None,
+                lake_only: false,
+            },
         }
     }
 }
 
-/// A configurable scan request over a `FlussLakeTable`.
+/// A configurable scan request over a `FlussLakeTable`. `with_*` consume `self`
+/// so a scan can be cloned and reused.
 #[derive(Clone)]
 pub struct FlussLakeScan {
     connection: Arc<FlussConnection>,
-    table_path: TablePath,
-    schema: Schema,
-    num_buckets: i32,
-    partition_keys: Vec<String>,
-    lake_catalog_properties: HashMap<String, String>,
-    projection: Option<Vec<usize>>,
-    filter: Option<FlussLakeFilter>,
-    options: FlussLakeReadOptions,
-    /// When true, read ONLY the lake snapshot (Paimon current state) with no
-    /// Fluss log tail — the `<table>$lake` read shape. Implemented by pinning each
-    /// split's log stop offset to its start (seam), so the tail `[seam, seam)` is
-    /// empty and the union/merge degrades to the lake side alone.
-    lake_only: bool,
+    config: FlussLakeScanConfig,
 }
 
 impl FlussLakeScan {
+    /// Projects by column index into the Fluss schema.
     pub fn with_projection(mut self, indices: Vec<usize>) -> Self {
-        self.projection = Some(indices);
+        self.config.projection = Some(indices);
         self
     }
 
-    pub fn with_filter(mut self, filter: FlussLakeFilter) -> Self {
-        self.filter = Some(filter);
+    /// Projects by column name (resolved against the Fluss schema). Names not
+    /// found resolve to an out-of-range index, surfaced as an error at `plan()`.
+    pub fn with_projection_by_names(mut self, columns: Vec<String>) -> Self {
+        let indices = columns
+            .iter()
+            .map(|name| {
+                self.config
+                    .schema
+                    .columns()
+                    .iter()
+                    .position(|c| c.name() == name)
+                    .unwrap_or(usize::MAX)
+            })
+            .collect();
+        self.config.projection = Some(indices);
         self
     }
 
-    pub fn with_options(mut self, options: FlussLakeReadOptions) -> Self {
-        self.options = options;
+    /// Sets the unified predicate. The SDK auto-decomposes it into partition
+    /// pruning and exact row filtering.
+    pub fn with_filter(mut self, filter: FlussLakePredicate) -> Self {
+        self.config.filter = filter;
+        self
+    }
+
+    /// Sets the target `RecordBatch` row count.
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.config.batch_size = Some(batch_size);
         self
     }
 
     /// Reads only the lake snapshot (Paimon current state), excluding the
-    /// residual Fluss log tail. Used for the `<table>$lake` read shape.
+    /// residual Fluss log tail.
     pub fn with_lake_only(mut self, lake_only: bool) -> Self {
-        self.lake_only = lake_only;
+        self.config.lake_only = lake_only;
         self
     }
 
+    /// The shared, serializable scan configuration (for distributed dispatch).
+    pub fn config(&self) -> &FlussLakeScanConfig {
+        &self.config
+    }
+
     pub async fn plan(&self) -> Result<FlussLakeReadPlan> {
-        let is_pk = self.schema.primary_key().is_some();
+        let cfg = &self.config;
+        let is_pk = cfg.schema.primary_key().is_some();
         let seam = self.snapshot_boundary().await?;
-        let targets = self.filter_targets()?;
 
         // Validate the catalog config early so planning fails fast, not on first read.
-        let _ = LakeCatalogConfig::from_catalog_properties(&self.lake_catalog_properties)?;
+        let _ = LakeCatalogConfig::from_catalog_properties(&cfg.lake_catalog_properties)?;
 
-        // Freeze the bounded-batch stop boundary at plan time: capture the latest
-        // log offset per bucket now so the read is repeatable and does not absorb
-        // rows appended between plan() and read_split(). v1 is non-partitioned, so
-        // every target carries partition_id == None and one offset list suffices.
-        //
-        // In lake-only mode there is no log tail to bound, so skip the
-        // `list_offsets` RPC entirely; each split's stop is pinned to its start
-        // below, yielding an empty `[seam, seam)` tail.
-        let stop_offsets = if self.lake_only {
+        // Decompose the filter; partition conjuncts prune partitions at plan time.
+        let decomposed = decompose(&cfg.filter, &cfg.partition_keys);
+        let targets = self.resolve_targets(&decomposed.partition).await?;
+
+        // Freeze the bounded-batch stop boundary now so the read is repeatable.
+        // Lake-only mode has no log tail to bound, so each split's stop is pinned
+        // to its start (an empty `[seam, seam)` tail).
+        let stop_offsets = if cfg.lake_only {
             HashMap::new()
         } else {
             self.frozen_stop_offsets(&targets).await?
         };
 
-        let splits = targets
-            .iter()
-            .map(|&(partition_id, bucket)| {
-                let log_start_offset = seam.seam_offset(partition_id, bucket).unwrap_or(0);
-                // Lake-only: pin the stop to the start so the Fluss log tail is
-                // empty and only the lake snapshot is read.
-                let log_stop_offset = if self.lake_only {
-                    Some(log_start_offset)
-                } else {
-                    stop_offsets.get(&bucket).copied()
-                };
-                let task = if is_pk {
-                    ReadTask::PrimaryKey(PkSplitSpec {
-                        partition_id,
-                        bucket,
-                        snapshot_id: seam.snapshot_id(),
-                        log_start_offset,
-                        // No tiered offset for an empty bucket => empty tail.
-                        log_stop_offset: log_stop_offset.unwrap_or(log_start_offset),
-                    })
-                } else {
-                    ReadTask::Append(AppendSplitSpec {
-                        partition_id,
-                        bucket,
-                        snapshot_id: seam.snapshot_id(),
-                        log_start_offset,
-                        log_stop_offset,
-                    })
-                };
-                FlussLakeReadSplit {
-                    split_id: format!(
-                        "{}:{}:{}",
-                        self.table_path,
-                        partition_id
-                            .map(|v| v.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                        bucket
-                    ),
-                    bucket_id: bucket,
-                    partition: FlussLakePartitionIdentity::Unpartitioned,
-                    estimated_rows: None,
-                    estimated_size: None,
-                    task,
-                }
-            })
-            .collect();
+        let mut splits = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let key = (target.partition_id, target.bucket);
+            let log_start_offset = seam
+                .seam_offset(target.partition_id, target.bucket)
+                .unwrap_or(0);
+            let log_stop_offset = if cfg.lake_only {
+                Some(log_start_offset)
+            } else {
+                stop_offsets.get(&key).copied()
+            };
+            let task = if is_pk {
+                ReadTask::PrimaryKey(PkSplitSpec {
+                    partition_id: target.partition_id,
+                    partition_values: target.partition_values.clone(),
+                    bucket: target.bucket,
+                    snapshot_id: seam.snapshot_id(),
+                    log_start_offset,
+                    log_stop_offset: log_stop_offset.unwrap_or(log_start_offset),
+                })
+            } else {
+                ReadTask::Append(AppendSplitSpec {
+                    partition_id: target.partition_id,
+                    partition_values: target.partition_values.clone(),
+                    bucket: target.bucket,
+                    snapshot_id: seam.snapshot_id(),
+                    log_start_offset,
+                    log_stop_offset,
+                })
+            };
+            splits.push(FlussLakeReadSplit {
+                split_id: format!(
+                    "{}:{}:{}",
+                    cfg.table_path,
+                    target
+                        .partition_id
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                    target.bucket
+                ),
+                bucket_id: target.bucket,
+                partition: target.identity.clone(),
+                estimated_rows: None,
+                estimated_size: None,
+                descriptor_version: DESCRIPTOR_VERSION,
+                execution_descriptor: encode_task(&task)?,
+            });
+        }
 
-        let (projected_schema, _names) =
-            projected_schema_and_names(&self.schema, self.projection.as_deref())?;
+        let projected_schema = projected_schema(&cfg.schema, cfg.projection.as_deref())?;
         Ok(FlussLakeReadPlan {
             inner: Arc::new(FlussLakeReadPlanInner {
                 schema: projected_schema,
                 splits,
-                mode: self.options.mode.clone(),
             }),
         })
-    }
-
-    /// Captures the exclusive latest log offset per target bucket at plan time,
-    /// freezing the bounded-batch boundary. v1 only handles non-partitioned
-    /// tables, so all targets share `partition_id == None`.
-    async fn frozen_stop_offsets(
-        &self,
-        targets: &[(Option<i64>, i32)],
-    ) -> Result<HashMap<i32, i64>> {
-        if targets.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let buckets: Vec<i32> = targets.iter().map(|(_, b)| *b).collect();
-        let admin = self.connection.get_admin()?;
-        let latest = admin
-            .list_offsets(&self.table_path, &buckets, OffsetSpec::Latest)
-            .await?;
-        Ok(latest)
     }
 
     pub fn new_read(&self) -> Result<FlussLakeRead> {
         Ok(FlussLakeRead {
             connection: self.connection.clone(),
-            table_path: self.table_path.clone(),
-            lake_catalog_properties: self.lake_catalog_properties.clone(),
-            schema: self.schema.clone(),
-            projection: self.projection.clone(),
+            config: self.config.clone(),
         })
     }
 
-    fn filter_targets(&self) -> Result<Vec<(Option<i64>, i32)>> {
-        resolve_filter_targets(&self.filter, self.num_buckets, &self.partition_keys)
+    /// Resolves the concrete read targets after partition pruning.
+    async fn resolve_targets(
+        &self,
+        partition_conjuncts: &[FlussLakePredicate],
+    ) -> Result<Vec<ReadTarget>> {
+        let cfg = &self.config;
+        let buckets: Vec<i32> = (0..cfg.num_buckets).collect();
+        if cfg.partition_keys.is_empty() {
+            return Ok(buckets
+                .into_iter()
+                .map(|bucket| ReadTarget {
+                    partition_id: None,
+                    partition_name: None,
+                    partition_values: Vec::new(),
+                    identity: FlussLakePartitionIdentity::Unpartitioned,
+                    bucket,
+                })
+                .collect());
+        }
+
+        let admin = self.connection.get_admin()?;
+        let partitions = admin.list_partition_infos(&cfg.table_path).await?;
+        let mut targets = Vec::new();
+        for info in partitions {
+            let spec = info.get_resolved_partition_spec();
+            let values: Vec<(String, String)> = spec
+                .get_partition_keys()
+                .iter()
+                .cloned()
+                .zip(spec.get_partition_values().iter().cloned())
+                .collect();
+            if !crate::predicate::partition_matches(partition_conjuncts, &values) {
+                continue;
+            }
+            let partition_id = Some(info.get_partition_id());
+            let partition_name = Some(info.get_partition_name());
+            for &bucket in &buckets {
+                targets.push(ReadTarget {
+                    partition_id,
+                    partition_name: partition_name.clone(),
+                    partition_values: values.clone(),
+                    identity: FlussLakePartitionIdentity::KeyValues(values.clone()),
+                    bucket,
+                });
+            }
+        }
+        Ok(targets)
+    }
+
+    /// Captures the exclusive latest log offset per target at plan time, keyed by
+    /// `(partition_id, bucket)`. Partitioned tables query per partition.
+    async fn frozen_stop_offsets(
+        &self,
+        targets: &[ReadTarget],
+    ) -> Result<HashMap<(Option<i64>, i32), i64>> {
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let admin = self.connection.get_admin()?;
+        let cfg = &self.config;
+
+        // Group buckets by partition so each partition needs one RPC.
+        let mut by_partition: HashMap<(Option<i64>, Option<String>), Vec<i32>> = HashMap::new();
+        for t in targets {
+            by_partition
+                .entry((t.partition_id, t.partition_name.clone()))
+                .or_default()
+                .push(t.bucket);
+        }
+
+        let mut out = HashMap::new();
+        for ((partition_id, partition_name), buckets) in by_partition {
+            let latest = match &partition_name {
+                Some(name) => {
+                    admin
+                        .list_partition_offsets(
+                            &cfg.table_path,
+                            name,
+                            &buckets,
+                            OffsetSpec::Latest,
+                        )
+                        .await?
+                }
+                None => {
+                    admin
+                        .list_offsets(&cfg.table_path, &buckets, OffsetSpec::Latest)
+                        .await?
+                }
+            };
+            for (bucket, offset) in latest {
+                out.insert((partition_id, bucket), offset);
+            }
+        }
+        Ok(out)
     }
 
     async fn snapshot_boundary(&self) -> Result<LakeSeam> {
         #[cfg(feature = "integration_tests")]
-        if let Some(seam) = crate::test_overrides::get_test_lake_seam_override(&self.table_path) {
+        if let Some(seam) =
+            crate::test_overrides::get_test_lake_seam_override(&self.config.table_path)
+        {
             return Ok(seam);
         }
 
         let admin = self.connection.get_admin()?;
-        let snapshot = match self.options.mode {
-            FlussLakeReadMode::Batch(FlussLakeReadBoundaryMode::LatestReadable) => {
-                // TODO: switch to readable snapshot RPC when wired in.
-                admin.get_latest_lake_snapshot(&self.table_path).await?
-            }
-            FlussLakeReadMode::Batch(FlussLakeReadBoundaryMode::SnapshotId(snapshot_id)) => {
-                // TODO: support fetching a specific historical lake snapshot once
-                // the Rust client exposes that RPC path.
-                let latest = admin.get_latest_lake_snapshot(&self.table_path).await?;
-                if latest.snapshot_id() != snapshot_id {
-                    return Err(FlussLakeError::Internal(format!(
-                        "snapshot mode SnapshotId({snapshot_id}) is not yet implemented in fluss-rust"
-                    )));
-                }
-                latest
-            }
-        };
+        // v1 always reads the latest readable snapshot; historical snapshot
+        // selection (`with_snapshot_id`) is a future extension.
+        let snapshot = admin
+            .get_latest_lake_snapshot(&self.config.table_path)
+            .await?;
         Ok(LakeSeam::from_lake_snapshot(&snapshot))
     }
 }
 
-fn projected_schema_and_names(
-    schema: &Schema,
-    projection: Option<&[usize]>,
-) -> Result<(SchemaRef, Option<Vec<String>>)> {
+/// One resolved `(partition, bucket)` read target.
+struct ReadTarget {
+    partition_id: Option<i64>,
+    /// Canonical partition name for `list_partition_offsets`; `None` when the
+    /// table is non-partitioned.
+    partition_name: Option<String>,
+    partition_values: Vec<(String, String)>,
+    identity: FlussLakePartitionIdentity,
+    bucket: i32,
+}
+
+fn encode_task(task: &ReadTask) -> Result<Vec<u8>> {
+    serde_json::to_vec(task).map_err(|e| {
+        FlussLakeError::Internal(format!("failed to encode split execution descriptor: {e}"))
+    })
+}
+
+fn decode_task(bytes: &[u8]) -> Result<ReadTask> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        FlussLakeError::Internal(format!("failed to decode split execution descriptor: {e}"))
+    })
+}
+
+/// Builds the projected Arrow output schema for a projection (or the full schema
+/// when `projection` is `None`).
+fn projected_schema(schema: &Schema, projection: Option<&[usize]>) -> Result<SchemaRef> {
     match projection {
         Some(indices) => {
             let fields = indices
@@ -379,74 +470,78 @@ fn projected_schema_and_names(
                 .map_err(|e| {
                     FlussLakeError::Internal(format!("failed to build projected schema: {e}"))
                 })?;
-            let names = indices
-                .iter()
-                .map(|&idx| schema.columns()[idx].name().to_string())
-                .collect();
-            Ok((to_arrow_schema(projected.row_type())?, Some(names)))
+            Ok(to_arrow_schema(projected.row_type())?)
         }
-        None => Ok((to_arrow_schema(schema.row_type())?, None)),
+        None => Ok(to_arrow_schema(schema.row_type())?),
     }
 }
 
-/// Resolves a [`FlussLakeFilter`] into the concrete `(partition_id, bucket)`
-/// targets to read. v1 is non-partitioned only.
-///
-/// - no filter / `partitions = None`  -> all buckets
-/// - `partitions = Some([])`          -> empty (no target)
-/// - each entry's `bucket_ids = None` -> all buckets; `Some(ids)` -> those buckets
-/// - any partitioned table or non-`Unpartitioned` identity -> error (v1)
-fn resolve_filter_targets(
-    filter: &Option<FlussLakeFilter>,
-    num_buckets: i32,
-    partition_keys: &[String],
-) -> Result<Vec<(Option<i64>, i32)>> {
-    if !partition_keys.is_empty() {
-        return Err(FlussLakeError::Internal(
-            "partitioned lake reads are not yet implemented".to_string(),
-        ));
-    }
-    let all = || (0..num_buckets).map(|b| (None, b)).collect::<Vec<_>>();
-    match filter.as_ref().and_then(|f| f.partitions.as_ref()) {
-        None => Ok(all()),
-        Some(entries) => {
-            let mut out = Vec::new();
-            for entry in entries {
-                if entry.partition != FlussLakePartitionIdentity::Unpartitioned {
-                    return Err(FlussLakeError::Internal(
-                        "partitioned lake read filter is not yet implemented".to_string(),
-                    ));
-                }
-                match &entry.bucket_ids {
-                    None => out.extend((0..num_buckets).map(|b| (None, b))),
-                    Some(ids) => out.extend(ids.iter().copied().map(|b| (None, b))),
-                }
-            }
-            Ok(out)
+/// The output column names for a projection (used by the lake reader to project
+/// by Fluss column name), or `None` for the full schema.
+fn projected_names(schema: &Schema, projection: Option<&[usize]>) -> Result<Option<Vec<String>>> {
+    match projection {
+        Some(indices) => {
+            let names = indices
+                .iter()
+                .map(|&idx| {
+                    schema.columns().get(idx).map(|c| c.name().to_string()).ok_or_else(|| {
+                        FlussLakeError::Internal(format!("projection index {idx} out of bounds"))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(names))
         }
+        None => Ok(None),
     }
+}
+
+/// Projects each batch of `stream` (full Fluss schema) down to `projection`.
+fn project_stream(
+    stream: RecordBatchStream,
+    schema: &Schema,
+    projection: Option<Vec<usize>>,
+) -> Result<RecordBatchStream> {
+    let Some(indices) = projection else {
+        return Ok(stream);
+    };
+    let target = projected_schema(schema, Some(&indices))?;
+    Ok(stream
+        .map(move |item| {
+            let batch = item?;
+            let columns = indices
+                .iter()
+                .map(|&i| {
+                    if i >= batch.num_columns() {
+                        return Err(FlussLakeError::Internal(format!(
+                            "projection index {i} out of bounds for output batch"
+                        )));
+                    }
+                    Ok(batch.column(i).clone())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(RecordBatch::try_new(target.clone(), columns)?)
+        })
+        .boxed())
 }
 
 struct FlussLakeReadPlanInner {
     schema: SchemaRef,
     splits: Vec<FlussLakeReadSplit>,
-    mode: FlussLakeReadMode,
 }
 
-/// Public logical read split descriptor.
-///
-/// This is NOT a physical Paimon `DataSplit`. It is the kernel's stable
-/// execution-unit descriptor exposed to engines and other consumers. Internally
-/// one `FlussLakeReadSplit` may map to multiple lake `DataSplit`s plus a Fluss
-/// log tail.
-#[derive(Debug, Clone)]
+/// Public logical read split descriptor. Distributable, serializable, and
+/// versioned; carries an opaque execution descriptor and no full scan config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlussLakeReadSplit {
     pub split_id: String,
     pub bucket_id: i32,
     pub partition: FlussLakePartitionIdentity,
     pub estimated_rows: Option<usize>,
     pub estimated_size: Option<usize>,
-    task: ReadTask,
+    pub descriptor_version: u32,
+    /// Private, opaque, versioned execution descriptor. Not part of the stable
+    /// human-facing surface; used by the reader to rebuild the internal task.
+    execution_descriptor: Vec<u8>,
 }
 
 /// A frozen, inspectable read plan.
@@ -469,58 +564,93 @@ impl FlussLakeReadPlan {
     }
 
     pub fn statistics(&self) -> FlussLakePlanStatistics {
+        // Aggregate split estimates: any `None` makes the plan estimate `None`.
+        let split_count = self.inner.splits.len();
+        let estimated_rows = self
+            .inner
+            .splits
+            .iter()
+            .map(|s| s.estimated_rows)
+            .try_fold(0usize, |acc, r| r.map(|r| acc + r));
+        let estimated_size = self
+            .inner
+            .splits
+            .iter()
+            .map(|s| s.estimated_size)
+            .try_fold(0usize, |acc, r| r.map(|r| acc + r));
         FlussLakePlanStatistics {
-            split_count: self.inner.splits.len(),
-            mode: self.inner.mode.clone(),
+            split_count,
+            estimated_rows,
+            estimated_size,
         }
     }
 }
 
-/// Lightweight plan statistics for engine/consumer visibility.
-#[derive(Clone)]
+/// Plan-level statistics for engine cost estimation and parallelism decisions.
+#[derive(Debug, Clone)]
 pub struct FlussLakePlanStatistics {
     pub split_count: usize,
-    pub mode: FlussLakeReadMode,
+    pub estimated_rows: Option<usize>,
+    pub estimated_size: Option<usize>,
 }
 
-/// Read executor over a previously configured scan.
+/// Read executor over a previously configured scan. `Send + Sync`, so an
+/// `Arc<FlussLakeRead>` can be shared and called concurrently across tasks.
 #[derive(Clone)]
 pub struct FlussLakeRead {
     connection: Arc<FlussConnection>,
-    table_path: TablePath,
-    lake_catalog_properties: HashMap<String, String>,
-    schema: Schema,
-    projection: Option<Vec<usize>>,
+    config: FlussLakeScanConfig,
 }
 
 impl FlussLakeRead {
     pub async fn read_split(&self, split: &FlussLakeReadSplit) -> Result<RecordBatchStream> {
-        match &split.task {
+        let cfg = &self.config;
+        let task = decode_task(&split.execution_descriptor)?;
+        let has_filter = !cfg.filter.is_always_true();
+
+        // With a filter we read the full Fluss schema, apply the exact filter,
+        // then project — the filter may reference columns outside the projection.
+        // Without a filter we push the projection down for efficiency.
+        let read_projection = if has_filter {
+            None
+        } else {
+            cfg.projection.clone()
+        };
+
+        let stream = match &task {
             ReadTask::Append(spec) => {
-                let (projected_schema, projected_column_names) =
-                    projected_schema_and_names(&self.schema, self.projection.as_deref())?;
+                let schema = projected_schema(&cfg.schema, read_projection.as_deref())?;
+                let names = projected_names(&cfg.schema, read_projection.as_deref())?;
                 open_append_split(
                     self.connection.clone(),
-                    &self.table_path,
-                    &self.lake_catalog_properties,
-                    projected_schema,
-                    projected_column_names.as_deref(),
-                    self.projection.clone(),
+                    &cfg.table_path,
+                    &cfg.lake_catalog_properties,
+                    schema,
+                    names.as_deref(),
+                    read_projection.clone(),
                     spec,
                 )
-                .await
+                .await?
             }
             ReadTask::PrimaryKey(spec) => {
                 open_pk_split(
                     self.connection.clone(),
-                    &self.table_path,
-                    &self.lake_catalog_properties,
-                    &self.schema,
-                    self.projection.clone(),
+                    &cfg.table_path,
+                    &cfg.lake_catalog_properties,
+                    &cfg.schema,
+                    read_projection.clone(),
                     spec,
                 )
-                .await
+                .await?
             }
+        };
+
+        if has_filter {
+            let full_schema = to_arrow_schema(cfg.schema.row_type())?;
+            let filtered = apply_exact_filter(stream, cfg.filter.clone(), full_schema);
+            project_stream(filtered, &cfg.schema, cfg.projection.clone())
+        } else {
+            Ok(stream)
         }
     }
 
@@ -543,69 +673,46 @@ impl FlussLakeRead {
 mod tests {
     use super::*;
 
-    fn pf(bucket_ids: Option<Vec<i32>>) -> FlussLakePartitionFilter {
-        FlussLakePartitionFilter {
-            partition: FlussLakePartitionIdentity::Unpartitioned,
-            bucket_ids,
+    #[test]
+    fn split_descriptor_round_trips() {
+        let task = ReadTask::Append(AppendSplitSpec {
+            partition_id: Some(7),
+            partition_values: vec![("dt".to_string(), "2024".to_string())],
+            bucket: 3,
+            snapshot_id: 42,
+            log_start_offset: 100,
+            log_stop_offset: Some(200),
+        });
+        let bytes = encode_task(&task).unwrap();
+        let decoded = decode_task(&bytes).unwrap();
+        match decoded {
+            ReadTask::Append(spec) => {
+                assert_eq!(spec.partition_id, Some(7));
+                assert_eq!(spec.bucket, 3);
+                assert_eq!(spec.log_stop_offset, Some(200));
+                assert_eq!(
+                    spec.partition_values,
+                    vec![("dt".to_string(), "2024".to_string())]
+                );
+            }
+            _ => panic!("expected append task"),
         }
     }
 
     #[test]
-    fn no_filter_selects_all_buckets() {
-        let targets = resolve_filter_targets(&None, 3, &[]).unwrap();
-        assert_eq!(targets, vec![(None, 0), (None, 1), (None, 2)]);
-    }
-
-    #[test]
-    fn filter_with_no_partitions_selects_all_buckets() {
-        let filter = FlussLakeFilter { partitions: None };
-        let targets = resolve_filter_targets(&Some(filter), 2, &[]).unwrap();
-        assert_eq!(targets, vec![(None, 0), (None, 1)]);
-    }
-
-    #[test]
-    fn empty_partitions_select_nothing() {
-        let filter = FlussLakeFilter {
-            partitions: Some(vec![]),
+    fn split_is_serializable() {
+        let split = FlussLakeReadSplit {
+            split_id: "db.t:-:0".to_string(),
+            bucket_id: 0,
+            partition: FlussLakePartitionIdentity::Unpartitioned,
+            estimated_rows: None,
+            estimated_size: None,
+            descriptor_version: DESCRIPTOR_VERSION,
+            execution_descriptor: vec![1, 2, 3],
         };
-        let targets = resolve_filter_targets(&Some(filter), 3, &[]).unwrap();
-        assert!(targets.is_empty());
-    }
-
-    #[test]
-    fn explicit_bucket_ids_select_those_buckets() {
-        let filter = FlussLakeFilter {
-            partitions: Some(vec![pf(Some(vec![2, 0]))]),
-        };
-        let targets = resolve_filter_targets(&Some(filter), 4, &[]).unwrap();
-        assert_eq!(targets, vec![(None, 2), (None, 0)]);
-    }
-
-    #[test]
-    fn entry_with_none_bucket_ids_selects_all_buckets() {
-        let filter = FlussLakeFilter {
-            partitions: Some(vec![pf(None)]),
-        };
-        let targets = resolve_filter_targets(&Some(filter), 2, &[]).unwrap();
-        assert_eq!(targets, vec![(None, 0), (None, 1)]);
-    }
-
-    #[test]
-    fn partitioned_table_is_rejected() {
-        assert!(resolve_filter_targets(&None, 2, &["dt".to_string()]).is_err());
-    }
-
-    #[test]
-    fn key_valued_partition_filter_is_rejected() {
-        let filter = FlussLakeFilter {
-            partitions: Some(vec![FlussLakePartitionFilter {
-                partition: FlussLakePartitionIdentity::KeyValues(vec![(
-                    "dt".to_string(),
-                    "2024".to_string(),
-                )]),
-                bucket_ids: None,
-            }]),
-        };
-        assert!(resolve_filter_targets(&Some(filter), 2, &[]).is_err());
+        let json = serde_json::to_string(&split).unwrap();
+        let back: FlussLakeReadSplit = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.split_id, split.split_id);
+        assert_eq!(back.descriptor_version, DESCRIPTOR_VERSION);
     }
 }

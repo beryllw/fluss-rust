@@ -1,140 +1,77 @@
 # fluss-datafusion 设计文档
 
 > English version: [design.md](./design.md).
+>
+> 本文采用接近 FIP 的组织方式，系统描述当前 `fluss-datafusion` 模块的设计、
+> 公共契约、已经落地的代码路径，以及仍处于收敛阶段的部分。它刻意以当前实现为准，
+> 而不是描述一个理想化但尚未落地的 gateway。
 
-本文件描述 `fluss-datafusion` 的设计与内部结构,面向 crate 的维护者，以及未来要消费它的
-`fluss-gateway` 集成工作。使用方式与公共 API 见同目录的 [`README.md`](./README.md)。
+使用方式与快速上手见 [`README.md`](./README.md)。
+本模块正式的 FIP 风格提案见 [`FIP.md`](./FIP.md) 与
+[`FIP.en.md`](./FIP.en.md)。
+lake-enabled 表的 adapter 边界与读取路由规则，另见
+[`fip-lake-integration.zh.md`](./fip-lake-integration.zh.md)。
 
-## 概述
+## Motivation
 
-`fluss-datafusion` 是一个**无状态**的 Rust library crate，通过 catalog / schema / table /
-execution-plan 集成，把 Fluss 数据暴露给 DataFusion，使调用方可以直接用 `ctx.sql(...)` 查询
-Fluss 表。
+`fluss-datafusion` 的目标，是通过 DataFusion 的标准扩展点把 Fluss 表暴露给
+SQL 执行层：
 
-设计上刻意收窄：
+- `CatalogProvider`
+- `SchemaProvider`
+- `TableProvider`
+- 自定义 `ExecutionPlan`
 
-- 让 `fluss-gateway` 的 SQL 读取路径成为可能；
-- 保持该 crate 在 gateway 之外仍可独立复用；
-- 复用现有的 Fluss Rust client，而不是发明一个 gateway 专属的 backend 抽象。
+它解决的是 Rust 侧 Fluss 生态中的一个非常具体的问题：Fluss 原生提供的是
+KV / log 读取能力与客户端 API，而不是一个现成的 DataFusion catalog；但上层
+SQL 消费方希望直接使用 `ctx.sql(...)` 查询 Fluss 表。
 
-## 目标与范围
+这个模块必须同时桥接三类读取路径：
 
-### 当前支持
+1. **非 lake KV 表**
+   - 完整 primary-key equality 的点查；
+   - 完整 bucket-key prefix equality 的前缀查；
+   - 仅在存在 `LIMIT` 时才支持有界扫描。
+2. **非 lake log 表**
+   - earliest 到 latest 的有限 snapshot scan；
+   - 可选 `LIMIT`，语义是 head-first 的 first-N。
+3. **lake-enabled 表**
+   - 基于 lake snapshot + residual Fluss log tail 的 unified read；
+   - 通过 `<table>$lake` 暴露 lake-only read；
+   - 对符合条件的主键查询保留直接的 KV fast path。
 
-1. database 与 table 发现（list / get schema / 表类型）
-2. KV 表支持四种读路径（按优先级）：完整 primary-key 等值谓词下推为点查（point lookup）；bucket-key 前缀等值（分区表还需给出全部分区列等值）下推为 prefix lookup；带 `LIMIT` 时走有界 scan；其它形态（无 filter / 无 `LIMIT`，如 `SELECT *`）走全表扫描——通过 changelog 合并到当前状态。全表扫描的完整性受 changelog 保留期约束
-3. log 表支持两种扫描形态：带 `LIMIT` 时走 head-first 的 first-N 扫描；不带 `LIMIT` 时走有限的 earliest->latest snapshot 扫描；两者都支持 projection pushdown
-4. 复用 Fluss-to-Arrow 的 schema 与 row 转换
-5. 通过 `CatalogProvider` / `SchemaProvider` / `TableProvider` / 自定义 `ExecutionPlan`
-   完成 DataFusion 集成
-6. 共享 installer + 每会话 `register_catalog(...)` 的使用模型
+这里最重要的设计压力，是让这个 crate 保持 **thin and reusable**：
 
-### 非目标
+- 它应该是一个 library，而不是协议服务器；
+- 它不应该拥有 session / auth / protocol 语义；
+- 它不应该重复实现本应归属 `fluss-lake` 的 lake+log union 语义；
+- 它不应该用内部缓存掩盖 metadata freshness。
 
-刻意排除（避免对尚未实现的 SQL 语义过度承诺）：
+换句话说，`fluss-datafusion` 是 Fluss 的 DataFusion adapter 层，而不是第二个
+storage kernel，也不是一个已经完整成型的 query gateway。
 
-- PostgreSQL / MySQL 协议或兼容对象（如 `pg_catalog`）
-- session / user / auth / 多 cluster 感知
-- SQL DML 写入
-- 直连读写的 REST / gRPC API
-- batch lookup 优化
-- offset 伪列、offset 谓词 pushdown
-- 复杂的 filter / join / aggregate / sort pushdown
+## Public Interfaces
 
-## 架构与依赖方向
+这个 crate 的公共接口刻意很小。
 
-依赖方向严格单向：`fluss client/core -> fluss-datafusion`，绝不反向。该 crate 不感知调用方
-身份、协议、session 变量、auth 模式，也不知道自己是否运行在 gateway 内。
+### Rust API
 
-```
-+-----------------------------+
-|        SessionContext       |   每个 SQL 会话一个
-+--------------+--------------+
-               | register_catalog(...)
-               v
-+-----------------------------+
-|       FlussDatafusion       |   共享 installer（Arc，无状态）
-|   MetadataLoader (live)     |   无缓存；每次调用都回源 Fluss
-+--------------+--------------+
-               | FlussSource（内部 trait, crate 边界）
-               v
-+-----------------------------+
-|       RealFlussSource       |   包裹 Arc<FlussConnection>
-+--------------+--------------+
-               v
-        Fluss client / core
-```
+当前导出的只有：
 
-核心边界是内部 trait `FlussSource`：crate 内部只通过它访问 Fluss，`metadata/loader.rs` 与
-`execution/*` 都**不直接持有** `FlussConnection` / `FlussAdmin` / `Lookuper` / scanner。
-`FlussSource` 是内部测试 seam（`pub(crate)`），不是公共 gateway backend 抽象，不得塞入
-session / protocol / auth 概念。
+- `FlussDatafusion`
+- `FlussDatafusionOptions`
+- `RegisterCatalogOptions`
+- `FlussDatafusionError`
+- `Result`
 
-## crate 布局
-
-```text
-crates/integrations/datafusion/
-  Cargo.toml
-  docs/
-    README.md          # 使用方式与公共 API
-    design.md          # 本文件
-  src/
-    lib.rs             # 公共导出
-    config.rs          # FlussDatafusionOptions / RegisterCatalogOptions
-    error.rs           # FlussDatafusionError / Result
-    install.rs         # FlussDatafusion: new / register_catalog
-    runtime.rs         # 同步回调的 sync<->async 桥接
-    backend/
-      mod.rs           # FlussSource trait（pub(crate)）+ 共享别名
-      real.rs          # 生产实现，包 FlussConnection
-    metadata/
-      mod.rs
-      loader.rs        # 仅依赖 FlussSource 的实时直通；无缓存
-    catalog/
-      mod.rs
-      provider.rs      # FlussCatalogProvider（实时同步 schema_names / schema）
-      schema.rs        # FlussSchemaProvider（实时 table_names；异步 table()）
-      register.rs      # build_catalog_provider
-    table/
-      mod.rs
-      predicate.rs     # KV 谓词识别（analyze_kv_filters）
-      kv.rs            # FlussKvTableProvider
-      log.rs           # FlussLogTableProvider
-    execution/
-      mod.rs
-      lookup.rs        # FlussKvLookupExec
-      log_scan.rs      # FlussLogScanExec（有界 scan；标签按 log/KV）
-      kv_full_scan.rs  # FlussKvFullScanExec（KV 全表扫描；changelog 合并）
-      stream.rs        # 协作式取消的 stream 适配
-    types/
-      mod.rs
-      scalar.rs        # ScalarValue -> Fluss KeyValue
-      record_batch.rs  # projection 裁列
-  tests/
-    test_fluss_datafusion.rs
-    integration/
-      mod.rs
-      utils.rs         # 共享表名常量 + SQL-path helper
-      setup.rs         # integration_tests: 真实集群 bootstrap + 建表/灌数
-      e2e.rs           # integration_tests: 真实后端端到端 SQL
-      live_metadata.rs # integration_tests: 实时 post-DDL 可见性（无缓存）
-```
-
-> 注：crate 位于 `crates/integrations/datafusion/`（包名为 `fluss-datafusion`）。`integrations/`
-> 这层目录用于分组未来可能新增的其他集成（如其他查询引擎/格式）。
-
-## 公共 API
-
-公共面刻意精简，全部从 `lib.rs` 导出：
-
-- `FlussDatafusion`（`install.rs`）—— 共享 installer
-- `FlussDatafusionOptions` / `RegisterCatalogOptions`（`config.rs`）
-- `FlussDatafusionError` / `Result`（`error.rs`）
+当前操作 API 如下：
 
 ```rust
-pub struct FlussDatafusionOptions {}               // 占位；catalog 实时，无可调项
+pub struct FlussDatafusionOptions {
+    pub lake_storage_options: std::collections::HashMap<String, String>,
+}
 
-pub struct RegisterCatalogOptions {}               // 占位，预留 per-catalog 选项
+pub struct RegisterCatalogOptions {}
 
 impl FlussDatafusion {
     pub async fn new(
@@ -148,230 +85,538 @@ impl FlussDatafusion {
         catalog_name: &str,
         options: RegisterCatalogOptions,
     ) -> Result<()>;
+
+    pub fn swap_connection(
+        &self,
+        new: Arc<fluss::client::FlussConnection>,
+    ) -> Result<()>;
 }
 ```
 
-`new()` 接收具体的 `Arc<FlussConnection>`，但内部立即把它包成 `Arc<dyn FlussSource>`，此后
-crate 不再依赖 `FlussConnection`。`FlussSource` 是纯 `pub(crate)` 的内部 seam，不暴露任何测试
-注入入口；集成测试一律走 `new()` 这条生产路径，对接真实集群。
+这些 API 对外的关键行为是：
 
-## 内部模块职责
+- `new(...)` 基于一个 live 的 Fluss connection 构造共享 installer；
+- `register_catalog(...)` 把一个 fully live 的 Fluss catalog 安装到
+  `SessionContext`；
+- `swap_connection(...)` 支持在不重新注册 catalog 的前提下热切换底层连接。
 
-### `backend/`（内部访问 seam）
+### SQL 可见契约
 
-- `FlussSource` trait（`pub(crate)`）只覆盖当前 crate 真正用到的原子操作：metadata 列举/获取、
-  KV 完整 primary-key `lookup(key) -> RecordBatch`、分区列举（`list_partitions`）、KV 有界
-  `bounded_scan(partition_id, bucket, projection, limit) -> Vec<RecordBatch>`、log 快照
-  `log_scan(partition_id, bucket, projection, row_limit) -> Vec<RecordBatch>`，以及 KV 全表
-  `kv_full_scan(partition_id, bucket, projection) -> Vec<RecordBatch>`。`bounded_scan`
-  保留为仅供 KV 使用的 tail 语义 `LimitBatchScanner` 路径；`log_scan` 则是 log 专用：从 earliest
-  向 latest 读取，`Some(n)` 表示 head-first 的 first-N，`None` 表示读到查询启动时捕获的 latest
-  offsets 为止的有限快照；`kv_full_scan` 为 KV 专用：把单个 bucket 的 CDC changelog（调用时刻的
-  earliest->latest）经客户端 `collect_kv_current_state_batch` 合并到当前状态后返回（无 kv-snapshot
-  RPC、无 RocksDB）。三者都接收 `Option<i64>` 分区 id（非分区表为 `None`），以便 scanner
-  定位分区限定的 bucket。
-- `real.rs`：唯一实现，包 `FlussConnection` / `FlussAdmin` / lookuper / scanner，复用 fluss
-  现有 Arrow helper（如 `LookupResult::to_record_batch`），不重复实现 Arrow 组装。
-  `list_partitions` 把 `admin.list_partition_infos` 映射为 crate 的 `FlussPartition`（分区 id +
-  分区键/值字符串对）；两个 scan 方法都经 `TableBucket::new_with_partition` 构造 bucket。`log_scan`
-  会在每个 target 上于查询起始一次性捕获 `Earliest`/`Latest` offset，以 earliest 订阅
-  `RecordBatchLogScanner`，并持续 poll，直到到达该 latest 边界或满足 first-N 上限。
-- seam 返回 crate 自有的精简 `FlussTableMeta`（schema + primary_keys + num_buckets + partition_keys
-  等），把上层与 `fluss::metadata::TableInfo` 解耦，只携带 catalog 接线、谓词分析、执行真正需要的字段。
+通过 DataFusion 暴露给 SQL 使用者的契约包括：
 
-### `metadata/`
+- 表路径形态为 `<catalog>.<database>.<table>`；
+- `<table>$options` 作为 key/value metadata table；
+- 在 `lake` feature 下暴露 `<table>$lake` 作为 lake-only read；
+- 在 `EXPLAIN` 中可见自定义 physical plan 名称。
 
-- `loader.rs`：`MetadataLoader` 仅依赖 `SharedFlussSource`，不持有缓存。`databases()` 每次都
-  实时读取全 cluster 的 db/table 列举；`table_entry()` 每次都实时重读每表 meta + Arrow schema。
-  Arrow schema 经 `fluss::record::to_arrow_schema(meta.schema.row_type())` 转换；该派生仍归
-  loader 所有，避免调用方各自重复实现映射。
+当前主要可见的执行计划名称有：
 
-### `runtime.rs`
+- `FlussKvLookupExec`
+- `FlussKvPrefixLookupExec`
+- `FlussKvScanExec`
+- `FlussLogScanExec`
+- `FlussUnionScanExec`
 
-- DataFusion 同步 catalog 回调的 sync<->async 桥接。`block_on_with_runtime` 在同步回调里把 async
-  源调用跑到完成；当已处于 tokio runtime 内时，会临时起一个短命线程对全局 runtime handle 做
-  `block_on`，规避「runtime 内不能 block」的 panic。一个懒初始化的全局 runtime 兜底，避免每次
-  调用都新建 runtime。
-- 正确性说明：这个私有 runtime **不是** 连接归属 runtime。上游 `fluss-rs` 的修复已经把
-  `FlussConnection` 做成完整 actor:socket 的创建/注册、读、写全部钉在 `fluss-rs` 内部单一的
-  I/O runtime 上，调用方只通过 runtime 无关的 channel 与之交互。因此 catalog 桥自己的私有
-  runtime 不再是死锁风险；它只影响成本模型(一次线程跳转 / `block_on`)，不影响连接正确性。
-- 运维含义：如果宿主希望 Fluss socket I/O 复用自己长生命的 runtime(便于线程预算或可观测性
-  统一)，应在构造底层 `FlussConnection` 时经 `FlussConnection::new_with_io_handle(...)`
-  注入；`fluss-datafusion` 本身不拥有也不配置 Fluss I/O runtime。
-- 已知上游限制(仅记录,此处不修)：`fluss-rs` 当前的连接 actor 出站队列是无界 mpsc。在今天没有
-  堆积证据,但在 socket 卡住 + 大量并发调用方时理论上可能无限增长；这应被视为上游的可观测性/
-  背压后续项,而不是 `fluss-datafusion` 的正确性问题。
+### Feature gating
 
-### `catalog/`
+这个 crate 的行为会被 feature 实质性改变：
 
-- `provider.rs`：`FlussCatalogProvider` 只持有共享 loader。同步 `schema_names()` 通过
-  `block_on_with_runtime` 实时列举 database；`schema()` 实时校验 database 是否存在，未知名返回
-  `None`（对齐 paimon 的 `DatabaseNotExist -> None`），否则返回 `FlussSchemaProvider`。
-- `schema.rs`：`FlussSchemaProvider` 持有 database 名 + loader。同步 `table_names()` /
-  `table_exist()` 实时列举 table；异步 `table()` 实时加载 entry，把 `TableNotFound -> Ok(None)`，
-  再按 `meta.has_primary_key()` 分流，返回 `FlussKvTableProvider`（KV）或 `FlussLogTableProvider`（log）。
-- `register.rs`：`build_catalog_provider` 仅把 loader 包成 `FlussCatalogProvider`，不做任何预列举，
-  因此注册开销小、列表永不陈旧。
+- 默认构建：仅包含核心 DataFusion 集成，不强依赖 `fluss-lake`；
+- `lake`：开启 lake-enabled 表路由与 `<table>$lake`；
+- `integration_tests`：开启真实集群集成测试与从 `fluss-lake` re-export 的
+  test-only seam helper。
 
-> 同步/异步桥接采用「同步回调里实时 block_on」（经 `runtime.rs`）而非「注册时快照」。这使 catalog
-> 完全实时——DDL 在同一会话内即时可见——代价是每次 catalog 调用一次 admin RPC（外加一次线程
-> 跳转），已知且接受。详见 README 的「元数据可见性」。
+## Proposed Changes
 
-### `table/`
+这一节描述本文希望固化的模块契约，以及当前已经落地的实现行为。
 
-- `predicate.rs`：`analyze_kv_filters` 把 DataFusion 拆开的顶层 AND conjuncts 识别为完整
-  primary-key 等值，按 PK 顺序产出 `LookupKey`；明确拒绝部分 PK、非 PK 列、`IN`、范围、列对列、
-  重复/缺失 PK、空 filter，一律 `UnsupportedQueryPattern`。`analyze_partition_filters` 仅抽取
-  分区列上的等值绑定（best-effort：无法渲染为分区值字符串的字面量直接跳过，不报错），
-  `is_partition_equality` 为 log 表的下推判定识别单个分区列等值。
-- `kv.rs`：`FlussKvTableProvider` 按优先级提供四种读形态。`scan()` 先试 `analyze_kv_filters`：
-  完整 PK 等值则构建点查 plan（正确传 projection）；否则完整 bucket-key 前缀等值则构建 prefix lookup
-  plan；否则计算 `(partition, bucket)` 扫描目标（分区裁剪算法与 log 表完全一致），带 `LIMIT` 时复用
-  `FlussLogScanExec` 跑有界 KV scan（显示名 `FlussKvScanExec`），不带 `LIMIT` 时走 `FlussKvFullScanExec`
-  全表扫描——把每个目标 bucket 的 CDC changelog 合并到当前状态（changelog-only，无 kv-snapshot RPC、无
-  RocksDB），其完整性受 changelog 保留期约束；目标集为空时返回 `EmptyExec`。
-  `supports_filters_pushdown` 是优先级感知的以保证 soundness：仅当**整组** filter 构成点查会真正应用的
-  完整 PK 等值，或 prefix lookup 会真正应用的完整 bucket-key 前缀等值时，filter 才标 `Exact`（被消费、
-  不生成 `FilterExec`）；走有界 scan / 全表 scan 路径时一律不标 `Exact`——分区表对分区列等值标 `Inexact`
-  （驱动裁剪，残余 `FilterExec` 复核），其余 `Unsupported`。这避免了「部分 PK 等值被误标 `Exact` 而被
-  静默丢弃」的不正确情形。
-- `log.rs`：`FlussLogTableProvider` 不再要求 `LIMIT`。projection 下推到 log 源扫描，`SELECT *`
-  的完整 identity projection 会归一化为 `None`。非分区表的 `supports_filters_pushdown` 一律
-  `Unsupported`；分区表则把分区列等值标为 `Inexact`（其上仍叠加 `FilterExec` 复核谓词——裁剪是
-  best-effort），其余 `Unsupported`。`scan()` 计算扫描目标（`Vec<(Option<i64>, i32)>`，即分区 id +
-  bucket）：非分区表每 bucket 产出一个 `(None, bucket)`；分区表先列举分区，保留满足所有等值绑定的
-  分区（无绑定则全保留），再产出保留分区与 bucket 的笛卡尔积。目标集为空（无分区命中，或分区表零分区）
-  时返回带投影 schema 的 `EmptyExec`，而非零分区 scan。`LIMIT` 现在表示 head-first 的 first-N；
-  不带 `LIMIT` 则表示有限的 earliest->latest snapshot。
+### 1. 模块范围与定位
 
-### `execution/`
+`fluss-datafusion` 被定义为一个 **stateless 的 Fluss DataFusion adapter**。
 
-- `lookup.rs`：`FlussKvLookupExec`，单分区 leaf `ExecutionPlan`，`execute()` 经 `single_batch_stream`
-  异步调 `source.lookup` 产出 0/1 行；实现 `DisplayAs`，`EXPLAIN` 显示 `FlussKvLookupExec`。
-- `log_scan.rs`：`FlussLogScanExec`，leaf，每个扫描目标（`(partition_id, bucket)` 对）报告一个
-  DataFusion partition。log 模式下，`execute(partition)` 经 `bounded_batches_stream` 异步调
-  `source.log_scan(partition_id, bucket, projection, row_limit)`；KV 模式下仍调
-  `source.bounded_scan(...)`。同一 plan 形状同时支撑 log 与 KV 的 scan，其 `EXPLAIN` 标签由
-  `plan_name` 字段参数化——log provider 传 `FlussLogScanExec`，KV provider 传 `FlussKvScanExec`。
-  debug/display 文本会显示 `limit=<n>` 或 `limit=None/full`。
-- `kv_full_scan.rs`：`FlussKvFullScanExec`，leaf，每个 `(partition_id, bucket)` 目标报告一个
-  DataFusion partition。`execute(partition)` 经 `bounded_batches_stream` 异步调
-  `source.kv_full_scan(partition_id, bucket, projection)`，把该 bucket 的 CDC changelog 合并到
-  当前状态。它与 `FlussLogScanExec`（承载 log 快照扫描与 KV 有界 `LIMIT` 扫描）相互独立；`EXPLAIN`
-  显示 `FlussKvFullScanExec`。
-- `stream.rs`：把 lookup / scan 输出适配为 DataFusion stream（`futures::stream::once` /
-  Vec 版），drop 即协作式取消。
-- 不对称点：源侧 scan 在 `FlussSource` 一侧已按 projection 投影，故 scan 路径**不再二次投影**；
-  KV 的点查返回全列后由 `types/record_batch.rs` 的 `project_batch` 裁列。
+它负责：
 
-### `types/`
+- 把 live 的 Fluss catalog 注册进 DataFusion session；
+- 按需加载 table metadata 与 Arrow schema；
+- 识别受支持的 SQL predicate 形态；
+- 将读取路由到 KV fast path、有界 scan、log snapshot scan，或
+  `fluss-lake` kernel；
+- 把 Fluss / `fluss-lake` 的输出适配为 DataFusion `ExecutionPlan`。
 
-- `scalar.rs`：`scalar_to_key_value` 严格把 `ScalarValue`（`Boolean` / `Int8/16/32/64` / `Utf8`）
-  转 `KeyValue`，NULL 与其它类型显式返回 `TypeConversion`。`scalar_to_partition_string` 把同样的
-  受支持字面量类型渲染为 Fluss 分区值字符串用于等值裁剪，对 NULL / 不支持类型同样拒绝。
-- `record_batch.rs`：`project_batch` 集中处理按 projection 裁列（`None` 透传）。
-- 未设 `types/schema.rs`：Fluss->Arrow 映射直接复用 fluss 的 `to_arrow_schema`，无去重收益。
+它明确 **不** 负责：
 
-## 查询语义
+- PostgreSQL / Flight SQL / REST / gRPC 协议前端；
+- session variable、user identity、auth；
+- SQL 写入或 DML；
+- 为任意 source 提供通用 backend abstraction；
+- lake seam 解释、append stitch、PK merge 逻辑本身。
 
-### KV 表
+因此依赖方向必须保持单向：
 
-KV（主键）表按优先级支持四种读形态：
-
-1. **点查**——**完整 primary-key 等值**谓词（`pk1 = v1 AND pk2 = v2 ...`，按 PK 全列）。命中返回
-   1 行，未命中返回 0 行（不报错）。
-2. **Prefix lookup**——完整的 bucket-key 前缀等值。非分区表要求给出全部 bucket keys 的等值；分区表还必须同时给出全部分区列等值。bucket key 必须是 physical primary key（去掉分区列后的 PK）的严格前缀，这与 Fluss client `lookup_by(...)` 的校验一致。该路径返回所有 primary key 以该前缀开头的行，`EXPLAIN` 显示为 `FlussKvPrefixLookupExec`。
-3. **有界 scan**——任何其它谓词形态配合 `LIMIT`。它复用 log 表同一套有界 scan 机制（每 bucket
-   末尾 `limit` 行，DataFusion 再施加最终的跨目标 `LIMIT`），`EXPLAIN` 显示为 `FlussKvScanExec`。
-   分区表中分区列等值会裁剪被扫描的分区（`Inexact`，残余 `FilterExec` 复核）。
-4. **全表 scan**——任何其它谓词形态且**不带** `LIMIT`（如裸 `SELECT *`、部分 key、非 key filter）。
-   它把每个目标 bucket 的 CDC changelog 合并到当前状态（changelog-only，无 kv-snapshot RPC、无
-   RocksDB），`EXPLAIN` 显示为 `FlussKvFullScanExec`。它使用与有界 scan 相同的 `(partition, bucket)`
-   目标计算，因此分区列等值同样裁剪被扫描的分区；目标集为空时返回 `EmptyExec`。合并按主键应用
-   `+I`/`+U`/`+A` 为 upsert、`-D` 为 delete（忽略 `-U`）；因为 KV 表某个主键的行只存在于唯一 bucket。
-
-   全表 scan 的完整性受 changelog 保留期约束：已老化出保留窗口（compaction 进 kv snapshot 并从 log
-   丢弃）的行不会被反映。这对当前特性可接受；完整历史需要 snapshot-backed reader。
-
-分区 KV 表的点查无需额外处理：分区 PK 表的分区列本身就是主键的一部分，完整 PK 等值已绑定它们。
-Fluss `Lookuper` 会从 lookup key row 解析出分区 id，因此点查路径会自动定位到唯一所属分区。对于 prefix lookup，分区列也必须出现在 `lookup_by(...)` 的列列表与 lookup key row 中，client 才能先解析分区、再路由 bucket-key 前缀请求。
-
-### Log 表
-
-锁定决策：
-
-1. `LIMIT` 变为可选。带 `LIMIT n` 时，log 表从 earliest offset 起返回前 `n` 行（head-first
-   first-N）；不带 `LIMIT` 时返回有限的 earliest->latest snapshot。
-2. 支持 projection pushdown。
-3. 不暴露 offset 伪列、不支持 offset 谓词。
-4. 源侧会在查询启动时对每个 scan target 一次性捕获 latest offset，以 earliest offset 订阅，
-   并持续 poll，直到达到该有限 snapshot 边界。
-5. 支持多 bucket snapshot scan：一个 bucket 映射为一个 DataFusion partition（`FlussLogScanExec`
-   上报 `num_buckets` 个 partition，并行读取）。带 `LIMIT` 时，每个 target 独立施加自己的
-   first-N 上限，DataFusion 再在 scan 之上施加跨 bucket 的最终 `LIMIT`，因此合并结果恰好被裁剪到
-   `limit` 行；不做跨 bucket 的全局 first-N 协调。
-6. `ORDER BY` pushdown 不在范围内；跨 bucket 全局 row 顺序不作保证。
-7. 分区 Log 表支持分区裁剪，仅等值。只要提供了分区列等值谓词，就会按已提供的分区键绑定值把扫描
-   裁剪到匹配分区；并不要求每个分区键都全等值。分区谓词绝非必需，因此不带分区谓词时扫描所有分区。
-   扫描目标是保留分区与 bucket 的笛卡尔积，每个目标对应一个 DataFusion partition（partition x
-   bucket => DataFusion partitions）。下推为 `Inexact`，故 DataFusion 仍叠加一个 `FilterExec`
-   复核谓词：裁剪是 best-effort 优化，正确性绝不依赖它。无任何分区命中的谓词经 `EmptyExec` 返回零行。
-
-## 错误模型
-
-`error.rs` 定义 crate 本地错误 `FlussDatafusionError`（别名 `Result<T>`），明确区分各类不支持/失败：
-
-```rust
-pub enum FlussDatafusionError {
-    DatabaseNotFound(String),
-    TableNotFound(String),
-    UnsupportedQueryPattern(String),
-    LimitRequired(String),
-    SchemaMismatch(String),
-    TypeConversion(String),
-    FlussClient(String),
-    Internal(String),
-}
+```text
++-----------------------------+
+|       SessionContext        |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+|       FlussDatafusion       |
+|     live catalog installer  |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+|        MetadataLoader       |
+|         FlussSource         |
++--------------+--------------+
+               |
+               v
++-----------------------------+
+|       RealFlussSource       |
+|   Fluss client / fluss-lake |
++-----------------------------+
 ```
 
-经 `From<FlussDatafusionError> for DataFusionError`（`External`）在 plan 或 collect 阶段清晰
-冒泡。`From` 实现把 fluss / arrow 错误分别映射为 `FlussClient` / `SchemaMismatch`。该类型刻意**不**
-编码任何 PostgreSQL / gateway 概念。
+### 2. 架构概览
 
-## 测试策略
+当前 crate 可以分成四层。
 
-单一真实集群分层：没有 fake/fixture 镜像层，避免「免集群断言」与「真实断言」两份相互漂移。
-分两层：
+#### 2.1 Installer 与生命周期层
 
-| 层 | feature | 容器 | 作用 |
-|---|---|---|---|
-| 单元测试 | 默认 | 否 | schema 映射、`ScalarValue` 转 key、谓词识别、pushdown 决策、错误映射 |
-| 集成测试 | `integration_tests` | 是 | 真实 SQL 走真实后端（`FlussDatafusion::new` -> `RealFlussSource`），覆盖 catalog 列举、KV 点查（单/复合 PK、缺键、非 PK / 部分 PK / `IN` / 无过滤等不支持形态）、log 有界扫描与 projection、分区裁剪、`EXPLAIN` 自定义 plan、`TableProvider` 暴露的 Arrow schema，以及实时无缓存契约（`register_catalog` **之后**的 DDL 在同一会话内即时可见，被 drop 的表从列表 / `table()` 解析中消失） |
+- `src/install.rs`
+- `src/config.rs`
+- `src/runtime.rs`
 
-集成测试在单个测试函数里对一个集群顺序断言：拉起 Fluss 集群成本高，而这些断言均为只读、彼此独立，
-故共用一个集群以降低开销（`setup.rs` 提供共享建表/灌数）。由于 catalog 不持有缓存，没有白盒缓存
-机制需要单测；实时可见性行为直接对真实后端做端到端验证。
+这一层负责：
 
-验证命令：
+- 共享 `FlussDatafusion` installer；
+- session 级的 `register_catalog(...)`；
+- connection hot-swap；
+- 为 DataFusion 同步 catalog callback 提供 sync/async bridge。
+
+一个 `FlussDatafusion` 实例预期会被多个 `SessionContext` 复用。
+
+#### 2.2 Metadata 与 catalog 层
+
+- `src/metadata/loader.rs`
+- `src/catalog/provider.rs`
+- `src/catalog/schema.rs`
+- `src/catalog/register.rs`
+
+这一层把 Fluss metadata 映射为 DataFusion catalog 模型：
+
+- 一个 DataFusion catalog 包含多个 Fluss database；
+- 一个 Fluss database 映射到一个 `SchemaProvider`；
+- 一张 Fluss table 动态映射为一个 `TableProvider`。
+
+这里的刻意设计是 metadata **live 且无缓存**：
+
+- `schema_names()` 实时列库；
+- `table_names()` 实时列表；
+- `table()` 每次都重载该表 metadata 与 Arrow schema；
+- `register_catalog(...)` 之后的 DDL 在同一个 session 中立即可见。
+
+#### 2.3 Table-provider 路由层
+
+- `src/table/kv.rs`
+- `src/table/log.rs`
+- `src/table/union.rs`
+- `src/table/predicate.rs`
+
+这一层承载读路径识别逻辑。
+
+它决定一次查询究竟应走：
+
+- point lookup；
+- prefix lookup；
+- bounded KV scan；
+- finite log snapshot scan；
+- lake+log unified read；
+- lake-only read。
+
+#### 2.4 Physical execution 层
+
+- `src/execution/lookup.rs`
+- `src/execution/prefix_lookup.rs`
+- `src/execution/log_scan.rs`
+- `src/execution/union_scan.rs`
+- `src/execution/stream.rs`
+
+这一层暴露真正的 DataFusion `ExecutionPlan`，包装 Fluss 或
+`fluss-lake` 的读取，再适配成 `SendableRecordBatchStream`。
+
+### 3. 公共 API 与生命周期模型
+
+推荐的使用生命周期是：
+
+1. 调用方先构造 `FlussConnection`；
+2. 再构造一个共享的 `FlussDatafusion` installer；
+3. 每个 SQL session 创建自己的 `SessionContext`；
+4. 调用 `register_catalog(&ctx, "fluss", ...)`；
+5. 之后所有查询都经过这个 live catalog。
+
+当前实现中已经成立的关键运维属性包括：
+
+- installer 本身与 session 无关，可重复复用；
+- catalog provider 不在注册时做 metadata snapshot；
+- `swap_connection(...)` 允许已注册的 session 在后续访问中透明切换到新连接。
+
+### 4. Catalog / schema / table 映射
+
+当前 table 路由逻辑实现于 `src/catalog/schema.rs`。
+
+解析优先级为：
+
+1. `<table>$options`
+2. `lake` feature 下的 `<table>$lake`
+3. `<table>$lake$<system>` -> 显式 unsupported error
+4. 普通表名 -> 按 metadata 选择 provider
+
+对普通表，provider 路由规则如下：
+
+| 表形态 | Provider |
+| --- | --- |
+| `lake` feature 开启且表为 lake-enabled Paimon 表 | `FlussUnionTableProvider` |
+| 非 lake 主键表 | `FlussKvTableProvider` |
+| 非 lake append/log 表 | `FlussLogTableProvider` |
+
+这个优先级非常关键：lake-enabled 的 PK 表绝不能直接走非 lake KV provider，
+因为 Fluss-only KV 读取会漏掉已经 tier 到 lake 里的数据。
+
+#### `<table>$options`
+
+`<table>$options` 是一个正式的、用户可见的 introspection surface。
+它会暴露：
+
+- table id；
+- schema id；
+- primary keys；
+- bucket keys；
+- partition keys；
+- datalake enablement 与 format；
+- lake catalog properties。
+
+其中 secret-like 值在暴露前会被 redaction。
+
+#### `<table>$lake`
+
+`<table>$lake` 是正式的 lake-only read 形态。
+其语义是：
+
+- 只读取 Paimon lake snapshot；
+- 不再拼接 residual Fluss log tail；
+- 即使是主键表，也跳过 KV fast-path routing。
+
+### 5. 查询路由与 planner 行为
+
+这是模块契约里最核心的部分。
+
+#### 5.1 非 lake KV 表
+
+`FlussKvTableProvider` 当前支持如下优先级：
+
+| 查询形态 | 路径 | 说明 |
+| --- | --- | --- |
+| 完整 primary-key equality | `FlussKvLookupExec` | 精确点查 |
+| 完整 bucket-key prefix equality | `FlussKvPrefixLookupExec` | 精确前缀查 |
+| 其它任意形态 + `LIMIT` | `FlussKvScanExec` | 对计算出的 scan target 做有界扫描 |
+| 其它任意形态且无 `LIMIT` | unsupported | 非 lake KV 不暴露 full current-state scan |
+
+当前语义要点：
+
+- 完整 primary-key equality 指每个 PK 列都被等值绑定；
+- 完整 bucket-key prefix equality 指每个必需的 prefix 列都被绑定，分区表时还要包含分区键；
+- 不支持的形态会保守失败，而不是悄悄退化成全表扫描。
+
+#### 5.2 非 lake log 表
+
+`FlussLogTableProvider` 暴露的是有限 snapshot scan。
+
+| 查询形态 | 路径 | 说明 |
+| --- | --- | --- |
+| 存在 `LIMIT n` | `FlussLogScanExec` | 从 earliest offset 开始的 head-first first-N |
+| 不带 `LIMIT` | `FlussLogScanExec` | 查询启动时刻冻结边界的完整 earliest-to-latest snapshot |
+
+当前语义要点：
+
+- 在当前实现里，`LIMIT` 已经是可选的；
+- projection 会下推到 source scan；
+- 分区等值可以裁剪 partition，但 pushdown 为 `Inexact`，scan 之上仍保留 residual `FilterExec`；
+- 不承诺跨 bucket 的全局顺序。
+
+#### 5.3 Lake-enabled 表
+
+lake-enabled 表统一先路由到 `FlussUnionTableProvider`，它本质上是
+`fluss-lake` 之上的 thin adapter。
+
+当前优先级为：
+
+| 查询形态 | 路径 | 说明 |
+| --- | --- | --- |
+| PK 表 + 完整 primary-key equality | `FlussKvLookupExec` | 直接从 Fluss current state 服务 |
+| PK 表 + 完整 bucket-key prefix equality | `FlussKvPrefixLookupExec` | 直接从 Fluss current state 服务 |
+| `<table>$lake` | lake-only `fluss-lake` 路径 | 不包含 residual log tail |
+| 其余任何 lake-enabled 读 | `FlussUnionScanExec` | 统一的 lake snapshot + residual Fluss tail 读取 |
+
+当前行为要点：
+
+- 仅在 `!lake_only` 且表存在主键时才启用 KV fast path；
+- 普通 union path 当前还不向 kernel 下推 value filter；
+- residual filter 继续由 DataFusion 上层负责；
+- `num_buckets == 0` 会直接返回 `EmptyExec`。
+
+### 6. Filter pushdown 契约
+
+filter pushdown 的整体策略是**保守且显式**的。
+
+#### KV provider
+
+`FlussKvTableProvider::supports_filters_pushdown(...)` 是 precedence-aware 且
+sound 的：
+
+- 只有真正会进入 point lookup / prefix lookup 的查询才标 `Exact`；
+- partition equality 在 scan 路径上最多标 `Inexact`；
+- 其余一律 `Unsupported`。
+
+这样可以避免不正确的情况：DataFusion 误以为 source 已经消费了某个 filter，
+从而把 `FilterExec` 去掉。
+
+#### Log provider
+
+`FlussLogTableProvider` 的规则是：
+
+- 非分区表所有 filter 都是 `Unsupported`；
+- 分区表的 partition equality 为 `Inexact`；
+- 其余情况都是 `Unsupported`。
+
+#### Lake provider
+
+`FlussUnionTableProvider` 的规则是：
+
+- 只有 KV fast-path 谓词可标 `Exact`；
+- 正常 union path 下，所有 filter 仍视为 `Unsupported`。
+
+因此当前 unified lake read 的正确性仍依赖 DataFusion residual filtering。
+
+### 7. 执行层行为
+
+当前 physical execution 层主要包含四类计划。
+
+#### `FlussKvLookupExec`
+
+- 单次 lookup；
+- 返回 0 或 1 行；
+- fetch 后再做 projection trim。
+
+#### `FlussKvPrefixLookupExec`
+
+- 基于 Fluss KV current state 的前缀查；
+- 返回所有命中的行。
+
+#### `FlussLogScanExec`
+
+- 每个 `(partition_id, bucket)` target 对应一个 DataFusion partition；
+- 被 log snapshot scan 与 bounded KV scan 共同复用；
+- 在 log 模式下读取 earliest-to-latest 或 first-N；
+- 在 KV bounded-scan 模式下读取每 bucket 的有界扫描路径。
+
+#### `FlussUnionScanExec`
+
+- 每个 `FlussLakeReadSplit` 对应一个 DataFusion partition；
+- 包装 opaque 的 `FlussLakeReadPlan` 与 `FlussLakeRead`；
+- 自身不理解 seam、physical lake split、append stitch 或 PK merge 细节。
+
+### 8. 与 `fluss-lake` 的边界
+
+推荐固定的职责分工如下：
+
+| 层 | 职责 |
+| --- | --- |
+| `fluss-rust` | metadata、KV read、log read、Arrow helper |
+| `fluss-lake` | seam resolution、snapshot planning、append stitch、PK merge、logical split |
+| `fluss-datafusion` | predicate recognition、route selection、DataFusion wrapping、config injection |
+
+因此，DataFusion 模块应该始终保持为 `fluss-lake` 之上的 **thin adapter**。
+
+这在当前代码中已经大体成立：
+
+- `src/table/union.rs` 负责构造 `FlussLakeTable` 与 `FlussLakeScan`；
+- 由它调用 kernel 的 `plan()` 与 `new_read()`；
+- `src/execution/union_scan.rs` 执行 public `FlussLakeReadSplit`；
+- connector 自身不解释 seam DTO，也不做 PK merge。
+
+### 9. 配置契约
+
+当前 installer 层面真正有意义的配置项是：
+
+- `FlussDatafusionOptions.lake_storage_options`
+
+它存在的原因是：服务端 metadata 中可能不会保留完整的 lake storage
+credentials，因此 adapter 需要在打开 lake catalog 之前做 caller-side
+reinjection。
+
+合并规则为：
+
+- 服务端 `table.datalake.*` properties 作为基础配置；
+- 调用方传入的 `lake_storage_options` 合并覆盖到其上；
+- 冲突时 **caller wins**。
+
+这部分是 adapter 层的 transport/configuration glue，而不是 lake 语义本身。
+
+`RegisterCatalogOptions` 当前仍然只是预留，没有承载实际行为。
+
+### 10. 错误模型
+
+当前 crate 的本地错误类型是 `FlussDatafusionError`，主要包括：
+
+- `DatabaseNotFound`
+- `TableNotFound`
+- `UnsupportedQueryPattern`
+- `LimitRequired`
+- `SchemaMismatch`
+- `TypeConversion`
+- `FlussClient`
+- `Internal`
+
+这里的设计原则是：
+
+- 对不支持的 SQL 形态保守失败；
+- 对 storage/client 错误保持显式；
+- 清晰桥接到 `DataFusionError::External`。
+
+需要说明的是：尽管 log scan 已不再要求 `LIMIT`，`LimitRequired` 仍保留在
+错误类型中，作为整个 crate 错误模型的一部分。
+
+### 11. 当前限制与收敛项
+
+当前实现已经可用，但仍有几处明显的 transitional 状态。
+
+#### 11.1 过渡命名
+
+当前仍使用 `Union` 命名：
+
+- `FlussUnionTableProvider`
+- `FlussUnionScanExec`
+
+但从语义上看，它们已经是 lake adapter 路径。未来改名为 `FlussLake*`
+会更清晰，且不应改变行为。
+
+#### 11.2 Lake 路径还没有接上 limit pushdown
+
+`FlussUnionTableProvider::scan(...)` 当前会忽略 SQL `LIMIT` 在 kernel 路径上的
+传递，因此 DataFusion 只能在 lake scan 之上再做 limit。
+这在语义上正确，但可能造成 over-read。
+
+#### 11.3 Lake 路径的 filter pushdown 仍然刻意收窄
+
+普通 union path 还没有 value-filter pushdown；
+residual filtering 继续由 DataFusion 负责。
+
+#### 11.4 Lake 路径仍依赖 `RealFlussSource` 下转型
+
+当前 lake path 需要 downcast 到 `RealFlussSource`，以拿到底层生产连接与
+caller-supplied lake storage options。这是当前的务实边界，也说明 lake 路径
+尚未完全被更广义的 source trait 抽象掉。
+
+#### 11.5 Packaging 仍依赖 feature gating
+
+Lake 支持位于 `lake` feature 下。这个边界在当前是合理的，但也意味着文档必须
+明确说明 feature，而不能默认暗示 unified lake read 永远可用。
+
+#### 11.6 上游 `fluss-lake` 能力缺口会透传到这里
+
+DataFusion adapter 会继承当前 `fluss-lake` 的限制，例如：
+
+- partitioned lake read 仍在收敛中；
+- historical snapshot 还不是主要受支持路径；
+- kernel 侧 statistics、limit/predicate pushdown 仍然较薄。
+
+## Compatibility, Deprecation, and Migration Plan
+
+这个设计不会要求 Fluss 服务端 wire protocol 或 storage format 发生变化。
+
+兼容性说明：
+
+- 现有 Fluss 集群无需服务端改造即可使用该 crate；
+- 对采用它的调用方来说，这是一个附加能力；
+- lake 行为是 additive 且 feature-gated 的；
+- `<table>$lake` 是对已存在行为的正式文档化，而不是引入新的不兼容模式。
+
+迁移方面：
+
+- 不需要数据迁移；
+- 不需要 SQL migration tooling；
+- 未来若从 `FlussUnion*` 改名为 `FlussLake*`，应与 `EXPLAIN` 断言和相关文档同步推进。
+
+## Test Plan
+
+测试策略刻意以**真实行为**为中心，而不只是 mock 单测。
+
+### Unit tests
+
+当前单测主要覆盖：
+
+- predicate recognition 与 pushdown classification；
+- projection normalization；
+- scalar 到 key 的类型转换；
+- metadata property merge 与 redaction 行为。
+
+### 基于真实 Fluss 集群的集成测试
+
+当前主集成测试会验证：
+
+- catalog listing 与 `information_schema` 可见性；
+- 无需重新注册的 live post-DDL metadata visibility；
+- KV point lookup 与 prefix lookup 行为；
+- 非 lake KV 路径上的 unsupported-query failure；
+- bounded 与 full snapshot 的 log 读取；
+- partitioned log / KV scan 的分区裁剪；
+- connection hot-swap；
+- injected-seam 与 real-tiering 两条 lake-enabled unified read 路径；
+- `$options` 与 `$lake` 行为；
+- `EXPLAIN` 是否展示预期的自定义 plan。
+
+### 验证命令
 
 ```bash
 cargo check --workspace
-cargo test -p fluss-datafusion                               # 单元
-cargo test -p fluss-datafusion --features integration_tests  # 需容器, 真实集群
+cargo test -p fluss-datafusion
+cargo test -p fluss-datafusion --features integration_tests
 ```
 
-边界约束（对齐 CLAUDE.md）：`FlussSource` 是内部 seam，保持 `pub(crate)`，不进公共 API，也不
-做成 gateway 形状的 backend 抽象。
+## Rejected Alternatives
 
-## 与 fluss-gateway 的衔接
+### 1. 把 `fluss-datafusion` 做成完整 gateway backend abstraction
 
-本 crate 只负责 `SQL -> Fluss 表访问`。`fluss-gateway` 在其上应：
+拒绝原因：这样会把 protocol/auth/session 语义带进 engine adapter 层，降低该 crate
+独立复用的价值。
 
-1. 为每个 cluster/proxy 连接创建一个共享的 `FlussDatafusion`；
-2. 用**单一、长生命的 I/O runtime** 构造底层 `FlussConnection`（若 gateway 需要显式提供自己的
-   runtime，优先用 `FlussConnection::new_with_io_handle(...)`；否则 `FlussConnection::new(...)`
-   会回退到 `fluss-rs` 的进程级默认 runtime）；
-3. 当某个 SQL session 构建新的 `SessionContext` 时，调用 `register_catalog(&ctx, "fluss", ...)`；
-4. 在真实 Fluss catalog 之上叠加 gateway 专属的 SQL 环境设置；
-5. 把 `pg_catalog`、session 变量、auth、timeout 与 cancel 语义保留在 gateway，而非此处。
+### 2. 在 DataFusion 层重做一套 lake+log union 语义
+
+拒绝原因：这些语义应当归属 `fluss-lake`，并被不同 Arrow engine 复用。
+
+### 3. 用 catalog cache 隐藏 metadata 访问成本
+
+拒绝原因：在当前阶段，同 session 内 DDL 立即可见的契约比减少 admin RPC 更重要。
+
+### 4. 让所有 lake-enabled PK 读都统一走 `fluss-lake`
+
+拒绝原因：完整 PK 与可判定的 prefix 查询可以更高效地直接从 Fluss current state 服务。
+
+### 5. 把不支持的谓词悄悄退化成 full scan
+
+拒绝原因：正确性与可预期行为比“看起来什么 SQL 都支持”更重要。
+
+## Future Work and Open Questions
+
+后续值得继续推进的方向包括：
+
+1. 将 `FlussUnion*` 内部命名收敛为 `FlussLake*`；
+2. 给 lake scan path 接上 limit 传递；
+3. 仅在可证明 sound 的前提下逐步扩展 pushdown；
+4. 减少 lake 读取路径上对 `RealFlussSource` 特定下转型的依赖；
+5. 随着 `fluss-lake` 在 partitioned read 与 richer statistics 上成熟，继续做边界收敛；
+6. 即使未来上层有 Fluss gateway，这个 crate 也继续保持 library-scoped 的 adapter 定位。
+
+这里最关键的不变约束仍然是：`fluss-datafusion` 应持续作为 Fluss 的 DataFusion
+adapter，而不是 lake storage model 的语义所有者。

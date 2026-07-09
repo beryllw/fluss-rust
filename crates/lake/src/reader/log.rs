@@ -134,7 +134,7 @@ impl FlussLogTailReader {
             .find(|info| info.get_partition_id() == partition_id)
             .map(|info| info.get_partition_name())
             .ok_or_else(|| {
-                FlussLakeError::SchemaMismatch(format!(
+                FlussLakeError::SchemaIncompatible(format!(
                     "unknown partition id {partition_id} for log table {}",
                     self.table_path
                 ))

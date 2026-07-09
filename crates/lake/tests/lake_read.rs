@@ -111,7 +111,7 @@ async fn reads_seeded_paimon_snapshot() {
     let catalog = open_catalog(&config).await.unwrap();
     let table = get_table_at_snapshot(&catalog, DB, TABLE, 1).await.unwrap();
 
-    let stream = read_lake_table(&table, None, None).await.unwrap();
+    let stream = read_lake_table(&table, None, None, &[]).await.unwrap();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
 
     let total: usize = batches.iter().map(|b| b.num_rows()).sum();
@@ -137,7 +137,7 @@ async fn projection_selects_named_columns() {
     let table = get_table_at_snapshot(&catalog, DB, TABLE, 1).await.unwrap();
 
     let projection = vec!["id".to_string()];
-    let stream = read_lake_table(&table, Some(&projection), None)
+    let stream = read_lake_table(&table, Some(&projection), None, &[])
         .await
         .unwrap();
     let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
@@ -235,7 +235,7 @@ async fn per_bucket_read_partitions_snapshot_without_overlap() {
         .unwrap();
 
     // Full read (no bucket filter) is the ground truth.
-    let full: Vec<RecordBatch> = read_lake_table(&table, None, None)
+    let full: Vec<RecordBatch> = read_lake_table(&table, None, None, &[])
         .await
         .unwrap()
         .try_collect()
@@ -252,7 +252,7 @@ async fn per_bucket_read_partitions_snapshot_without_overlap() {
         let table = get_table_at_snapshot(&catalog, MULTI_DB, MULTI_TABLE, 1)
             .await
             .unwrap();
-        let batches: Vec<RecordBatch> = read_lake_table(&table, None, Some(bucket))
+        let batches: Vec<RecordBatch> = read_lake_table(&table, None, Some(bucket), &[])
             .await
             .unwrap()
             .try_collect()

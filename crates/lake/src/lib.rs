@@ -41,6 +41,7 @@ pub mod api;
 pub mod catalog;
 pub mod config;
 pub mod error;
+pub mod predicate;
 pub mod reader;
 
 // Internal kernel modules: not part of the public surface. The public read API
@@ -54,12 +55,12 @@ mod test_overrides;
 mod union;
 
 pub use api::{
-    FlussLakeFilter, FlussLakePartitionFilter, FlussLakePartitionIdentity, FlussLakePlanStatistics,
-    FlussLakeRead, FlussLakeReadBoundaryMode, FlussLakeReadMode, FlussLakeReadOptions,
-    FlussLakeReadPlan, FlussLakeReadSplit, FlussLakeScan, FlussLakeTable,
+    FlussLakePartitionIdentity, FlussLakePlanStatistics, FlussLakeRead, FlussLakeReadPlan,
+    FlussLakeReadSplit, FlussLakeScan, FlussLakeScanConfig, FlussLakeTable,
 };
 pub use config::LakeCatalogConfig;
 pub use error::{FlussLakeError, Result};
+pub use predicate::{FlussLakeComparisonOp, FlussLakeLiteral, FlussLakePredicate};
 pub use reader::RecordBatchStream;
 #[cfg(feature = "integration_tests")]
 pub use test_overrides::{

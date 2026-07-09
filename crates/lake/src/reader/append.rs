@@ -129,7 +129,7 @@ mod tests {
     async fn lake_error_propagates_before_log() {
         let target = schema();
         let lake: RecordBatchStream = stream::iter(vec![Err(
-            crate::error::FlussLakeError::SchemaMismatch("x".into()),
+            crate::error::FlussLakeError::SchemaIncompatible("x".into()),
         )])
         .boxed();
         let log: RecordBatchStream = stream::iter(vec![Ok(batch(target.clone(), vec![1]))]).boxed();

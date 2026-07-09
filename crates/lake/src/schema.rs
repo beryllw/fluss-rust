@@ -44,13 +44,13 @@ pub fn align_batch_to(batch: &RecordBatch, target: &SchemaRef) -> Result<RecordB
     let mut columns = Vec::with_capacity(target.fields().len());
     for field in target.fields() {
         let Some((idx, source_field)) = source_schema.column_with_name(field.name()) else {
-            return Err(FlussLakeError::SchemaMismatch(format!(
+            return Err(FlussLakeError::SchemaIncompatible(format!(
                 "column `{}` missing from lake batch",
                 field.name()
             )));
         };
         if source_field.data_type() != field.data_type() {
-            return Err(FlussLakeError::SchemaMismatch(format!(
+            return Err(FlussLakeError::SchemaIncompatible(format!(
                 "column `{}` type mismatch: lake {:?} vs fluss {:?}",
                 field.name(),
                 source_field.data_type(),
@@ -111,7 +111,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(lake_schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
         let err = align_batch_to(&batch, &target()).unwrap_err();
-        assert!(matches!(err, FlussLakeError::SchemaMismatch(_)));
+        assert!(matches!(err, FlussLakeError::SchemaIncompatible(_)));
     }
 
     #[test]
@@ -129,6 +129,6 @@ mod tests {
         )
         .unwrap();
         let err = align_batch_to(&batch, &target()).unwrap_err();
-        assert!(matches!(err, FlussLakeError::SchemaMismatch(_)));
+        assert!(matches!(err, FlussLakeError::SchemaIncompatible(_)));
     }
 }
