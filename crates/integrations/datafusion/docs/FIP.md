@@ -120,7 +120,7 @@ key: Utf8
 value: Utf8
 ```
 
-   - 典型内容包括：`table.id`、`schema.id`、`num.buckets`、`primary.keys`、`bucket.keys`、`partition.keys`、`datalake.enabled`、`datalake.format` 以及脱敏后的 datalake properties。
+   - 典型内容包括：`table.id`、`schema.id`、`num.buckets`、`primary.keys`、`bucket.keys`、`partition.keys`、`partitioned`、`datalake.enabled`、`datalake.format` 以及脱敏后的 datalake properties。
 
 3. **`<table>$lake`**
    - 形态：`<catalog>.<database>.<table>$lake`
@@ -439,6 +439,8 @@ filter pushdown 的正式策略是：**只要下推可被证明 sound，就精�
 - **lake-enabled 表的通用 value predicate**：adapter 将可翻译的谓词转换为 `fluss-lake` 统一 predicate 下推；kernel 用它在 plan 期做分区裁剪、并在输出前对每个 RecordBatch 精确过滤，故这些谓词标记为 `Exact`、无残留；无法翻译的谓词保持 `Unsupported`，由上层 residual `FilterExec` 处理。
 
 pushdown 分类与 `scan` 实际消费严格一致：被标记 `Exact` 的谓词一定会被对应执行路径精确应用；不被消费的谓词绝不标记 `Exact`。这一定义优先保证正确性，同时在 kernel 提供 exact filter 的前提下尽可能减少上层 residual 计算，而不是制造“看起来支持更多 SQL”的假象。
+
+执行代价说明：当 lake 表下推 value predicate 时，kernel 需读取谓词引用的列才能精确过滤。因此实际读取列 = 输出投影列 ∪ filter 引用列（取并集，而非读全表）；exact filter 后再投影到输出列。当 filter 引用列已包含在输出投影中时，不产生额外读取。
 
 ### 3.9 错误模型
 

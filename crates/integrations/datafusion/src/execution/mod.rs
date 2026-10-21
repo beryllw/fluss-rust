@@ -28,4 +28,4 @@ pub(crate) mod lookup;
 pub(crate) mod prefix_lookup;
 pub(crate) mod stream;
 #[cfg(feature = "lake")]
-pub(crate) mod union_scan;
+pub(crate) mod lake_scan;

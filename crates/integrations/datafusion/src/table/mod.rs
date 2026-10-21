@@ -27,4 +27,4 @@ pub(crate) mod kv;
 pub(crate) mod log;
 pub(crate) mod predicate;
 #[cfg(feature = "lake")]
-pub(crate) mod union;
+pub(crate) mod lake;

@@ -38,13 +38,13 @@ use futures::StreamExt;
 use futures::stream::TryStreamExt;
 
 /// A lake scan: one DataFusion partition per public read split.
-pub(crate) struct FlussUnionScanExec {
+pub(crate) struct FlussLakeScanExec {
     plan: FlussLakeReadPlan,
     read: FlussLakeRead,
     properties: Arc<PlanProperties>,
 }
 
-impl FlussUnionScanExec {
+impl FlussLakeScanExec {
     pub(crate) fn new(plan: FlussLakeReadPlan, read: FlussLakeRead) -> Self {
         let properties = PlanProperties::new(
             EquivalenceProperties::new(plan.schema()),
@@ -60,28 +60,28 @@ impl FlussUnionScanExec {
     }
 }
 
-impl Debug for FlussUnionScanExec {
+impl Debug for FlussLakeScanExec {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "FlussUnionScanExec(splits={})", self.plan.split_count())
+        write!(f, "FlussLakeScanExec(splits={})", self.plan.split_count())
     }
 }
 
-impl DisplayAs for FlussUnionScanExec {
+impl DisplayAs for FlussLakeScanExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "FlussUnionScanExec: splits={}", self.plan.split_count())
+                write!(f, "FlussLakeScanExec: splits={}", self.plan.split_count())
             }
             DisplayFormatType::TreeRender => {
-                write!(f, "FlussUnionScanExec\nsplits={}", self.plan.split_count())
+                write!(f, "FlussLakeScanExec\nsplits={}", self.plan.split_count())
             }
         }
     }
 }
 
-impl ExecutionPlan for FlussUnionScanExec {
+impl ExecutionPlan for FlussLakeScanExec {
     fn name(&self) -> &str {
-        "FlussUnionScanExec"
+        "FlussLakeScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -102,7 +102,7 @@ impl ExecutionPlan for FlussUnionScanExec {
     ) -> DfResult<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
             return Err(datafusion::error::DataFusionError::Internal(
-                "FlussUnionScanExec has no children".to_string(),
+                "FlussLakeScanExec has no children".to_string(),
             ));
         }
         Ok(self)

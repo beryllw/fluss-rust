@@ -118,7 +118,7 @@ Today the main user-visible execution-plan names are:
 - `FlussKvPrefixLookupExec`
 - `FlussKvScanExec`
 - `FlussLogScanExec`
-- `FlussUnionScanExec`
+- `FlussLakeScanExec`
 
 ### Feature-gated behavior
 
@@ -226,7 +226,7 @@ A deliberate design choice is that metadata is **live and uncached**:
 
 - `src/table/kv.rs`
 - `src/table/log.rs`
-- `src/table/union.rs`
+- `src/table/lake.rs`
 - `src/table/predicate.rs`
 
 This layer contains the read-shape recognition logic.
@@ -245,7 +245,7 @@ It is where the crate decides whether a query should use:
 - `src/execution/lookup.rs`
 - `src/execution/prefix_lookup.rs`
 - `src/execution/log_scan.rs`
-- `src/execution/union_scan.rs`
+- `src/execution/lake_scan.rs`
 - `src/execution/stream.rs`
 
 This layer exposes DataFusion `ExecutionPlan`s that wrap Fluss or
@@ -284,7 +284,7 @@ For normal tables, the provider routing is:
 
 | Table shape | Provider |
 | --- | --- |
-| lake-enabled Paimon table, `lake` feature on | `FlussUnionTableProvider` |
+| lake-enabled Paimon table, `lake` feature on | `FlussLakeTableProvider` |
 | non-lake primary-key table | `FlussKvTableProvider` |
 | non-lake append/log table | `FlussLogTableProvider` |
 
@@ -358,7 +358,7 @@ Important current semantics:
 
 #### 5.3 Lake-enabled tables
 
-Lake-enabled tables route through `FlussUnionTableProvider`, which is a thin
+Lake-enabled tables route through `FlussLakeTableProvider`, which is a thin
 adapter over `fluss-lake`.
 
 Current precedence is:
@@ -368,7 +368,7 @@ Current precedence is:
 | PK table + full primary-key equality | `FlussKvLookupExec` | served directly from Fluss current state |
 | PK table + complete bucket-key prefix equality | `FlussKvPrefixLookupExec` | served directly from Fluss current state |
 | `<table>$lake` | lake-only `fluss-lake` path | no residual log tail |
-| any other lake-enabled read | `FlussUnionScanExec` | unified lake snapshot + residual Fluss tail |
+| any other lake-enabled read | `FlussLakeScanExec` | unified lake snapshot + residual Fluss tail |
 
 Important current behavior:
 
@@ -404,7 +404,7 @@ predicate that the underlying source is not actually applying.
 
 #### Lake provider
 
-`FlussUnionTableProvider` reports:
+`FlussLakeTableProvider` reports:
 
 - `Exact` only for KV fast-path predicates;
 - `Unsupported` for all filters on the normal union path.
@@ -434,7 +434,7 @@ The physical execution layer consists of four main plan families.
 - in log mode, reads earliest-to-latest or first-N;
 - in KV bounded-scan mode, reads the per-bucket bounded scan path.
 
-#### `FlussUnionScanExec`
+#### `FlussLakeScanExec`
 
 - one DataFusion partition per `FlussLakeReadSplit`;
 - wraps opaque `FlussLakeReadPlan` + `FlussLakeRead`;
@@ -456,9 +456,9 @@ The DataFusion module should therefore remain a **thin adapter** above
 
 This is already largely true in code today:
 
-- `src/table/union.rs` builds `FlussLakeTable` and `FlussLakeScan`;
+- `src/table/lake.rs` builds `FlussLakeTable` and `FlussLakeScan`;
 - it calls `plan()` and `new_read()` on the kernel;
-- `src/execution/union_scan.rs` executes public `FlussLakeReadSplit`s;
+- `src/execution/lake_scan.rs` executes public `FlussLakeReadSplit`s;
 - the connector itself never interprets seam DTOs or performs PK merge.
 
 ### 9. Configuration contract
@@ -510,17 +510,17 @@ transitional or convergence state.
 
 #### 11.1 Transitional naming
 
-Current names still use `Union` terminology:
+Connector naming has converged to the `FlussLake*` family:
 
-- `FlussUnionTableProvider`
-- `FlussUnionScanExec`
+- `FlussLakeTableProvider`
+- `FlussLakeScanExec`
 
-Semantically these are already the lake adapter path. A future rename to
-`FlussLake*` would improve clarity without changing behavior.
+The earlier `FlussUnion*` names have been renamed to `FlussLake*` (types,
+module/file names, and `EXPLAIN` output) with no behavior change.
 
 #### 11.2 Lake path limit pushdown is not wired
 
-`FlussUnionTableProvider::scan(...)` currently ignores SQL `LIMIT` for the
+`FlussLakeTableProvider::scan(...)` currently ignores SQL `LIMIT` for the
 kernel path, so DataFusion applies the limit above the lake scan.
 This preserves correctness but may over-read.
 
@@ -566,7 +566,7 @@ Migration expectations:
 
 - no data migration is required;
 - no SQL migration tooling is required;
-- future internal renames from `FlussUnion*` to `FlussLake*` should be done in
+- the `FlussUnion*` -> `FlussLake*` internal rename has been completed in
   lockstep with `EXPLAIN` expectations and docs.
 
 ## Test Plan
@@ -637,7 +637,7 @@ pretending every SQL shape is supported.
 
 The main next-step topics are:
 
-1. rename `FlussUnion*` internals to `FlussLake*`;
+1. (done) renamed `FlussUnion*` internals to `FlussLake*`;
 2. add limit propagation to the lake scan path;
 3. broaden pushdown only when it can be done soundly;
 4. reduce the `RealFlussSource`-specific downcast boundary on lake reads;

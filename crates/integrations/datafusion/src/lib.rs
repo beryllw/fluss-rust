@@ -22,16 +22,22 @@
 //!
 //! # Supported query forms
 //!
-//! - **KV (primary-key) tables**: full-primary-key equality point lookup, pushed
-//!   down as a single point lookup. Both single and composite primary keys are
-//!   supported (a composite key requires an equality predicate on every key
-//!   column, combined with `AND`).
-//! - **Log tables**: bounded last-N scan that *requires* a `LIMIT` clause, with
-//!   projection pushdown.
+//! - **KV (primary-key) tables**: full-primary-key equality point lookup and
+//!   complete bucket-key prefix lookup, plus a bounded scan when a `LIMIT` is
+//!   present. Composite keys require an equality predicate on every key column
+//!   combined with `AND`.
+//! - **Log tables**: a finite snapshot scan with projection pushdown and
+//!   partition pruning — `LIMIT n` reads the first N rows from the earliest
+//!   offset, and no `LIMIT` reads the whole earliest-to-latest snapshot bounded
+//!   at query start.
+//! - **Lake-enabled tables** (`lake` feature): a unified read over the
+//!   `fluss-lake` kernel via `<table>`, a lake-only read via `<table>$lake`, and
+//!   exact value-predicate pushdown; primary-key point/prefix lookups still take
+//!   the direct Fluss fast path. Table metadata is exposed via `<table>$options`.
 //!
 //! Unsupported patterns fail conservatively: they raise an explicit error at plan
-//! time (for example a KV predicate on a non-primary-key column, or a Log query
-//! without `LIMIT`) instead of silently degrading to a full-table scan.
+//! time (for example a KV predicate on a non-primary-key column, or a non-lake KV
+//! full scan without `LIMIT`) instead of silently degrading to a full-table scan.
 //!
 //! # Example
 //!

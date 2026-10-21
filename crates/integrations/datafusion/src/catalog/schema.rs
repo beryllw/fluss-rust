@@ -39,7 +39,7 @@ use crate::runtime::{block_on_with_runtime, ACCESS_PANIC};
 use crate::table::kv::FlussKvTableProvider;
 use crate::table::log::FlussLogTableProvider;
 #[cfg(feature = "lake")]
-use crate::table::union::FlussUnionTableProvider;
+use crate::table::lake::FlussLakeTableProvider;
 
 /// One Fluss database surfaced as a DataFusion schema, listing tables live.
 #[derive(Debug)]
@@ -161,7 +161,7 @@ impl FlussSchemaProvider {
             ))
             .into());
         }
-        let provider = FlussUnionTableProvider::with_lake_only(
+        let provider = FlussLakeTableProvider::with_lake_only(
             self.loader.source(),
             base_ref,
             entry.arrow_schema,
@@ -237,7 +237,7 @@ impl SchemaProvider for FlussSchemaProvider {
         // the tiered lake data.
         #[cfg(feature = "lake")]
         if entry.meta.is_paimon_lake() {
-            let provider = FlussUnionTableProvider::new(
+            let provider = FlussLakeTableProvider::new(
                 self.loader.source(),
                 table_ref,
                 entry.arrow_schema,
@@ -404,7 +404,7 @@ mod tests {
         let schema_provider = FlussSchemaProvider::new("db".to_string(), loader);
 
         let provider = schema_provider.table("t").await.unwrap().unwrap();
-        assert!(provider.as_any().is::<FlussUnionTableProvider>());
+        assert!(provider.as_any().is::<FlussLakeTableProvider>());
     }
 
     #[cfg(feature = "lake")]
@@ -439,7 +439,7 @@ mod tests {
 
         let provider = schema_provider.table("t").await.unwrap().unwrap();
         assert!(
-            provider.as_any().is::<FlussUnionTableProvider>(),
+            provider.as_any().is::<FlussLakeTableProvider>(),
             "lake PK table must use the union provider, not KV"
         );
     }

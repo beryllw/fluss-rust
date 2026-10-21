@@ -495,33 +495,49 @@ fn projected_names(schema: &Schema, projection: Option<&[usize]>) -> Result<Opti
     }
 }
 
-/// Projects each batch of `stream` (full Fluss schema) down to `projection`.
-fn project_stream(
+/// Projects each batch to `output_names` by column NAME. The input batch may
+/// carry a superset of columns (e.g. filter-only columns read for exact
+/// filtering), so selection is by name rather than by full-schema index.
+fn project_stream_by_names(
     stream: RecordBatchStream,
-    schema: &Schema,
-    projection: Option<Vec<usize>>,
-) -> Result<RecordBatchStream> {
-    let Some(indices) = projection else {
-        return Ok(stream);
-    };
-    let target = projected_schema(schema, Some(&indices))?;
-    Ok(stream
+    output_schema: SchemaRef,
+    output_names: Vec<String>,
+) -> RecordBatchStream {
+    stream
         .map(move |item| {
             let batch = item?;
-            let columns = indices
+            let columns = output_names
                 .iter()
-                .map(|&i| {
-                    if i >= batch.num_columns() {
-                        return Err(FlussLakeError::Internal(format!(
-                            "projection index {i} out of bounds for output batch"
-                        )));
-                    }
-                    Ok(batch.column(i).clone())
+                .map(|name| {
+                    let idx = batch.schema().index_of(name).map_err(|_| {
+                        FlussLakeError::Internal(format!(
+                            "output column `{name}` missing from filtered batch"
+                        ))
+                    })?;
+                    Ok(batch.column(idx).clone())
                 })
                 .collect::<Result<Vec<_>>>()?;
-            Ok(RecordBatch::try_new(target.clone(), columns)?)
+            Ok(RecordBatch::try_new(output_schema.clone(), columns)?)
         })
-        .boxed())
+        .boxed()
+}
+
+/// Computes the read projection when a filter is present: the union of the
+/// output projection and the filter's referenced columns (as indices into
+/// `schema`), sorted ascending and deduplicated. A filter column absent from the
+/// schema is skipped here; the exact filter surfaces it as a schema error.
+fn read_projection_with_filter_columns(
+    schema: &Schema,
+    output: &[usize],
+    filter: &FlussLakePredicate,
+) -> Vec<usize> {
+    let mut set: std::collections::BTreeSet<usize> = output.iter().copied().collect();
+    for name in filter.referenced_columns() {
+        if let Some(idx) = schema.columns().iter().position(|c| c.name() == name) {
+            set.insert(idx);
+        }
+    }
+    set.into_iter().collect()
 }
 
 struct FlussLakeReadPlanInner {
@@ -608,13 +624,18 @@ impl FlussLakeRead {
         let task = decode_task(&split.execution_descriptor)?;
         let has_filter = !cfg.filter.is_always_true();
 
-        // With a filter we read the full Fluss schema, apply the exact filter,
-        // then project — the filter may reference columns outside the projection.
-        // Without a filter we push the projection down for efficiency.
-        let read_projection = if has_filter {
-            None
-        } else {
-            cfg.projection.clone()
+        // Without a filter, push the output projection straight down. With a
+        // filter, the exact filter may reference columns outside the output
+        // projection, so we read the UNION of the output columns and the filter's
+        // columns (NOT the whole table), apply the exact filter, then project down
+        // to the output columns. When the output projection is `None` (all
+        // columns) the union is also all columns, so no extra reprojection runs.
+        let read_projection: Option<Vec<usize>> = match (&cfg.projection, has_filter) {
+            (proj, false) => proj.clone(),
+            (None, true) => None,
+            (Some(output), true) => {
+                Some(read_projection_with_filter_columns(&cfg.schema, output, &cfg.filter))
+            }
         };
 
         let stream = match &task {
@@ -645,12 +666,23 @@ impl FlussLakeRead {
             }
         };
 
-        if has_filter {
-            let full_schema = to_arrow_schema(cfg.schema.row_type())?;
-            let filtered = apply_exact_filter(stream, cfg.filter.clone(), full_schema);
-            project_stream(filtered, &cfg.schema, cfg.projection.clone())
-        } else {
-            Ok(stream)
+        if !has_filter {
+            return Ok(stream);
+        }
+
+        // Apply the exact filter over the columns actually read, then project to
+        // the output columns by name (the read batch may be a superset).
+        let read_schema = projected_schema(&cfg.schema, read_projection.as_deref())?;
+        let filtered = apply_exact_filter(stream, cfg.filter.clone(), read_schema);
+        match &cfg.projection {
+            // Read == output (all columns); no reprojection needed.
+            None => Ok(filtered),
+            Some(output) => {
+                let output_schema = projected_schema(&cfg.schema, Some(output))?;
+                let output_names = projected_names(&cfg.schema, Some(output))?
+                    .expect("Some projection yields Some names");
+                Ok(project_stream_by_names(filtered, output_schema, output_names))
+            }
         }
     }
 
@@ -714,5 +746,35 @@ mod tests {
         let back: FlussLakeReadSplit = serde_json::from_str(&json).unwrap();
         assert_eq!(back.split_id, split.split_id);
         assert_eq!(back.descriptor_version, DESCRIPTOR_VERSION);
+    }
+
+    fn schema4() -> Schema {
+        use fluss::metadata::DataTypes;
+        Schema::builder()
+            .column("id", DataTypes::int())
+            .column("name", DataTypes::string())
+            .column("age", DataTypes::int())
+            .column("dt", DataTypes::string())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn read_projection_unions_output_and_filter_columns() {
+        use crate::predicate::FlussLakeLiteral;
+        // output = [name(1)]; filter references age(2) -> read [1, 2].
+        let filter = FlussLakePredicate::gt("age", FlussLakeLiteral::Int32(18));
+        let read = read_projection_with_filter_columns(&schema4(), &[1], &filter);
+        assert_eq!(read, vec![1, 2]);
+    }
+
+    #[test]
+    fn read_projection_dedups_and_sorts() {
+        use crate::predicate::FlussLakeLiteral;
+        // output already includes age(2); filter on age adds nothing new; result
+        // is sorted and deduplicated.
+        let filter = FlussLakePredicate::gt("age", FlussLakeLiteral::Int32(18));
+        let read = read_projection_with_filter_columns(&schema4(), &[2, 0], &filter);
+        assert_eq!(read, vec![0, 2]);
     }
 }

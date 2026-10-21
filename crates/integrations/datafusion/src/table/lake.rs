@@ -18,7 +18,7 @@
 //! Lake-enabled `TableProvider`, backed entirely by the `fluss-lake` kernel.
 //!
 //! This provider is a thin adapter: it constructs a [`FlussLakeTable`], plans the
-//! read, and hands the plan + reader to a [`FlussUnionScanExec`]. All lake+log
+//! read, and hands the plan + reader to a [`FlussLakeScanExec`]. All lake+log
 //! union semantics (seam resolution, lake planning, append stitch, PK merge) live
 //! inside `fluss-lake`; the connector never sees seams, lake splits, or merge
 //! state.
@@ -44,7 +44,7 @@ use crate::backend::{SharedFlussSource, TableRef};
 use crate::error::FlussDatafusionError;
 use crate::execution::lookup::FlussKvLookupExec;
 use crate::execution::prefix_lookup::FlussKvPrefixLookupExec;
-use crate::execution::union_scan::FlussUnionScanExec;
+use crate::execution::lake_scan::FlussLakeScanExec;
 use crate::table::predicate::{
     analyze_kv_filters, analyze_kv_prefix_filters, is_complete_prefix_key_equality,
     is_complete_primary_key_equality, is_prefix_key_equality, is_primary_key_equality,
@@ -65,7 +65,7 @@ use arrow::datatypes::SchemaRef;
 /// full union read is avoided. Everything else (full scan, `LIMIT`, other
 /// predicates) falls through to the lake+log union read. `lake_only` skips this
 /// routing (it must read the Paimon snapshot regardless).
-pub(crate) struct FlussUnionTableProvider {
+pub(crate) struct FlussLakeTableProvider {
     source: SharedFlussSource,
     table_ref: TableRef,
     schema: SchemaRef,
@@ -82,15 +82,15 @@ pub(crate) struct FlussUnionTableProvider {
     lake_only: bool,
 }
 
-impl std::fmt::Debug for FlussUnionTableProvider {
+impl std::fmt::Debug for FlussLakeTableProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FlussUnionTableProvider")
+        f.debug_struct("FlussLakeTableProvider")
             .field("table_ref", &self.table_ref)
             .finish()
     }
 }
 
-impl FlussUnionTableProvider {
+impl FlussLakeTableProvider {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         source: SharedFlussSource,
@@ -155,7 +155,7 @@ impl FlussUnionTableProvider {
 }
 
 #[async_trait]
-impl TableProvider for FlussUnionTableProvider {
+impl TableProvider for FlussLakeTableProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -311,7 +311,7 @@ impl TableProvider for FlussUnionTableProvider {
             .new_read()
             .map_err(|e| FlussDatafusionError::Internal(e.to_string()))?;
 
-        Ok(Arc::new(FlussUnionScanExec::new(plan, read)))
+        Ok(Arc::new(FlussLakeScanExec::new(plan, read)))
     }
 }
 

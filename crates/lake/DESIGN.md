@@ -695,7 +695,7 @@ public API 必须为 partitioned table 预留，因此：
 内部先桥接到当前实现，不要求一步改完。
 
 ### Step 2 — move seam acquisition into `fluss-lake`
-`LakeSeam` / snapshot 获取从 `fluss-datafusion::table::union` 下沉到 `FlussLakeScan::plan()` 内部。DataFusion 不再显式构造/持有 seam。
+`LakeSeam` / snapshot 获取从 `fluss-datafusion::table::lake` 下沉到 `FlussLakeScan::plan()` 内部。DataFusion 不再显式构造/持有 seam。
 
 ### Step 3 — make `fluss-datafusion` depend only on the new façade
 `fluss-datafusion` 只依赖：

@@ -32,8 +32,6 @@ pub enum FlussDatafusionError {
     TableNotFound(String),
     /// The query shape is not supported by the narrow Phase 1 pushdown rules.
     UnsupportedQueryPattern(String),
-    /// A log-table query was issued without a required `LIMIT`.
-    LimitRequired(String),
     /// Fluss and Arrow schemas disagree in a way the crate cannot reconcile.
     SchemaMismatch(String),
     /// A `ScalarValue` could not be converted to a Fluss row/key value.
@@ -50,7 +48,6 @@ impl Display for FlussDatafusionError {
             Self::DatabaseNotFound(name) => write!(f, "database not found: {name}"),
             Self::TableNotFound(name) => write!(f, "table not found: {name}"),
             Self::UnsupportedQueryPattern(msg) => write!(f, "unsupported query pattern: {msg}"),
-            Self::LimitRequired(msg) => write!(f, "LIMIT required: {msg}"),
             Self::SchemaMismatch(msg) => write!(f, "schema mismatch: {msg}"),
             Self::TypeConversion(msg) => write!(f, "type conversion error: {msg}"),
             Self::FlussClient(msg) => write!(f, "fluss client error: {msg}"),

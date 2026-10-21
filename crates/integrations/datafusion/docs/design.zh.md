@@ -115,7 +115,7 @@ impl FlussDatafusion {
 - `FlussKvPrefixLookupExec`
 - `FlussKvScanExec`
 - `FlussLogScanExec`
-- `FlussUnionScanExec`
+- `FlussLakeScanExec`
 
 ### Feature gating
 
@@ -220,7 +220,7 @@ impl FlussDatafusion {
 
 - `src/table/kv.rs`
 - `src/table/log.rs`
-- `src/table/union.rs`
+- `src/table/lake.rs`
 - `src/table/predicate.rs`
 
 这一层承载读路径识别逻辑。
@@ -239,7 +239,7 @@ impl FlussDatafusion {
 - `src/execution/lookup.rs`
 - `src/execution/prefix_lookup.rs`
 - `src/execution/log_scan.rs`
-- `src/execution/union_scan.rs`
+- `src/execution/lake_scan.rs`
 - `src/execution/stream.rs`
 
 这一层暴露真正的 DataFusion `ExecutionPlan`，包装 Fluss 或
@@ -276,7 +276,7 @@ impl FlussDatafusion {
 
 | 表形态 | Provider |
 | --- | --- |
-| `lake` feature 开启且表为 lake-enabled Paimon 表 | `FlussUnionTableProvider` |
+| `lake` feature 开启且表为 lake-enabled Paimon 表 | `FlussLakeTableProvider` |
 | 非 lake 主键表 | `FlussKvTableProvider` |
 | 非 lake append/log 表 | `FlussLogTableProvider` |
 
@@ -346,7 +346,7 @@ impl FlussDatafusion {
 
 #### 5.3 Lake-enabled 表
 
-lake-enabled 表统一先路由到 `FlussUnionTableProvider`，它本质上是
+lake-enabled 表统一先路由到 `FlussLakeTableProvider`，它本质上是
 `fluss-lake` 之上的 thin adapter。
 
 当前优先级为：
@@ -356,7 +356,7 @@ lake-enabled 表统一先路由到 `FlussUnionTableProvider`，它本质上是
 | PK 表 + 完整 primary-key equality | `FlussKvLookupExec` | 直接从 Fluss current state 服务 |
 | PK 表 + 完整 bucket-key prefix equality | `FlussKvPrefixLookupExec` | 直接从 Fluss current state 服务 |
 | `<table>$lake` | lake-only `fluss-lake` 路径 | 不包含 residual log tail |
-| 其余任何 lake-enabled 读 | `FlussUnionScanExec` | 统一的 lake snapshot + residual Fluss tail 读取 |
+| 其余任何 lake-enabled 读 | `FlussLakeScanExec` | 统一的 lake snapshot + residual Fluss tail 读取 |
 
 当前行为要点：
 
@@ -391,7 +391,7 @@ sound 的：
 
 #### Lake provider
 
-`FlussUnionTableProvider` 的规则是：
+`FlussLakeTableProvider` 的规则是：
 
 - 只有 KV fast-path 谓词可标 `Exact`；
 - 正常 union path 下，所有 filter 仍视为 `Unsupported`。
@@ -420,7 +420,7 @@ sound 的：
 - 在 log 模式下读取 earliest-to-latest 或 first-N；
 - 在 KV bounded-scan 模式下读取每 bucket 的有界扫描路径。
 
-#### `FlussUnionScanExec`
+#### `FlussLakeScanExec`
 
 - 每个 `FlussLakeReadSplit` 对应一个 DataFusion partition；
 - 包装 opaque 的 `FlussLakeReadPlan` 与 `FlussLakeRead`；
@@ -440,9 +440,9 @@ sound 的：
 
 这在当前代码中已经大体成立：
 
-- `src/table/union.rs` 负责构造 `FlussLakeTable` 与 `FlussLakeScan`；
+- `src/table/lake.rs` 负责构造 `FlussLakeTable` 与 `FlussLakeScan`；
 - 由它调用 kernel 的 `plan()` 与 `new_read()`；
-- `src/execution/union_scan.rs` 执行 public `FlussLakeReadSplit`；
+- `src/execution/lake_scan.rs` 执行 public `FlussLakeReadSplit`；
 - connector 自身不解释 seam DTO，也不做 PK merge。
 
 ### 9. 配置契约
@@ -493,17 +493,17 @@ reinjection。
 
 #### 11.1 过渡命名
 
-当前仍使用 `Union` 命名：
+connector 命名已收敛为 `FlussLake*` 家族：
 
-- `FlussUnionTableProvider`
-- `FlussUnionScanExec`
+- `FlussLakeTableProvider`
+- `FlussLakeScanExec`
 
-但从语义上看，它们已经是 lake adapter 路径。未来改名为 `FlussLake*`
-会更清晰，且不应改变行为。
+早先的 `FlussUnion*` 命名已重命名为 `FlussLake*`（类型、模块/文件名及
+`EXPLAIN` 输出），行为不变。
 
 #### 11.2 Lake 路径还没有接上 limit pushdown
 
-`FlussUnionTableProvider::scan(...)` 当前会忽略 SQL `LIMIT` 在 kernel 路径上的
+`FlussLakeTableProvider::scan(...)` 当前会忽略 SQL `LIMIT` 在 kernel 路径上的
 传递，因此 DataFusion 只能在 lake scan 之上再做 limit。
 这在语义上正确，但可能造成 over-read。
 
@@ -546,7 +546,7 @@ DataFusion adapter 会继承当前 `fluss-lake` 的限制，例如：
 
 - 不需要数据迁移；
 - 不需要 SQL migration tooling；
-- 未来若从 `FlussUnion*` 改名为 `FlussLake*`，应与 `EXPLAIN` 断言和相关文档同步推进。
+- `FlussUnion*` -> `FlussLake*` 的内部重命名已完成，并与 `EXPLAIN` 断言和相关文档同步推进。
 
 ## Test Plan
 
@@ -611,7 +611,7 @@ cargo test -p fluss-datafusion --features integration_tests
 
 后续值得继续推进的方向包括：
 
-1. 将 `FlussUnion*` 内部命名收敛为 `FlussLake*`；
+1. （已完成）将 `FlussUnion*` 内部命名收敛为 `FlussLake*`；
 2. 给 lake scan path 接上 limit 传递；
 3. 仅在可证明 sound 的前提下逐步扩展 pushdown；
 4. 减少 lake 读取路径上对 `RealFlussSource` 特定下转型的依赖；

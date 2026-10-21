@@ -369,8 +369,8 @@ async fn sql_reads_real_tiered_lake_plus_log_tail() {
         "lake PK point lookup must use FlussKvLookupExec (not a union scan), got:\n{rendered}"
     );
     assert!(
-        !rendered.contains("FlussUnionScanExec"),
-        "lake PK point lookup must NOT open the lake (no FlussUnionScanExec), got:\n{rendered}"
+        !rendered.contains("FlussLakeScanExec"),
+        "lake PK point lookup must NOT open the lake (no FlussLakeScanExec), got:\n{rendered}"
     );
 
     // A deleted key returns no rows via the same point-lookup fast path.
